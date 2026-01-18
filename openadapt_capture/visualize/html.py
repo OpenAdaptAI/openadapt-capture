@@ -1,7 +1,7 @@
 """Generate interactive HTML viewer for capture recordings.
 
 Creates a self-contained HTML file with timeline navigation,
-frame viewing, event list, and audio playback.
+frame viewing, event list, and audio playback using openadapt-viewer components.
 """
 
 from __future__ import annotations
@@ -64,146 +64,36 @@ def create_html(
         indices = [int(i * step) for i in range(max_events)]
         actions = [actions[i] for i in indices]
 
-    # Prepare frame data
-    frames_data = []
-    events_data = []
-    # Use audio_start_time as reference if available, otherwise first action
+    # Prepare data for viewer
     start_time = audio_start_time if audio_start_time else (actions[0].timestamp if actions else 0)
 
-    # Add a "start" marker at time 0 with the first frame from the video
-    if actions and capture.video_path:
-        first_frame = capture.get_frame_at(start_time)
-        if first_frame:
-            frame_b64 = _image_to_base64(first_frame, scale=frame_scale, quality=frame_quality)
-            frames_data.append({
-                "index": 0,
-                "time": 0.0,
-                "image": frame_b64,
-            })
-            events_data.append({
-                "index": 0,
-                "time": 0.0,
-                "type": "recording.start",
-            })
+    # Convert actions to steps format expected by openadapt-viewer
+    steps = _convert_actions_to_steps(
+        actions,
+        start_time,
+        capture,
+        frame_scale,
+        frame_quality
+    )
 
-    # Offset for indices if we added start marker
-    idx_offset = len(frames_data)
-
-    for i, action in enumerate(actions):
-        idx = i + idx_offset
-        rel_time = action.timestamp - start_time
-        event_type = action.type if isinstance(action.type, str) else action.type.value
-
-        # Encode screenshot
-        screenshot = action.screenshot
-        if screenshot is not None:
-            frame_b64 = _image_to_base64(screenshot, scale=frame_scale, quality=frame_quality)
-        else:
-            frame_b64 = ""
-
-        frames_data.append({
-            "index": idx,
-            "time": rel_time,
-            "image": frame_b64,
-        })
-
-        # Event data
-        event_dict = {
-            "index": idx,
-            "time": rel_time,
-            "type": event_type,
-            "x": getattr(action, "x", None),
-            "y": getattr(action, "y", None),
-        }
-
-        # Add type-specific fields
-        if hasattr(action, "text"):
-            event_dict["text"] = action.text
-        if hasattr(action, "keys"):
-            keys = action.keys
-            if keys:
-                event_dict["keys"] = "+".join(keys)
-        if hasattr(action, "button"):
-            event_dict["button"] = str(action.button)
-        # dx/dy for drags and scrolls
-        if hasattr(action.event, "dx"):
-            event_dict["dx"] = action.event.dx
-            event_dict["dy"] = action.event.dy
-
-        events_data.append(event_dict)
-
-    # Prepare audio data and get audio duration
-    audio_b64 = ""
-    audio_type = ""
-    audio_duration = 0.0
-    transcript = ""
+    # Prepare audio data
+    audio_data = None
     if include_audio:
-        audio_path = capture_path / "audio.flac"
-        if audio_path.exists():
-            with open(audio_path, "rb") as f:
-                audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-            audio_type = "audio/flac"
-            # Get audio duration using soundfile
-            try:
-                import soundfile as sf
-                info = sf.info(str(audio_path))
-                audio_duration = info.duration
-            except ImportError:
-                pass
-            # Load transcript if exists (prefer JSON with timestamps)
-            transcript_json_path = capture_path / "transcript.json"
-            transcript_path = capture_path / "transcript.txt"
-            if transcript_json_path.exists():
-                transcript = transcript_json_path.read_text(encoding="utf-8")
-            elif transcript_path.exists():
-                # Wrap plain text in JSON format
-                plain_text = transcript_path.read_text(encoding="utf-8")
-                transcript = json.dumps({"text": plain_text, "segments": []})
-        else:
-            # Try other formats
-            for ext, mime in [(".mp3", "audio/mpeg"), (".wav", "audio/wav"), (".ogg", "audio/ogg")]:
-                alt_path = capture_path / f"audio{ext}"
-                if alt_path.exists():
-                    with open(alt_path, "rb") as f:
-                        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-                    audio_type = mime
-                    break
+        audio_data = _prepare_audio_data(capture_path)
 
-    # Calculate effective duration as max of audio duration and last event time
-    last_event_time = events_data[-1]["time"] if events_data else 0
-    effective_duration = max(audio_duration, duration, last_event_time)
+    # Prepare transcript data
+    transcript_data = _prepare_transcript_data(capture_path)
 
-    # Add an "end" marker at the end of the recording
-    if effective_duration > 0 and capture.video_path:
-        # Get the last frame from the video
-        end_timestamp = start_time + effective_duration
-        last_frame = capture.get_frame_at(end_timestamp)
-        if last_frame:
-            end_idx = len(frames_data)
-            frame_b64 = _image_to_base64(last_frame, scale=frame_scale, quality=frame_quality)
-            frames_data.append({
-                "index": end_idx,
-                "time": effective_duration,
-                "image": frame_b64,
-            })
-            events_data.append({
-                "index": end_idx,
-                "time": effective_duration,
-                "type": "recording.end",
-            })
-
-    # Generate HTML
-    html = _generate_html(
+    # Generate HTML using openadapt-viewer
+    html = _generate_html_with_viewer(
         capture_id=capture_id,
-        duration=effective_duration,
-        frames_data=frames_data,
-        events_data=events_data,
-        audio_b64=audio_b64,
-        audio_type=audio_type,
+        duration=duration,
+        steps=steps,
+        audio_data=audio_data,
+        transcript_data=transcript_data,
         screen_width=screen_width,
         screen_height=screen_height,
         pixel_ratio=pixel_ratio,
-        transcript=transcript,
     )
 
     if output is not None:
@@ -212,6 +102,155 @@ def create_html(
         return None
     else:
         return html
+
+
+def _convert_actions_to_steps(
+    actions: list,
+    start_time: float,
+    capture: "CaptureSession",
+    frame_scale: float,
+    frame_quality: int,
+) -> list[dict]:
+    """Convert capture actions to viewer step format.
+
+    Args:
+        actions: List of action objects from capture
+        start_time: Reference start time for timestamps
+        capture: CaptureSession for getting frames
+        frame_scale: Scale factor for images
+        frame_quality: JPEG quality for images
+
+    Returns:
+        List of step dictionaries for viewer
+    """
+    steps = []
+
+    # Add initial frame at time 0
+    if actions and capture.video_path:
+        first_frame = capture.get_frame_at(start_time)
+        if first_frame:
+            frame_b64 = _image_to_base64(first_frame, scale=frame_scale, quality=frame_quality)
+            steps.append({
+                "timestamp": 0.0,
+                "screenshot": f"data:image/jpeg;base64,{frame_b64}",
+                "action": {
+                    "type": "recording.start",
+                },
+            })
+
+    # Convert each action to a step
+    for action in actions:
+        rel_time = action.timestamp - start_time
+        event_type = action.type if isinstance(action.type, str) else action.type.value
+
+        # Get screenshot
+        screenshot = action.screenshot
+        if screenshot is not None:
+            frame_b64 = _image_to_base64(screenshot, scale=frame_scale, quality=frame_quality)
+            screenshot_data = f"data:image/jpeg;base64,{frame_b64}"
+        else:
+            screenshot_data = None
+
+        # Build action dict
+        action_dict = {
+            "type": event_type,
+        }
+
+        # Add position data
+        if hasattr(action, "x") and action.x is not None:
+            action_dict["x"] = action.x / capture.screen_size[0]  # Normalize to 0-1
+        if hasattr(action, "y") and action.y is not None:
+            action_dict["y"] = action.y / capture.screen_size[1]  # Normalize to 0-1
+
+        # Add type-specific fields
+        if hasattr(action, "text") and action.text:
+            action_dict["text"] = action.text
+        if hasattr(action, "keys") and action.keys:
+            action_dict["keys"] = "+".join(action.keys)
+        if hasattr(action, "button") and action.button:
+            action_dict["button"] = str(action.button)
+
+        # Add deltas for drags and scrolls
+        if hasattr(action, "event") and hasattr(action.event, "dx"):
+            action_dict["dx"] = action.event.dx
+            action_dict["dy"] = action.event.dy
+
+        steps.append({
+            "timestamp": rel_time,
+            "screenshot": screenshot_data,
+            "action": action_dict,
+        })
+
+    return steps
+
+
+def _prepare_audio_data(capture_path: Path) -> dict | None:
+    """Prepare audio data for embedding in HTML.
+
+    Args:
+        capture_path: Path to capture directory
+
+    Returns:
+        Dictionary with audio data or None if no audio
+    """
+    audio_path = capture_path / "audio.flac"
+    if not audio_path.exists():
+        # Try other formats
+        for ext, mime in [(".mp3", "audio/mpeg"), (".wav", "audio/wav"), (".ogg", "audio/ogg")]:
+            alt_path = capture_path / f"audio{ext}"
+            if alt_path.exists():
+                audio_path = alt_path
+                break
+        else:
+            return None
+
+    with open(audio_path, "rb") as f:
+        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    # Determine MIME type
+    mime_type = "audio/flac"
+    if audio_path.suffix == ".mp3":
+        mime_type = "audio/mpeg"
+    elif audio_path.suffix == ".wav":
+        mime_type = "audio/wav"
+    elif audio_path.suffix == ".ogg":
+        mime_type = "audio/ogg"
+
+    # Get audio duration
+    duration = 0.0
+    try:
+        import soundfile as sf
+        info = sf.info(str(audio_path))
+        duration = info.duration
+    except (ImportError, Exception):
+        pass
+
+    return {
+        "data": audio_b64,
+        "type": mime_type,
+        "duration": duration,
+    }
+
+
+def _prepare_transcript_data(capture_path: Path) -> dict | None:
+    """Prepare transcript data for embedding in HTML.
+
+    Args:
+        capture_path: Path to capture directory
+
+    Returns:
+        Dictionary with transcript data or None if no transcript
+    """
+    transcript_json_path = capture_path / "transcript.json"
+    transcript_path = capture_path / "transcript.txt"
+
+    if transcript_json_path.exists():
+        return json.loads(transcript_json_path.read_text(encoding="utf-8"))
+    elif transcript_path.exists():
+        plain_text = transcript_path.read_text(encoding="utf-8")
+        return {"text": plain_text, "segments": []}
+
+    return None
 
 
 def _image_to_base64(image: "Image.Image", scale: float = 1.0, quality: int = 85) -> str:
@@ -248,34 +287,33 @@ def _image_to_base64(image: "Image.Image", scale: float = 1.0, quality: int = 85
     return base64.b64encode(buf.read()).decode("utf-8")
 
 
-def _generate_html(
+def _generate_html_with_viewer(
     capture_id: str,
     duration: float,
-    frames_data: list[dict],
-    events_data: list[dict],
-    audio_b64: str,
-    audio_type: str,
+    steps: list[dict],
+    audio_data: dict | None,
+    transcript_data: dict | None,
     screen_width: int,
     screen_height: int,
     pixel_ratio: float,
-    transcript: str = "",
 ) -> str:
-    """Generate the HTML content.
+    """Generate HTML using openadapt-viewer components.
+
+    This is a custom implementation that matches the original viewer's functionality
+    while using openadapt-viewer's styling and patterns.
 
     Args:
-        capture_id: Capture identifier.
-        duration: Recording duration in seconds (audio duration if available).
-        frames_data: List of frame data dicts.
-        events_data: List of event data dicts.
-        audio_b64: Base64-encoded audio data.
-        transcript: Optional transcript text.
-        audio_type: Audio MIME type.
-        screen_width: Screen width in physical pixels.
-        screen_height: Screen height in physical pixels.
-        pixel_ratio: Display pixel ratio (physical/logical).
+        capture_id: Capture identifier
+        duration: Total duration in seconds
+        steps: List of step dictionaries
+        audio_data: Audio data dict or None
+        transcript_data: Transcript data dict or None
+        screen_width: Screen width in pixels
+        screen_height: Screen height in pixels
+        pixel_ratio: Display pixel ratio
 
     Returns:
-        Complete HTML string.
+        Complete HTML string
     """
     # Format duration
     minutes = int(duration // 60)
@@ -283,12 +321,14 @@ def _generate_html(
     duration_str = f"{minutes}:{seconds:05.2f}"
 
     # Serialize data to JSON
-    frames_json = json.dumps(frames_data)
-    events_json = json.dumps(events_data)
+    steps_json = json.dumps(steps)
+    transcript_json = json.dumps(transcript_data) if transcript_data else '{"text": "", "segments": []}'
 
-    # Build conditional HTML sections (Python 3.10 compatible)
+    # Audio HTML
+    audio_html = ""
     audio_controls_html = ""
-    if audio_b64:
+    if audio_data:
+        audio_html = f'<audio id="audio" src="data:{audio_data["type"]};base64,{audio_data["data"]}"></audio>'
         audio_controls_html = """
                     <div class="audio-controls">
                         <label>🔊 Volume</label>
@@ -297,14 +337,19 @@ def _generate_html(
                     </div>
         """
 
+    # Transcript HTML
     transcript_panel_html = ""
-    if transcript:
+    if transcript_data:
         transcript_panel_html = """
                 <div class="transcript-panel">
                     <h2>Transcript</h2>
                     <div class="transcript-content" id="transcript-content"></div>
                 </div>
         """
+
+    # Import core CSS from openadapt-viewer
+    from pathlib import Path
+    css_content = _get_core_css()
 
     html = f'''<!DOCTYPE html>
 <html lang="en">
@@ -313,548 +358,8 @@ def _generate_html(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Capture Viewer - {capture_id}</title>
     <style>
-        :root {{
-            --bg-primary: #0a0a0f;
-            --bg-secondary: #12121a;
-            --bg-tertiary: #1a1a24;
-            --border-color: rgba(255, 255, 255, 0.06);
-            --text-primary: #f0f0f0;
-            --text-secondary: #888;
-            --text-muted: #555;
-            --accent: #00d4aa;
-            --accent-dim: rgba(0, 212, 170, 0.15);
-            --accent-hover: #00ffcc;
-            --click-color: #ff5f5f;
-            --drag-color: #00d4aa;
-            --scroll-color: #a78bfa;
-            --type-color: #34d399;
-        }}
-
-        * {{
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }}
-
-        body {{
-            font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Inter", sans-serif;
-            background: var(--bg-primary);
-            color: var(--text-primary);
-            min-height: 100vh;
-            line-height: 1.5;
-        }}
-
-        .container {{
-            max-width: 1440px;
-            margin: 0 auto;
-            padding: 24px;
-        }}
-
-        header {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 16px 24px;
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            margin-bottom: 24px;
-        }}
-
-        header h1 {{
-            font-size: 1.1rem;
-            font-weight: 600;
-            letter-spacing: -0.02em;
-            color: var(--text-primary);
-        }}
-
-        header .meta {{
-            color: var(--text-secondary);
-            font-size: 0.85rem;
-            font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
-        }}
-
-        .step-nav {{
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }}
-
-        .step-counter {{
-            font-size: 1.2rem;
-            font-weight: 600;
-            color: var(--accent);
-            font-family: "SF Mono", Monaco, monospace;
-            min-width: 100px;
-            text-align: center;
-        }}
-
-        .step-nav button {{
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
-            color: var(--text-secondary);
-            width: 36px;
-            height: 36px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 1rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.15s ease;
-        }}
-
-        .step-nav button:hover {{
-            background: var(--accent-dim);
-            color: var(--accent);
-            border-color: var(--accent);
-        }}
-
-        .step-nav button:disabled {{
-            opacity: 0.3;
-            cursor: not-allowed;
-        }}
-
-        .main-content {{
-            display: grid;
-            grid-template-columns: 1fr 340px;
-            gap: 24px;
-        }}
-
-        .viewer-section {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            overflow: hidden;
-        }}
-
-        .frame-container {{
-            position: relative;
-            background: #000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 420px;
-        }}
-
-        .frame-container img {{
-            max-width: 100%;
-            max-height: 70vh;
-            object-fit: contain;
-        }}
-
-        .frame-container canvas {{
-            position: absolute;
-            top: 0;
-            left: 0;
-            pointer-events: none;
-        }}
-
-        .frame-overlay {{
-            position: absolute;
-            top: 12px;
-            right: 12px;
-            background: rgba(0, 0, 0, 0.75);
-            backdrop-filter: blur(8px);
-            padding: 6px 12px;
-            border-radius: 6px;
-            font-size: 0.8rem;
-            font-family: "SF Mono", Monaco, monospace;
-            border: 1px solid var(--border-color);
-        }}
-
-        .controls {{
-            padding: 16px 20px;
-            background: var(--bg-tertiary);
-            border-top: 1px solid var(--border-color);
-        }}
-
-        .playback-controls {{
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 16px;
-        }}
-
-        .playback-controls button {{
-            background: var(--accent);
-            border: none;
-            color: var(--bg-primary);
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            cursor: pointer;
-            font-size: 0.95rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.15s ease;
-            font-weight: 600;
-        }}
-
-        .playback-controls button:hover {{
-            background: var(--accent-hover);
-            transform: scale(1.05);
-        }}
-
-        .playback-controls button.nav {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            color: var(--text-secondary);
-            width: 32px;
-            height: 32px;
-            font-size: 0.8rem;
-        }}
-
-        .playback-controls button.nav:hover {{
-            background: var(--bg-tertiary);
-            color: var(--text-primary);
-            border-color: rgba(255, 255, 255, 0.12);
-        }}
-
-        .time-display {{
-            font-family: "SF Mono", Monaco, monospace;
-            font-size: 0.85rem;
-            min-width: 110px;
-            color: var(--text-secondary);
-        }}
-
-        .timeline {{
-            width: 100%;
-            height: 6px;
-            background: var(--bg-secondary);
-            border-radius: 3px;
-            cursor: pointer;
-            position: relative;
-            border: 1px solid var(--border-color);
-        }}
-
-        .timeline-progress {{
-            height: 100%;
-            background: var(--accent);
-            border-radius: 3px;
-            width: 0%;
-            transition: width 0.1s;
-        }}
-
-        .timeline-markers {{
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-        }}
-
-        .timeline-marker {{
-            position: absolute;
-            width: 2px;
-            height: 100%;
-            background: rgba(255, 255, 255, 0.25);
-            transform: translateX(-50%);
-        }}
-
-        .audio-controls {{
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-top: 16px;
-            padding-top: 16px;
-            border-top: 1px solid var(--border-color);
-        }}
-
-        .audio-controls label {{
-            font-size: 0.8rem;
-            color: var(--text-secondary);
-        }}
-
-        .audio-controls input[type="range"] {{
-            flex: 1;
-            max-width: 100px;
-            accent-color: var(--accent);
-        }}
-
-        .sidebar {{
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
-        }}
-
-        .events-panel {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            max-height: 50vh;
-        }}
-
-        .events-panel h2 {{
-            padding: 14px 18px;
-            font-size: 0.9rem;
-            font-weight: 600;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            letter-spacing: -0.01em;
-        }}
-
-        .events-list {{
-            flex: 1;
-            overflow-y: auto;
-            padding: 8px;
-        }}
-
-        .events-list::-webkit-scrollbar {{
-            width: 6px;
-        }}
-
-        .events-list::-webkit-scrollbar-track {{
-            background: transparent;
-        }}
-
-        .events-list::-webkit-scrollbar-thumb {{
-            background: var(--bg-tertiary);
-            border-radius: 3px;
-        }}
-
-        .event-item {{
-            padding: 10px 14px;
-            border-radius: 8px;
-            cursor: pointer;
-            margin-bottom: 4px;
-            transition: all 0.15s ease;
-            font-size: 0.82rem;
-            border: 1px solid transparent;
-        }}
-
-        .event-item:hover {{
-            background: var(--bg-tertiary);
-            border-color: var(--border-color);
-        }}
-
-        .event-item.active {{
-            background: var(--accent-dim);
-            border-color: var(--accent);
-        }}
-
-        .event-item .event-time {{
-            color: var(--text-muted);
-            font-family: "SF Mono", Monaco, monospace;
-            margin-right: 10px;
-            font-size: 0.75rem;
-        }}
-
-        .event-item.active .event-time {{
-            color: var(--accent);
-        }}
-
-        .event-type {{
-            font-weight: 500;
-        }}
-
-        .event-type.click {{ color: var(--click-color); }}
-        .event-type.drag {{ color: var(--drag-color); }}
-        .event-type.scroll {{ color: var(--scroll-color); }}
-        .event-type.type {{ color: var(--type-color); }}
-
-        .event-item.active .event-type {{
-            color: var(--text-primary);
-        }}
-
-        .details-panel {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            max-height: 30vh;
-        }}
-
-        .details-panel h2 {{
-            padding: 14px 18px;
-            font-size: 0.9rem;
-            font-weight: 600;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }}
-
-        .copy-btn {{
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
-            color: var(--text-secondary);
-            padding: 4px 10px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.7rem;
-            transition: all 0.15s ease;
-            text-transform: uppercase;
-            letter-spacing: 0.03em;
-            font-weight: 500;
-        }}
-
-        .copy-btn:hover {{
-            background: var(--bg-secondary);
-            color: var(--text-primary);
-            border-color: rgba(255, 255, 255, 0.12);
-        }}
-
-        .copy-btn.copied {{
-            background: var(--accent-dim);
-            color: var(--accent);
-            border-color: var(--accent);
-        }}
-
-        .overlay-toggle {{
-            display: flex;
-            align-items: center;
-            margin-left: 12px;
-            gap: 8px;
-            cursor: pointer;
-            user-select: none;
-        }}
-
-        .overlay-toggle input {{
-            display: none;
-        }}
-
-        .toggle-slider {{
-            width: 36px;
-            height: 20px;
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 10px;
-            position: relative;
-            transition: all 0.2s ease;
-        }}
-
-        .toggle-slider::after {{
-            content: '';
-            position: absolute;
-            width: 14px;
-            height: 14px;
-            background: var(--text-muted);
-            border-radius: 50%;
-            top: 2px;
-            left: 2px;
-            transition: all 0.2s ease;
-        }}
-
-        .overlay-toggle input:checked + .toggle-slider {{
-            background: var(--accent-dim);
-            border-color: var(--accent);
-        }}
-
-        .overlay-toggle input:checked + .toggle-slider::after {{
-            background: var(--accent);
-            left: 18px;
-        }}
-
-        .overlay-label {{
-            color: var(--text-secondary);
-            font-size: 0.8rem;
-            font-weight: 500;
-        }}
-
-        .overlay-toggle input:checked ~ .overlay-label {{
-            color: var(--text-primary);
-        }}
-
-        .details-content {{
-            padding: 14px 18px;
-            font-size: 0.82rem;
-            overflow-y: auto;
-            max-height: calc(30vh - 50px);
-        }}
-
-        .transcript-panel {{
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-        }}
-
-        .transcript-panel h2 {{
-            padding: 14px 18px;
-            font-size: 0.9rem;
-            font-weight: 600;
-            border-bottom: 1px solid var(--border-color);
-        }}
-
-        .transcript-content {{
-            padding: 14px 18px;
-            font-size: 0.85rem;
-            line-height: 1.9;
-            color: var(--text-secondary);
-            max-height: 150px;
-            overflow-y: auto;
-        }}
-
-        .transcript-segment {{
-            display: inline;
-            cursor: pointer;
-            padding: 2px 6px;
-            border-radius: 4px;
-            transition: all 0.15s ease;
-        }}
-
-        .transcript-segment:hover {{
-            background: var(--bg-tertiary);
-            color: var(--text-primary);
-        }}
-
-        .transcript-segment.active {{
-            background: var(--accent-dim);
-            color: var(--accent);
-        }}
-
-        .transcript-time {{
-            color: var(--text-muted);
-            font-size: 0.7rem;
-            font-family: "SF Mono", Monaco, monospace;
-            margin-right: 4px;
-        }}
-
-        .detail-row {{
-            display: flex;
-            margin-bottom: 6px;
-        }}
-
-        .detail-key {{
-            color: var(--text-muted);
-            min-width: 80px;
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.03em;
-        }}
-
-        .detail-value {{
-            font-family: "SF Mono", Monaco, monospace;
-            color: var(--text-secondary);
-        }}
-
-        .keyboard-hint {{
-            text-align: center;
-            padding: 16px;
-            color: var(--text-muted);
-            font-size: 0.75rem;
-            letter-spacing: 0.02em;
-        }}
-
-        @media (max-width: 900px) {{
-            .main-content {{
-                grid-template-columns: 1fr;
-            }}
-
-            .sidebar {{
-                flex-direction: row;
-            }}
-
-            .events-panel, .details-panel {{
-                flex: 1;
-                max-height: 300px;
-            }}
-        }}
+        {css_content}
+        {_get_viewer_specific_css()}
     </style>
 </head>
 <body>
@@ -863,7 +368,7 @@ def _generate_html(
             <h1>Capture Viewer</h1>
             <div class="step-nav">
                 <button id="step-prev" title="Previous Step (←)">←</button>
-                <div class="step-counter" id="step-counter">Step 1 / {len(events_data)}</div>
+                <div class="step-counter" id="step-counter">Step 1 / {len(steps)}</div>
                 <button id="step-next" title="Next Step (→)">→</button>
             </div>
             <div class="meta">ID: {capture_id} | Duration: {duration_str}</div>
@@ -905,7 +410,7 @@ def _generate_html(
 
             <div class="sidebar">
                 <div class="events-panel">
-                    <h2><span>Events ({len(events_data)})</span><button class="copy-btn" id="copy-all-btn" title="Copy all events">Copy All</button></h2>
+                    <h2><span>Events ({len(steps)})</span><button class="copy-btn" id="copy-all-btn" title="Copy all events">Copy All</button></h2>
                     <div class="events-list" id="events-list"></div>
                 </div>
 
@@ -925,19 +430,605 @@ def _generate_html(
         </div>
     </div>
 
-    {"" if not audio_b64 else f'<audio id="audio" src="data:{audio_type};base64,{audio_b64}"></audio>'}
+    {audio_html}
 
     <script>
+        {_get_viewer_javascript(steps_json, transcript_json, duration, screen_width, screen_height, pixel_ratio, bool(audio_data))}
+    </script>
+</body>
+</html>
+'''
+
+    return html
+
+
+def _get_core_css() -> str:
+    """Get core CSS from openadapt-viewer or use inline fallback."""
+    try:
+        from openadapt_viewer.styles import core
+        # Read the core.css file
+        import importlib.resources
+        css_content = importlib.resources.read_text('openadapt_viewer.styles', 'core.css')
+        return css_content
+    except Exception:
+        # Fallback to inline CSS
+        return """:root {
+    --bg-primary: #0a0a0f;
+    --bg-secondary: #12121a;
+    --bg-tertiary: #1a1a24;
+    --border-color: rgba(255, 255, 255, 0.06);
+    --text-primary: #f0f0f0;
+    --text-secondary: #888;
+    --text-muted: #555;
+    --accent: #00d4aa;
+    --accent-dim: rgba(0, 212, 170, 0.15);
+    --accent-hover: #00ffcc;
+    --click-color: #ff5f5f;
+    --drag-color: #00d4aa;
+    --scroll-color: #a78bfa;
+    --type-color: #34d399;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Inter", sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    line-height: 1.5;
+}"""
+
+
+def _get_viewer_specific_css() -> str:
+    """Get viewer-specific CSS that extends core styles."""
+    # This is the viewer-specific CSS that was in the original html.py
+    # We keep this part as it's specific to the capture viewer functionality
+    return """
+        .container {
+            max-width: 1440px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 24px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            margin-bottom: 24px;
+        }
+
+        header h1 {
+            font-size: 1.1rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            color: var(--text-primary);
+        }
+
+        header .meta {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+        }
+
+        .step-nav {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .step-counter {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: var(--accent);
+            font-family: "SF Mono", Monaco, monospace;
+            min-width: 100px;
+            text-align: center;
+        }
+
+        .step-nav button {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            width: 36px;
+            height: 36px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+        }
+
+        .step-nav button:hover {
+            background: var(--accent-dim);
+            color: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .step-nav button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 340px;
+            gap: 24px;
+        }
+
+        .viewer-section {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .frame-container {
+            position: relative;
+            background: #000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 420px;
+        }
+
+        .frame-container img {
+            max-width: 100%;
+            max-height: 70vh;
+            object-fit: contain;
+        }
+
+        .frame-container canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+        }
+
+        .frame-overlay {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            background: rgba(0, 0, 0, 0.75);
+            backdrop-filter: blur(8px);
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            font-family: "SF Mono", Monaco, monospace;
+            border: 1px solid var(--border-color);
+        }
+
+        .controls {
+            padding: 16px 20px;
+            background: var(--bg-tertiary);
+            border-top: 1px solid var(--border-color);
+        }
+
+        .playback-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+
+        .playback-controls button {
+            background: var(--accent);
+            border: none;
+            color: var(--bg-primary);
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 0.95rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+            font-weight: 600;
+        }
+
+        .playback-controls button:hover {
+            background: var(--accent-hover);
+            transform: scale(1.05);
+        }
+
+        .playback-controls button.nav {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            width: 32px;
+            height: 32px;
+            font-size: 0.8rem;
+        }
+
+        .playback-controls button.nav:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border-color: rgba(255, 255, 255, 0.12);
+        }
+
+        .time-display {
+            font-family: "SF Mono", Monaco, monospace;
+            font-size: 0.85rem;
+            min-width: 110px;
+            color: var(--text-secondary);
+        }
+
+        .timeline {
+            width: 100%;
+            height: 6px;
+            background: var(--bg-secondary);
+            border-radius: 3px;
+            cursor: pointer;
+            position: relative;
+            border: 1px solid var(--border-color);
+        }
+
+        .timeline-progress {
+            height: 100%;
+            background: var(--accent);
+            border-radius: 3px;
+            width: 0%;
+            transition: width 0.1s;
+        }
+
+        .timeline-markers {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+        }
+
+        .timeline-marker {
+            position: absolute;
+            width: 2px;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.25);
+            transform: translateX(-50%);
+        }
+
+        .audio-controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .audio-controls label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .audio-controls input[type="range"] {
+            flex: 1;
+            max-width: 100px;
+            accent-color: var(--accent);
+        }
+
+        .sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .events-panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            max-height: 50vh;
+        }
+
+        .events-panel h2 {
+            padding: 14px 18px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            letter-spacing: -0.01em;
+        }
+
+        .events-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+
+        .events-list::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .events-list::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .events-list::-webkit-scrollbar-thumb {
+            background: var(--bg-tertiary);
+            border-radius: 3px;
+        }
+
+        .event-item {
+            padding: 10px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-bottom: 4px;
+            transition: all 0.15s ease;
+            font-size: 0.82rem;
+            border: 1px solid transparent;
+        }
+
+        .event-item:hover {
+            background: var(--bg-tertiary);
+            border-color: var(--border-color);
+        }
+
+        .event-item.active {
+            background: var(--accent-dim);
+            border-color: var(--accent);
+        }
+
+        .event-item .event-time {
+            color: var(--text-muted);
+            font-family: "SF Mono", Monaco, monospace;
+            margin-right: 10px;
+            font-size: 0.75rem;
+        }
+
+        .event-item.active .event-time {
+            color: var(--accent);
+        }
+
+        .event-type {
+            font-weight: 500;
+        }
+
+        .event-type.click { color: var(--click-color); }
+        .event-type.drag { color: var(--drag-color); }
+        .event-type.scroll { color: var(--scroll-color); }
+        .event-type.type { color: var(--type-color); }
+
+        .event-item.active .event-type {
+            color: var(--text-primary);
+        }
+
+        .details-panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            max-height: 30vh;
+        }
+
+        .details-panel h2 {
+            padding: 14px 18px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .copy-btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            padding: 4px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.7rem;
+            transition: all 0.15s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            font-weight: 500;
+        }
+
+        .copy-btn:hover {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border-color: rgba(255, 255, 255, 0.12);
+        }
+
+        .copy-btn.copied {
+            background: var(--accent-dim);
+            color: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .overlay-toggle {
+            display: flex;
+            align-items: center;
+            margin-left: 12px;
+            gap: 8px;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .overlay-toggle input {
+            display: none;
+        }
+
+        .toggle-slider {
+            width: 36px;
+            height: 20px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            position: relative;
+            transition: all 0.2s ease;
+        }
+
+        .toggle-slider::after {
+            content: '';
+            position: absolute;
+            width: 14px;
+            height: 14px;
+            background: var(--text-muted);
+            border-radius: 50%;
+            top: 2px;
+            left: 2px;
+            transition: all 0.2s ease;
+        }
+
+        .overlay-toggle input:checked + .toggle-slider {
+            background: var(--accent-dim);
+            border-color: var(--accent);
+        }
+
+        .overlay-toggle input:checked + .toggle-slider::after {
+            background: var(--accent);
+            left: 18px;
+        }
+
+        .overlay-label {
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+
+        .overlay-toggle input:checked ~ .overlay-label {
+            color: var(--text-primary);
+        }
+
+        .details-content {
+            padding: 14px 18px;
+            font-size: 0.82rem;
+            overflow-y: auto;
+            max-height: calc(30vh - 50px);
+        }
+
+        .transcript-panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+        }
+
+        .transcript-panel h2 {
+            padding: 14px 18px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .transcript-content {
+            padding: 14px 18px;
+            font-size: 0.85rem;
+            line-height: 1.9;
+            color: var(--text-secondary);
+            max-height: 150px;
+            overflow-y: auto;
+        }
+
+        .transcript-segment {
+            display: inline;
+            cursor: pointer;
+            padding: 2px 6px;
+            border-radius: 4px;
+            transition: all 0.15s ease;
+        }
+
+        .transcript-segment:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .transcript-segment.active {
+            background: var(--accent-dim);
+            color: var(--accent);
+        }
+
+        .transcript-time {
+            color: var(--text-muted);
+            font-size: 0.7rem;
+            font-family: "SF Mono", Monaco, monospace;
+            margin-right: 4px;
+        }
+
+        .detail-row {
+            display: flex;
+            margin-bottom: 6px;
+        }
+
+        .detail-key {
+            color: var(--text-muted);
+            min-width: 80px;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+
+        .detail-value {
+            font-family: "SF Mono", Monaco, monospace;
+            color: var(--text-secondary);
+        }
+
+        .keyboard-hint {
+            text-align: center;
+            padding: 16px;
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            letter-spacing: 0.02em;
+        }
+
+        @media (max-width: 900px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+
+            .sidebar {
+                flex-direction: row;
+            }
+
+            .events-panel, .details-panel {
+                flex: 1;
+                max-height: 300px;
+            }
+        }
+    """
+
+
+def _get_viewer_javascript(
+    steps_json: str,
+    transcript_json: str,
+    duration: float,
+    screen_width: int,
+    screen_height: int,
+    pixel_ratio: float,
+    has_audio: bool,
+) -> str:
+    """Get the JavaScript code for the viewer.
+
+    This is kept from the original implementation as it contains
+    the specific viewer logic.
+    """
+    # The JavaScript is largely unchanged from the original, but now uses
+    # the data prepared by our conversion functions
+    return f"""
         // Data
-        const frames = {frames_json};
-        const events = {events_json};
+        const frames = {steps_json};
+        const events = {steps_json};
         const duration = {duration};
-        const hasAudio = {"true" if audio_b64 else "false"};
+        const hasAudio = {"true" if has_audio else "false"};
         const screenWidth = {screen_width};
         const screenHeight = {screen_height};
         const pixelRatio = {pixel_ratio};
-        const transcriptData = {transcript if transcript else '{"text": "", "segments": []}'};
-
+        const transcriptData = {transcript_json};
 
         // State
         let currentIndex = 0;
@@ -975,7 +1066,7 @@ def _generate_html(
             events.forEach((event, i) => {{
                 const marker = document.createElement('div');
                 marker.className = 'timeline-marker';
-                marker.style.left = (event.time / duration * 100) + '%';
+                marker.style.left = (event.timestamp / duration * 100) + '%';
                 timelineMarkers.appendChild(marker);
             }});
 
@@ -985,12 +1076,12 @@ def _generate_html(
                 item.className = 'event-item';
                 item.dataset.index = i;
 
-                const typeClass = getTypeClass(event.type);
-                const timeStr = formatTime(event.time);
+                const typeClass = getTypeClass(event.action.type);
+                const timeStr = formatTime(event.timestamp);
 
                 item.innerHTML = `
                     <span class="event-time">${{timeStr}}</span>
-                    <span class="event-type ${{typeClass}}">${{event.type}}</span>
+                    <span class="event-type ${{typeClass}}">${{event.action.type}}</span>
                 `;
 
                 item.addEventListener('click', () => goToIndex(i));
@@ -1064,14 +1155,9 @@ def _generate_html(
             const imgRect = frameImage.getBoundingClientRect();
             const containerRect = frameContainer.getBoundingClientRect();
 
-            // Use actual image dimensions (naturalWidth/Height) for aspect ratio
-            // This handles Retina displays where image pixels != screen coordinates
+            // Use actual image dimensions for aspect ratio
             const imgNaturalWidth = frameImage.naturalWidth || screenWidth;
             const imgNaturalHeight = frameImage.naturalHeight || screenHeight;
-
-            // Scale ratio: image pixels / screen coordinates (e.g., 2.0 for Retina)
-            const pixelRatioX = imgNaturalWidth / screenWidth;
-            const pixelRatioY = imgNaturalHeight / screenHeight;
 
             // Calculate actual displayed size (accounting for object-fit: contain)
             const imgAspect = imgNaturalWidth / imgNaturalHeight;
@@ -1107,23 +1193,15 @@ def _generate_html(
 
             if (!showOverlay) return;
 
-            // Scale factors: convert mouse coordinates to display pixels
-            // Mouse coords from pynput are in LOGICAL space (e.g., 1512x982 on Retina)
-            // screenWidth/Height we stored are in PHYSICAL space (e.g., 3024x1964)
-            // pixelRatio = physical/logical (e.g., 2.0 for Retina)
-            //
-            // To map mouse coord to display:
-            // 1. mouseCoord * pixelRatio = physical image coord
-            // 2. physical image coord * (displayWidth / imgNaturalWidth) = display coord
-            const scaleX = (displayWidth / imgNaturalWidth) * pixelRatio;
-            const scaleY = (displayHeight / imgNaturalHeight) * pixelRatio;
-
             // Draw based on event type
-            const type = event.type;
+            const type = event.action.type;
+            const action = event.action;
 
             if (type.includes('click') || type === 'mouse.down' || type === 'mouse.up') {{
-                const x = offsetX + (event.x * scaleX);
-                const y = offsetY + (event.y * scaleY);
+                if (action.x === undefined || action.y === undefined) return;
+
+                const x = offsetX + (action.x * displayWidth);
+                const y = offsetY + (action.y * displayHeight);
                 const radius = 20;
 
                 // Outer glow
@@ -1160,11 +1238,12 @@ def _generate_html(
                 overlayCtx.stroke();
 
             }} else if (type.includes('drag')) {{
-                const startX = offsetX + (event.x * scaleX);
-                const startY = offsetY + (event.y * scaleY);
-                // End position = start + delta
-                const endX = offsetX + ((event.x + event.dx) * scaleX);
-                const endY = offsetY + ((event.y + event.dy) * scaleY);
+                if (action.x === undefined || action.y === undefined) return;
+
+                const startX = offsetX + (action.x * displayWidth);
+                const startY = offsetY + (action.y * displayHeight);
+                const endX = startX + (action.dx || 0);
+                const endY = startY + (action.dy || 0);
 
                 // Draw arrow from start to end
                 overlayCtx.beginPath();
@@ -1191,8 +1270,10 @@ def _generate_html(
                 overlayCtx.fill();
 
             }} else if (type.includes('scroll')) {{
-                const x = offsetX + (event.x * scaleX);
-                const y = offsetY + (event.y * scaleY);
+                if (action.x === undefined || action.y === undefined) return;
+
+                const x = offsetX + (action.x * displayWidth);
+                const y = offsetY + (action.y * displayHeight);
 
                 // Scroll indicator
                 overlayCtx.beginPath();
@@ -1202,7 +1283,7 @@ def _generate_html(
                 overlayCtx.stroke();
 
                 // Arrows indicating scroll direction
-                const dy = event.dy || 0;
+                const dy = action.dy || 0;
                 if (dy !== 0) {{
                     const arrowY = dy > 0 ? -25 : 25;
                     overlayCtx.beginPath();
@@ -1216,7 +1297,7 @@ def _generate_html(
 
             }} else if (type.includes('type')) {{
                 // Text bubble for keyboard input
-                const text = event.text || event.keys || '';
+                const text = action.text || action.keys || '';
                 if (text) {{
                     const bubbleX = 20;
                     const bubbleY = overlayCanvas.height - 60;
@@ -1239,9 +1320,9 @@ def _generate_html(
             }}
 
             // Draw label
-            let label = event.type.split('.').pop();
-            if (event.text) label += ': ' + event.text.substring(0, 20);
-            else if (event.keys) label += ': ' + event.keys;
+            let label = event.action.type.split('.').pop();
+            if (action.text) label += ': ' + action.text.substring(0, 20);
+            else if (action.keys) label += ': ' + action.keys;
 
             overlayCtx.font = 'bold 14px sans-serif';
             const labelMetrics = overlayCtx.measureText(label);
@@ -1264,8 +1345,8 @@ def _generate_html(
             const event = events[currentIndex];
 
             // Update frame
-            if (frame && frame.image) {{
-                frameImage.src = 'data:image/jpeg;base64,' + frame.image;
+            if (frame && frame.screenshot) {{
+                frameImage.src = frame.screenshot;
                 // Draw overlay after image loads
                 frameImage.onload = () => drawOverlay(event);
             }}
@@ -1276,15 +1357,15 @@ def _generate_html(
             }}
 
             // Update time displays
-            const timeStr = formatTime(event.time);
+            const timeStr = formatTime(event.timestamp);
             frameTime.textContent = timeStr;
             if (!isPlaying) {{
                 currentTimeEl.textContent = timeStr;
             }}
 
-            // Update timeline (only if not playing - playback updates this directly)
+            // Update timeline (only if not playing)
             if (!isPlaying) {{
-                const progress = (event.time / duration) * 100;
+                const progress = (event.timestamp / duration) * 100;
                 timelineProgress.style.width = progress + '%';
             }}
 
@@ -1307,7 +1388,7 @@ def _generate_html(
 
             // Sync audio only on manual navigation, not during playback
             if (hasAudio && audio && !skipAudioSync && !isPlaying) {{
-                audio.currentTime = event.time;
+                audio.currentTime = event.timestamp;
             }}
         }}
 
@@ -1320,12 +1401,19 @@ def _generate_html(
         function updateDetails(event) {{
             currentEvent = event;
             let html = '';
-            for (const [key, value] of Object.entries(event)) {{
-                if (key === 'index') continue;
-                const displayValue = key === 'time' ? formatTime(value) : value;
+            html += `<div class="detail-row">
+                <span class="detail-key">time:</span>
+                <span class="detail-value">${{formatTime(event.timestamp)}}</span>
+            </div>`;
+            html += `<div class="detail-row">
+                <span class="detail-key">type:</span>
+                <span class="detail-value">${{event.action.type}}</span>
+            </div>`;
+            for (const [key, value] of Object.entries(event.action)) {{
+                if (key === 'type') continue;
                 html += `<div class="detail-row">
                     <span class="detail-key">${{key}}:</span>
-                    <span class="detail-value">${{displayValue ?? '-'}}</span>
+                    <span class="detail-value">${{value ?? '-'}}</span>
                 </div>`;
             }}
             detailsContent.innerHTML = html;
@@ -1333,10 +1421,9 @@ def _generate_html(
 
         function formatEventForCopy(event) {{
             const lines = [];
-            for (const [key, value] of Object.entries(event)) {{
-                if (key === 'index') continue;
-                const displayValue = key === 'time' ? formatTime(value) : value;
-                lines.push(`${{key}}: ${{displayValue ?? '-'}}`);
+            lines.push(`time: ${{formatTime(event.timestamp)}}`);
+            for (const [key, value] of Object.entries(event.action)) {{
+                lines.push(`${{key}}: ${{value ?? '-'}}`);
             }}
             return lines.join('\\n');
         }}
@@ -1373,35 +1460,31 @@ def _generate_html(
 
         function goToIndex(index) {{
             currentIndex = Math.max(0, Math.min(frames.length - 1, index));
-            // If playing, pause first so we can seek properly
             if (isPlaying) {{
                 togglePlay();
             }}
             updateDisplay();
-            // Force audio sync for navigation
             if (hasAudio && audio) {{
-                const targetTime = events[currentIndex].time;
+                const targetTime = events[currentIndex].timestamp;
                 audio.currentTime = targetTime;
                 updateActiveTranscript(targetTime);
             }}
         }}
 
         function seekToTranscript(time) {{
-            // Seek audio to transcript segment time
             if (hasAudio && audio) {{
                 audio.currentTime = time;
-                // Find the closest event to this time
                 let closest = 0;
                 let minDiff = Infinity;
                 events.forEach((event, i) => {{
-                    const diff = Math.abs(event.time - time);
+                    const diff = Math.abs(event.timestamp - time);
                     if (diff < minDiff) {{
                         minDiff = diff;
                         closest = i;
                     }}
                 }});
                 currentIndex = closest;
-                updateDisplay(true);  // skip audio sync since we just set it
+                updateDisplay(true);
                 updateActiveTranscript(time);
             }}
         }}
@@ -1441,20 +1524,17 @@ def _generate_html(
             btnPlay.textContent = isPlaying ? '⏸' : '▶';
 
             if (isPlaying) {{
-                // Start audio from current event time
                 if (hasAudio && audio) {{
-                    audio.currentTime = events[currentIndex].time;
+                    audio.currentTime = events[currentIndex].timestamp;
                     audio.play();
                 }}
-                // Use audio timeupdate to drive event updates, or fallback timer
                 if (hasAudio && audio) {{
                     audio.ontimeupdate = () => {{
                         if (!isPlaying) return;
                         const currentTime = audio.currentTime;
-                        // Find the event that matches current audio time
                         let newIndex = currentIndex;
                         for (let i = 0; i < events.length; i++) {{
-                            if (events[i].time <= currentTime) {{
+                            if (events[i].timestamp <= currentTime) {{
                                 newIndex = i;
                             }} else {{
                                 break;
@@ -1462,13 +1542,11 @@ def _generate_html(
                         }}
                         if (newIndex !== currentIndex) {{
                             currentIndex = newIndex;
-                            updateDisplay(true);  // skip audio sync
+                            updateDisplay(true);
                         }}
-                        // Update timeline progress
                         const percent = (currentTime / duration) * 100;
                         timelineProgress.style.width = percent + '%';
                         currentTimeEl.textContent = formatTime(currentTime);
-                        // Update active transcript segment
                         updateActiveTranscript(currentTime);
                     }};
                     audio.onended = () => {{
@@ -1476,16 +1554,14 @@ def _generate_html(
                         btnPlay.textContent = '▶';
                     }};
                 }} else {{
-                    // No audio: use timer-based playback at real speed
-                    const startTime = events[currentIndex].time;
+                    const startTime = events[currentIndex].timestamp;
                     const startRealTime = Date.now();
                     playInterval = setInterval(() => {{
                         const elapsed = (Date.now() - startRealTime) / 1000;
                         const currentTime = startTime + elapsed;
-                        // Find matching event
                         let newIndex = currentIndex;
                         for (let i = currentIndex; i < events.length; i++) {{
-                            if (events[i].time <= currentTime) {{
+                            if (events[i].timestamp <= currentTime) {{
                                 newIndex = i;
                             }} else {{
                                 break;
@@ -1495,11 +1571,9 @@ def _generate_html(
                             currentIndex = newIndex;
                             updateDisplay();
                         }}
-                        // Update timeline
                         const percent = (currentTime / duration) * 100;
                         timelineProgress.style.width = percent + '%';
                         currentTimeEl.textContent = formatTime(currentTime);
-                        // Stop at end
                         if (currentTime >= duration) {{
                             togglePlay();
                         }}
@@ -1542,11 +1616,10 @@ def _generate_html(
             const percent = x / rect.width;
             const targetTime = percent * duration;
 
-            // Find closest frame
             let closest = 0;
             let minDiff = Infinity;
             frames.forEach((frame, i) => {{
-                const diff = Math.abs(frame.time - targetTime);
+                const diff = Math.abs(frame.timestamp - targetTime);
                 if (diff < minDiff) {{
                     minDiff = diff;
                     closest = i;
@@ -1590,9 +1663,4 @@ def _generate_html(
 
         // Initialize
         init();
-    </script>
-</body>
-</html>
-'''
-
-    return html
+    """
