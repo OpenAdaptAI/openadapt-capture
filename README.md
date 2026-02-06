@@ -4,10 +4,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 
-<!-- PyPI badges (uncomment once package is published)
 [![PyPI version](https://img.shields.io/pypi/v/openadapt-capture.svg)](https://pypi.org/project/openadapt-capture/)
 [![Downloads](https://img.shields.io/pypi/dm/openadapt-capture.svg)](https://pypi.org/project/openadapt-capture/)
--->
 
 **OpenAdapt Capture** is the data collection component of the [OpenAdapt](https://github.com/OpenAdaptAI) GUI automation ecosystem.
 
@@ -43,7 +41,7 @@ Capture platform-agnostic GUI interaction streams with time-aligned screenshots 
 |-----------|---------|------------|
 | **openadapt-capture** | Record human demonstrations | [GitHub](https://github.com/OpenAdaptAI/openadapt-capture) |
 | **openadapt-ml** | Train and evaluate GUI automation models | [GitHub](https://github.com/OpenAdaptAI/openadapt-ml) |
-| **openadapt-privacy** | PII scrubbing for recordings | Coming soon |
+| **openadapt-privacy** | PII scrubbing for recordings | [GitHub](https://github.com/OpenAdaptAI/openadapt-privacy) |
 
 ---
 
@@ -208,12 +206,28 @@ The HTML viewer includes:
 uv run python scripts/generate_readme_demo.py --duration 10
 ```
 
+## Sharing Recordings
+
+Share recordings between machines using [Magic Wormhole](https://magic-wormhole.readthedocs.io/):
+
+```bash
+# On the sending machine
+capture share send ./my_capture
+# Shows a code like: 7-guitarist-revenge
+
+# On the receiving machine
+capture share receive 7-guitarist-revenge
+```
+
+The `share` command compresses the recording, sends it via Magic Wormhole, and extracts it on the receiving end. No account or setup required - just share the code.
+
 ## Optional Extras
 
 | Extra | Features |
 |-------|----------|
 | `audio` | Audio capture + Whisper transcription |
-| `privacy` | PII scrubbing (openadapt-privacy) |
+| `privacy` | PII scrubbing ([openadapt-privacy](https://github.com/OpenAdaptAI/openadapt-privacy)) |
+| `share` | Recording sharing via Magic Wormhole |
 | `all` | Everything |
 
 ---
@@ -290,6 +304,8 @@ uv run pytest
 ## Related Projects
 
 - [openadapt-ml](https://github.com/OpenAdaptAI/openadapt-ml) - Train and evaluate GUI automation models
+- [openadapt-privacy](https://github.com/OpenAdaptAI/openadapt-privacy) - PII detection and scrubbing for recordings
+- [openadapt-evals](https://github.com/OpenAdaptAI/openadapt-evals) - Benchmark evaluation for GUI agents
 - [Windows Agent Arena](https://github.com/microsoft/WindowsAgentArena) - Benchmark for Windows GUI agents
 
 ## License
