@@ -1,6 +1,21 @@
 # CHANGELOG
 
 
+## v0.3.0 (2026-02-06)
+
+### Features
+
+- **share**: Add Magic Wormhole sharing for recordings
+  ([`a25bc1f`](https://github.com/OpenAdaptAI/openadapt-capture/commit/a25bc1f21e784773d917eb37bf3ad94e05432e9a))
+
+- Add share.py module with send/receive via wormhole - Add 'capture share send/receive' CLI commands
+  - Add magic-wormhole as optional [share] dependency - Auto-installs wormhole if missing
+
+Usage: capture share send ./my_recording capture share receive 7-guitarist-revenge
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+
 ## v0.2.0 (2026-01-29)
 
 ### Bug Fixes
