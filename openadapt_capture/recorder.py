@@ -1,10 +1,17 @@
 """High-level recording API.
 
 Provides a simple interface for capturing GUI interactions.
+
+Architecture (matching legacy OpenAdapt record.py):
+- Screenshots captured continuously via mss in a background thread
+- Video encoding runs in a separate process to avoid GIL contention
+- Action-gated capture: video frames written only when actions occur
+  (not every screenshot), so encoding load is ~1-5 fps instead of 24fps
 """
 
 from __future__ import annotations
 
+import multiprocessing
 import sys
 import threading
 import time
@@ -22,15 +29,22 @@ if TYPE_CHECKING:
 def _get_screen_dimensions() -> tuple[int, int]:
     """Get screen dimensions in physical pixels (for video).
 
-    Returns the actual screenshot pixel dimensions, which may be
-    larger than logical dimensions on HiDPI/Retina displays.
+    Uses mss (matching legacy OpenAdapt) which returns physical pixel
+    dimensions directly. Falls back to PIL.ImageGrab if mss unavailable.
     """
     try:
-        from PIL import ImageGrab
-        screenshot = ImageGrab.grab()
-        return screenshot.size
+        import mss
+        with mss.mss() as sct:
+            monitor = sct.monitors[0]  # All monitors combined
+            sct_img = sct.grab(monitor)
+            return sct_img.size
     except Exception:
-        return (1920, 1080)  # Default fallback
+        try:
+            from PIL import ImageGrab
+            screenshot = ImageGrab.grab()
+            return screenshot.size
+        except Exception:
+            return (1920, 1080)
 
 
 def _get_display_pixel_ratio() -> float:
@@ -82,10 +96,72 @@ def _get_display_pixel_ratio() -> float:
         return 1.0
 
 
+def _video_writer_worker(
+    queue: multiprocessing.Queue,
+    video_path: str,
+    width: int,
+    height: int,
+    fps: int,
+) -> None:
+    """Video encoding worker running in a separate process.
+
+    Matches the legacy OpenAdapt architecture where video encoding is
+    decoupled from screenshot capture to avoid GIL contention.
+    Ignores SIGINT so only the main process handles Ctrl+C.
+
+    Args:
+        queue: Queue receiving (image_bytes, size, timestamp) tuples.
+               None sentinel signals shutdown.
+        video_path: Path to output video file.
+        width: Video width.
+        height: Video height.
+        fps: Frames per second.
+    """
+    import signal
+
+    from PIL import Image
+
+    from openadapt_capture.video import VideoWriter
+
+    # Ignore SIGINT in worker — main process handles Ctrl+C and sends sentinel
+    # (matches legacy OpenAdapt pattern)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    writer = VideoWriter(video_path, width=width, height=height, fps=fps)
+    is_first_frame = True
+
+    while True:
+        item = queue.get()
+        if item is None:
+            break
+
+        image_bytes, size, timestamp = item
+        image = Image.frombytes("RGB", size, image_bytes)
+
+        if is_first_frame:
+            # Write first frame as key frame (matches legacy pattern for seekability)
+            writer.write_frame(image, timestamp, force_key_frame=True)
+            is_first_frame = False
+        else:
+            writer.write_frame(image, timestamp)
+
+    writer.close()
+
+
 class Recorder:
     """High-level recorder for GUI interactions.
 
     Captures mouse, keyboard, and screen events with minimal configuration.
+
+    Architecture (matching legacy OpenAdapt record.py):
+    - Screenshots captured continuously in a background thread (using mss)
+    - Most recent screenshot is buffered (not encoded)
+    - When an action event occurs (click, keystroke), the buffered screenshot
+      is sent to the video encoding process — this is "action-gated capture"
+    - Video encoding runs in a separate process to avoid GIL contention
+    - Result: encoding load is ~1-5 fps (action frequency) not 24fps
+
+    Set record_full_video=True to encode every frame (legacy RECORD_FULL_VIDEO).
 
     Usage:
         with Recorder("./my_capture") as recorder:
@@ -103,6 +179,7 @@ class Recorder:
         capture_audio: bool = False,
         video_fps: int = 24,
         capture_mouse_moves: bool = True,
+        record_full_video: bool = False,
     ) -> None:
         """Initialize recorder.
 
@@ -113,6 +190,9 @@ class Recorder:
             capture_audio: Whether to capture audio.
             video_fps: Video frames per second.
             capture_mouse_moves: Whether to capture mouse move events.
+            record_full_video: If True, encode every frame (24fps).
+                If False (default), only encode frames when actions occur
+                (matching legacy OpenAdapt RECORD_FULL_VIDEO=False).
         """
         self.capture_dir = Path(capture_dir)
         self.task_description = task_description
@@ -120,17 +200,27 @@ class Recorder:
         self.capture_audio = capture_audio
         self.video_fps = video_fps
         self.capture_mouse_moves = capture_mouse_moves
+        self.record_full_video = record_full_video
 
         self._capture: Capture | None = None
         self._storage: CaptureStorage | None = None
         self._input_listener = None
         self._screen_capturer = None
-        self._video_writer = None
+        self._video_process: multiprocessing.Process | None = None
+        self._video_queue: multiprocessing.Queue | None = None
+        self._video_start_time: float | None = None
         self._audio_recorder = None
         self._running = False
         self._event_count = 0
         self._lock = threading.Lock()
         self._stats = CaptureStats()
+
+        # Action-gated capture state (matching legacy prev_screen_event pattern).
+        # Stores the PIL Image directly (not bytes) to avoid 6MB/frame allocation
+        # for frames that are mostly discarded. Only convert to bytes when sending.
+        self._prev_screen_image: "Image" | None = None
+        self._prev_screen_timestamp: float = 0
+        self._prev_saved_screen_timestamp: float = 0
 
     @property
     def event_count(self) -> int:
@@ -148,7 +238,13 @@ class Recorder:
         return self._stats
 
     def _on_input_event(self, event: Any) -> None:
-        """Handle input events from listener."""
+        """Handle input events from listener.
+
+        In action-gated mode (record_full_video=False), this is where
+        video frames actually get sent to the encoding process — only
+        when the user performs an action (click, keystroke, scroll).
+        Matches legacy OpenAdapt's process_events() action handling.
+        """
         if self._storage is not None and self._running:
             self._storage.write_event(event)
             with self._lock:
@@ -157,22 +253,71 @@ class Recorder:
             event_type = event.type if isinstance(event.type, str) else event.type.value
             self._stats.record_event(event_type, event.timestamp)
 
-    def _on_screen_frame(self, image: "Image", timestamp: float) -> None:
-        """Handle screen frames."""
-        if self._video_writer is not None and self._running:
-            self._video_writer.write_frame(image, timestamp)
+            # Action-gated video: send buffered screenshot to video process
+            # (matching legacy: when action arrives, write prev_screen_event)
+            if (
+                not self.record_full_video
+                and self._video_queue is not None
+                and self._prev_screen_image is not None
+            ):
+                screen_ts = self._prev_screen_timestamp
+                # Only send if this screenshot hasn't been sent already
+                if screen_ts > self._prev_saved_screen_timestamp:
+                    image = self._prev_screen_image
+                    # Convert to bytes only when actually sending (not every frame)
+                    self._video_queue.put(
+                        (image.tobytes(), image.size, screen_ts)
+                    )
+                    self._prev_saved_screen_timestamp = screen_ts
 
-            # Also record screen frame event
+                    # Record screen frame event
+                    if self._video_start_time is None:
+                        self._video_start_time = screen_ts
+                    frame_event = ScreenFrameEvent(
+                        timestamp=screen_ts,
+                        video_timestamp=screen_ts - self._video_start_time,
+                        width=image.width,
+                        height=image.height,
+                    )
+                    self._storage.write_event(frame_event)
+                    self._stats.record_event("screen.frame", screen_ts)
+
+    def _on_screen_frame(self, image: "Image", timestamp: float) -> None:
+        """Handle screen frames from the capture thread.
+
+        In action-gated mode (default): buffers the frame, doesn't encode.
+        In full video mode: sends every frame to the encoding process.
+
+        Matches legacy OpenAdapt's process_events() screen handling:
+        - screen event arrives → store in prev_screen_event
+        - if RECORD_FULL_VIDEO: also send to video_write_q immediately
+        """
+        if not self._running:
+            return
+
+        if self.record_full_video and self._video_queue is not None:
+            # Full video mode: send every frame (legacy RECORD_FULL_VIDEO=True)
+            if self._video_start_time is None:
+                self._video_start_time = timestamp
+            self._video_queue.put((image.tobytes(), image.size, timestamp))
+
+            # Record screen frame event in storage
             if self._storage is not None:
                 event = ScreenFrameEvent(
                     timestamp=timestamp,
-                    video_timestamp=timestamp - (self._video_writer.start_time or timestamp),
+                    video_timestamp=timestamp - self._video_start_time,
                     width=image.width,
                     height=image.height,
                 )
                 self._storage.write_event(event)
-                # Record performance stat
                 self._stats.record_event("screen.frame", timestamp)
+        else:
+            # Action-gated mode: buffer the PIL Image directly (not bytes).
+            # Only convert to bytes when an action triggers sending to video
+            # process. This avoids ~144MB/s of wasted allocation at 24fps.
+            # (Matches legacy: prev_screen_event stores the PIL Image)
+            self._prev_screen_image = image
+            self._prev_screen_timestamp = timestamp
 
     def start(self) -> None:
         """Start recording."""
@@ -219,19 +364,25 @@ class Recorder:
         except ImportError:
             pass  # Input capture not available
 
-        # Start video capture
+        # Start video capture (encoding in separate process like legacy OpenAdapt)
         if self.capture_video:
             try:
                 from openadapt_capture.input import ScreenCapturer
-                from openadapt_capture.video import VideoWriter
 
                 video_path = self.capture_dir / "video.mp4"
-                self._video_writer = VideoWriter(
-                    video_path,
-                    width=screen_width,
-                    height=screen_height,
-                    fps=self.video_fps,
+                self._video_queue = multiprocessing.Queue()
+                self._video_process = multiprocessing.Process(
+                    target=_video_writer_worker,
+                    args=(
+                        self._video_queue,
+                        str(video_path),
+                        screen_width,
+                        screen_height,
+                        self.video_fps,
+                    ),
+                    daemon=False,
                 )
+                self._video_process.start()
 
                 self._screen_capturer = ScreenCapturer(
                     callback=self._on_screen_frame,
@@ -267,12 +418,18 @@ class Recorder:
             self._screen_capturer.stop()
             self._screen_capturer = None
 
-        # Stop video writer
-        if self._video_writer is not None:
-            if self._capture is not None:
-                self._capture.video_start_time = self._video_writer.start_time
-            self._video_writer.close()
-            self._video_writer = None
+        # Stop video writer process
+        if self._video_queue is not None:
+            self._video_queue.put(None)  # Sentinel to stop
+        if self._video_process is not None:
+            self._video_process.join(timeout=30)
+            if self._video_process.is_alive():
+                self._video_process.terminate()
+            self._video_process = None
+        if self._video_queue is not None:
+            self._video_queue = None
+        if self._capture is not None:
+            self._capture.video_start_time = self._video_start_time
 
         # Stop audio capture
         if self._audio_recorder is not None:
