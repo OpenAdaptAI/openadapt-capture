@@ -3,10 +3,10 @@
 Copied from legacy OpenAdapt window/_windows.py. Only import paths changed.
 """
 
-from pprint import pprint
-from typing import TYPE_CHECKING
 import pickle
 import time
+from pprint import pprint
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import pywinauto

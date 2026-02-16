@@ -6,11 +6,10 @@ Only import paths are changed; column definitions and relationships are identica
 
 import io
 
-from PIL import Image
 import sqlalchemy as sa
+from PIL import Image
 
 from openadapt_capture.db import Base
-
 
 
 # https://groups.google.com/g/sqlalchemy/c/wlr7sShU6-k

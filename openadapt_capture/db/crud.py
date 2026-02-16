@@ -4,13 +4,12 @@ Copied from legacy OpenAdapt db/crud.py, adapted for per-capture databases.
 Only import paths are changed; function signatures and logic are identical.
 """
 
-from typing import Any, TypeVar
 import json
+from typing import Any, TypeVar
 
-from sqlalchemy.orm import Session as SaSession
 import sqlalchemy as sa
-
 from loguru import logger
+from sqlalchemy.orm import Session as SaSession
 
 from openadapt_capture.db.models import (
     ActionEvent,

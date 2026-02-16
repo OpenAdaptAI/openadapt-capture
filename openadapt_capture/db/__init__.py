@@ -3,12 +3,11 @@
 Copied from legacy OpenAdapt db/db.py, adapted for per-capture databases.
 """
 
+import sqlalchemy as sa
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.schema import MetaData
-import sqlalchemy as sa
-
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",

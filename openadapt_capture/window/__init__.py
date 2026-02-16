@@ -3,8 +3,8 @@
 Copied from legacy OpenAdapt window/__init__.py. Only import paths changed.
 """
 
-from typing import Any
 import sys
+from typing import Any
 
 from loguru import logger
 

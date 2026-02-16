@@ -9,9 +9,6 @@ Usage:
 
 """
 
-from collections import namedtuple
-from functools import partial
-from typing import Any, Callable
 import io
 import json
 import multiprocessing
@@ -22,21 +19,24 @@ import sys
 import threading
 import time
 import tracemalloc
+from collections import namedtuple
+from functools import partial
+from typing import Any, Callable
 
-from pynput import keyboard, mouse
-from pympler import tracker
-from tqdm import tqdm
-from loguru import logger
 import av
 import fire
 import numpy as np
 import psutil
+from loguru import logger
+from pympler import tracker
+from pynput import keyboard, mouse
+from tqdm import tqdm
 
 from openadapt_capture import plotting, utils, video, window
 from openadapt_capture.config import config
-from openadapt_capture.db import crud, create_db, get_session_for_path
+from openadapt_capture.db import create_db, crud, get_session_for_path
+from openadapt_capture.db.models import ActionEvent, Recording
 from openadapt_capture.extensions import synchronized_queue as sq
-from openadapt_capture.db.models import Recording, ActionEvent
 
 try:
     import soundfile

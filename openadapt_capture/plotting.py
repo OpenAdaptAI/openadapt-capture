@@ -4,10 +4,10 @@ Copied from legacy OpenAdapt plotting.py — only the plot_performance function
 and its dependencies. Import paths adapted for openadapt-capture.
 """
 
-from collections import defaultdict
-from itertools import cycle
 import os
 import sys
+from collections import defaultdict
+from itertools import cycle
 
 import matplotlib.pyplot as plt
 from loguru import logger

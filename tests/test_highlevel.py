@@ -9,11 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from openadapt_capture.capture import Action, Capture, CaptureSession
-from openadapt_capture.db import create_db, get_session_for_path
-from openadapt_capture.db import crud
-from openadapt_capture.db.models import Recording
-from openadapt_capture.recorder import Recorder
+from openadapt_capture.capture import Capture
+from openadapt_capture.db import create_db, crud
+
+# Recorder requires pynput which needs a display server
+try:
+    from openadapt_capture.recorder import Recorder
+except ImportError:
+    Recorder = None
 
 
 @pytest.fixture
@@ -47,6 +50,7 @@ def _create_test_recording(capture_dir, task_description="Test task"):
     return recording, db_path, session
 
 
+@pytest.mark.skipif(Recorder is None, reason="pynput unavailable (headless)")
 class TestRecorder:
     """Tests for Recorder class."""
 

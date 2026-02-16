@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Iterator
 
 from openadapt_capture.events import (
     ActionEvent as PydanticActionEvent,
+)
+from openadapt_capture.events import (
     KeyDownEvent,
     KeyTypeEvent,
     KeyUpEvent,

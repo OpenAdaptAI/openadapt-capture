@@ -4,17 +4,16 @@ Copied from legacy OpenAdapt utils.py — timestamp management, screenshot captu
 and multiprocessing helpers. Only import paths are changed.
 """
 
-from functools import wraps
-from typing import Any, Callable
 import sys
 import threading
 import time
-
-from PIL import Image
-from loguru import logger
+from functools import wraps
+from typing import Any, Callable
 
 import mss
 import mss.base
+from loguru import logger
+from PIL import Image
 
 if sys.platform == "win32":
     import mss.windows

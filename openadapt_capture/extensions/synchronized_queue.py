@@ -3,9 +3,9 @@
 Copied verbatim from legacy OpenAdapt extensions/synchronized_queue.py.
 """
 
+import multiprocessing
 from multiprocessing.queues import Queue
 from typing import Any
-import multiprocessing
 
 # Credit: https://gist.github.com/FanchenBao/d8577599c46eab1238a81857bb7277c9
 

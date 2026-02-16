@@ -26,7 +26,12 @@ import psutil
 import pytest
 
 from openadapt_capture.capture import CaptureSession
-from openadapt_capture.recorder import Recorder
+
+# Recorder requires pynput which needs a display server
+try:
+    from openadapt_capture.recorder import Recorder
+except ImportError:
+    Recorder = None
 
 # Skip on non-Windows platforms where the legacy recorder has known issues
 _SKIP_REASON = (
@@ -47,7 +52,8 @@ def _generate_synthetic_input(duration: float, stop_event: threading.Event) -> i
     Returns the number of input cycles completed.
     """
     from pynput.keyboard import Controller as KeyboardController
-    from pynput.mouse import Button, Controller as MouseController
+    from pynput.mouse import Button
+    from pynput.mouse import Controller as MouseController
 
     mouse = MouseController()
     keyboard = KeyboardController()
@@ -123,7 +129,7 @@ class TestRecorderIntegration:
         input_stop = threading.Event()
         cycles = [0]
 
-        with Recorder(capture_dir, task_description="Integration test") as rec:
+        with Recorder(capture_dir, task_description="Integration test"):
             # Give recorder a moment to start listeners
             time.sleep(1)
 
@@ -197,7 +203,7 @@ class TestRecorderIntegration:
         duration = 2
         input_stop = threading.Event()
 
-        with Recorder(capture_dir, task_description="Shutdown test") as rec:
+        with Recorder(capture_dir, task_description="Shutdown test"):
             time.sleep(0.5)
 
             def run_input():

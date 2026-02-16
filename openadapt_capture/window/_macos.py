@@ -3,12 +3,12 @@
 Copied from legacy OpenAdapt window/_macos.py. Only import paths changed.
 """
 
-from pprint import pprint
-from typing import Any, Literal, Union
 import pickle
 import plistlib
 import re
 import time
+from pprint import pprint
+from typing import Any, Literal, Union
 
 try:
     import AppKit

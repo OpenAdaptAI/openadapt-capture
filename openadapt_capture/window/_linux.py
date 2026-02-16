@@ -8,7 +8,6 @@ import time
 
 import xcffib
 import xcffib.xproto
-
 from loguru import logger
 
 # Global X server connection
