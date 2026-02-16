@@ -62,14 +62,12 @@ from openadapt_capture.stats import (
     PerfStat,
     plot_capture_performance,
 )
-from openadapt_capture.storage import Capture as CaptureMetadata
-
-# Storage (low-level)
-from openadapt_capture.storage import (
-    CaptureStorage,
-    Stream,
-    create_capture,
-    load_capture,
+# Database models (low-level)
+from openadapt_capture.db.models import (
+    Recording,
+    ActionEvent as DBActionEvent,
+    Screenshot,
+    WindowEvent as DBWindowEvent,
 )
 
 # Visualization
@@ -134,12 +132,11 @@ __all__ = [
     # Screen/audio events
     "ScreenFrameEvent",
     "AudioChunkEvent",
-    # Storage (low-level)
-    "CaptureMetadata",
-    "Stream",
-    "CaptureStorage",
-    "create_capture",
-    "load_capture",
+    # Database models (low-level)
+    "Recording",
+    "DBActionEvent",
+    "Screenshot",
+    "DBWindowEvent",
     # Processing
     "process_events",
     "remove_invalid_keyboard_events",
