@@ -90,7 +90,7 @@ def _send_profiling_via_wormhole(profile_path: str) -> None:
 Event = namedtuple("Event", ("timestamp", "type", "data"))
 
 EVENT_TYPES = ("screen", "action", "window", "browser")
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "WARNING"
 
 # Configure loguru to use LOG_LEVEL (default stderr handler is DEBUG)
 logger.remove()
