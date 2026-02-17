@@ -90,7 +90,11 @@ def _send_profiling_via_wormhole(profile_path: str) -> None:
 Event = namedtuple("Event", ("timestamp", "type", "data"))
 
 EVENT_TYPES = ("screen", "action", "window", "browser")
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "WARNING"
+
+# Configure loguru to use LOG_LEVEL (default stderr handler is DEBUG)
+logger.remove()
+logger.add(sys.stderr, level=LOG_LEVEL)
 # whether to write events of each type in a separate process
 PROC_WRITE_BY_EVENT_TYPE = {
     "screen": True,
@@ -267,8 +271,10 @@ def process_events(
                 event.data["screenshot_timestamp"] = prev_screen_event.timestamp
 
             if prev_window_event is None:
-                logger.warning("Discarding action that came before window")
-                continue
+                if config.RECORD_WINDOW_DATA:
+                    logger.warning("Discarding action that came before window")
+                    continue
+                # Window capture disabled — skip window timestamp requirement
             else:
                 event.data["window_event_timestamp"] = prev_window_event.timestamp
 
