@@ -1372,6 +1372,7 @@ def record(
     num_window_events: multiprocessing.Value = None,
     num_browser_events: multiprocessing.Value = None,
     num_video_events: multiprocessing.Value = None,
+    send_profile: bool = False,
 ) -> None:
     """Record Screenshots/ActionEvents/WindowEvents/BrowserEvents.
 
@@ -1819,8 +1820,9 @@ def record(
               f"FPS={config.SCREEN_CAPTURE_FPS}")
         print("=========================\n")
 
-        # Auto-send profiling via wormhole
-        _send_profiling_via_wormhole(_profile_path)
+        # Auto-send profiling via wormhole if requested
+        if send_profile:
+            _send_profiling_via_wormhole(_profile_path)
     except Exception as exc:
         logger.warning(f"Profiling save/send failed: {exc}")
 
@@ -1867,6 +1869,7 @@ class Recorder:
         log_memory: bool | None = None,
         plot_performance: bool | None = None,
         screen_capture_fps: float | None = None,
+        send_profile: bool = False,
     ) -> None:
         from pathlib import Path
 
@@ -1874,6 +1877,7 @@ class Recorder:
 
         self.capture_dir = str(Path(capture_dir).resolve())
         self.task_description = task_description
+        self._send_profile = send_profile
 
         # Build recording config from constructor params
         self._recording_config = RecordingConfig(
@@ -1940,6 +1944,7 @@ class Recorder:
                 num_window_events=self._num_window_events,
                 num_browser_events=self._num_browser_events,
                 num_video_events=self._num_video_events,
+                send_profile=self._send_profile,
             )
 
     def __enter__(self) -> "Recorder":
