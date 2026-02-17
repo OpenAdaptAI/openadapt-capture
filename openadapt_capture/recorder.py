@@ -1067,7 +1067,8 @@ def read_keyboard_events(
                 stop_sequence_indices[i] = 0
 
             # Check if the entire sequence has been entered correctly
-            if stop_sequence_indices[i] == len(stop_sequence):
+            if stop_sequence_indices[i] >= len(stop_sequence):
+                stop_sequence_indices[i] = 0
                 logger.info("Stop sequence entered! Stopping recording now.")
                 stop_sequence_detected = True
 
