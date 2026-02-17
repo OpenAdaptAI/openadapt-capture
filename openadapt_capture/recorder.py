@@ -73,9 +73,8 @@ def _send_profiling_via_wormhole(profile_path: str) -> None:
                 wormhole_bin = str(candidate)
                 break
     if not wormhole_bin:
-        print("wormhole not found. To enable auto-send:")
-        print("  pip install magic-wormhole")
-        print(f"Profiling saved to: {profile_path}")
+        print("wormhole not found — copy profiling.json manually")
+        print(f"  File: {profile_path}")
         return
 
     print("Sending profiling via wormhole (waiting for receiver)...")
@@ -1768,7 +1767,6 @@ def record(
             "browser": num_browser_events.value,
             "video": num_video_events.value,
         },
-        "screen_timing": {},
         "config": {
             "RECORD_VIDEO": config.RECORD_VIDEO,
             "RECORD_AUDIO": config.RECORD_AUDIO,
@@ -1781,19 +1779,6 @@ def record(
         },
         "capture_dir": capture_dir,
     }
-    # Compute screen timing stats
-    if _screen_timing:
-        ss_durs = [t[0] for t in _screen_timing]
-        total_durs = [t[1] for t in _screen_timing]
-        _profile_data["screen_timing"] = {
-            "iterations": len(_screen_timing),
-            "screenshot_avg_ms": round(sum(ss_durs) / len(ss_durs) * 1000, 1),
-            "screenshot_max_ms": round(max(ss_durs) * 1000, 1),
-            "screenshot_min_ms": round(min(ss_durs) * 1000, 1),
-            "total_avg_ms": round(sum(total_durs) / len(total_durs) * 1000, 1),
-            "total_max_ms": round(max(total_durs) * 1000, 1),
-        }
-
     _profile_path = os.path.join(capture_dir, "profiling.json")
     try:
         import json as _json
@@ -1809,20 +1794,14 @@ def record(
         for k, v in _profile_data["event_counts"].items():
             rate = v / _profile_duration if _profile_duration > 0 else 0
             print(f"  {k}: {v} events ({rate:.1f}/s)")
-        if _screen_timing:
-            st = _profile_data["screen_timing"]
-            print(f"  screenshot: avg={st['screenshot_avg_ms']}ms "
-                  f"max={st['screenshot_max_ms']}ms "
-                  f"min={st['screenshot_min_ms']}ms")
         print(f"Config: WINDOW_DATA={config.RECORD_WINDOW_DATA} "
               f"VIDEO={config.RECORD_VIDEO} "
               f"PLOT_PERF={config.PLOT_PERFORMANCE} "
               f"FPS={config.SCREEN_CAPTURE_FPS}")
         print("=========================\n")
 
-        # Auto-send profiling via wormhole if requested
-        if send_profile:
-            _send_profiling_via_wormhole(_profile_path)
+        # Auto-send profiling via wormhole
+        _send_profiling_via_wormhole(_profile_path)
     except Exception as exc:
         logger.warning(f"Profiling save/send failed: {exc}")
 
