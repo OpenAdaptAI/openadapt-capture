@@ -530,6 +530,11 @@ def video_post_callback(state: dict) -> None:
     Args:
         state (dict): The current state.
     """
+    if state is None or "last_frame" not in state:
+        logger.warning("No video frames captured — skipping finalization")
+        if state and "video_container" in state:
+            state["video_container"].close()
+        return
     video.finalize_video_writer(
         state["video_container"],
         state["video_stream"],
