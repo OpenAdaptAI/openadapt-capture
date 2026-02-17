@@ -73,8 +73,9 @@ def _send_profiling_via_wormhole(profile_path: str) -> None:
                 wormhole_bin = str(candidate)
                 break
     if not wormhole_bin:
-        print("wormhole not found — copy profiling.json manually")
-        print(f"  File: {profile_path}")
+        print("wormhole not found. To enable auto-send:")
+        print("  pip install magic-wormhole")
+        print(f"Profiling saved to: {profile_path}")
         return
 
     print("Sending profiling via wormhole (waiting for receiver)...")
