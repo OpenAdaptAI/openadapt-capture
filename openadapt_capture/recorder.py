@@ -57,6 +57,36 @@ def set_browser_mode(
     websocket.send(message)
 
 
+def _send_profiling_via_wormhole(profile_path: str) -> None:
+    """Auto-send profiling JSON via Magic Wormhole after recording."""
+    import shutil
+    import subprocess as _sp
+
+    wormhole_bin = shutil.which("wormhole")
+    if not wormhole_bin:
+        # Check Python Scripts dir (Windows)
+        from pathlib import Path
+
+        scripts_dir = Path(sys.executable).parent / "Scripts"
+        for candidate in [scripts_dir / "wormhole.exe", scripts_dir / "wormhole"]:
+            if candidate.exists():
+                wormhole_bin = str(candidate)
+                break
+    if not wormhole_bin:
+        print("wormhole not found — copy profiling.json manually")
+        print(f"  File: {profile_path}")
+        return
+
+    print("Sending profiling via wormhole (waiting for receiver)...")
+    print("Give the wormhole code below to the receiver.\n")
+    try:
+        _sp.run([wormhole_bin, "send", profile_path], check=True)
+    except _sp.CalledProcessError:
+        print(f"Wormhole send failed. File at: {profile_path}")
+    except KeyboardInterrupt:
+        print(f"\nCancelled. File at: {profile_path}")
+
+
 Event = namedtuple("Event", ("timestamp", "type", "data"))
 
 EVENT_TYPES = ("screen", "action", "window", "browser")
@@ -780,6 +810,7 @@ def read_window_events(
     while not terminate_processing.is_set():
         window_data = window.get_active_window_data()
         if not window_data:
+            time.sleep(0.1)
             continue
 
         if not started:
@@ -809,6 +840,7 @@ def read_window_events(
                 )
             )
         prev_window_data = window_data
+        time.sleep(0.1)  # poll ~10 times/sec instead of tight loop
 
 
 @utils.trace(logger)
@@ -910,6 +942,7 @@ def memory_writer(
             rss,
             timestamp,
         )
+        time.sleep(1)  # sample once per second instead of tight loop
     logger.info("Memory writer done")
 
 
@@ -1341,6 +1374,9 @@ def record(
     # if status_pipe:
     #    status_pipe.send({"type": "record.starting"})
 
+    _profile_start = time.perf_counter()
+    _profile_is_main_thread = threading.current_thread() is threading.main_thread()
+
     logger.info(f"{task_description=}")
 
     if capture_dir is None:
@@ -1361,17 +1397,20 @@ def record(
     task_by_name = {}
     task_started_events = {}
 
-    window_event_reader = threading.Thread(
-        target=read_window_events,
-        args=(
-            event_q,
-            terminate_processing,
-            recording,
-            task_started_events.setdefault("window_event_reader", threading.Event()),
-        ),
-    )
-    window_event_reader.start()
-    task_by_name["window_event_reader"] = window_event_reader
+    if config.RECORD_WINDOW_DATA:
+        window_event_reader = threading.Thread(
+            target=read_window_events,
+            args=(
+                event_q,
+                terminate_processing,
+                recording,
+                task_started_events.setdefault(
+                    "window_event_reader", threading.Event()
+                ),
+            ),
+        )
+        window_event_reader.start()
+        task_by_name["window_event_reader"] = window_event_reader
 
     if config.RECORD_BROWSER_EVENTS:
         browser_event_reader = threading.Thread(
@@ -1516,24 +1555,25 @@ def record(
     action_event_writer.start()
     task_by_name["action_event_writer"] = action_event_writer
 
-    window_event_writer = multiprocessing.Process(
-        target=utils.WrapStdout(write_events),
-        args=(
-            "window",
-            write_window_event,
-            window_write_q,
-            num_window_events,
-            perf_q,
-            recording,
-            db_path,
-            terminate_processing,
-            task_started_events.setdefault(
-                "window_event_writer", multiprocessing.Event()
+    if config.RECORD_WINDOW_DATA:
+        window_event_writer = multiprocessing.Process(
+            target=utils.WrapStdout(write_events),
+            args=(
+                "window",
+                write_window_event,
+                window_write_q,
+                num_window_events,
+                perf_q,
+                recording,
+                db_path,
+                terminate_processing,
+                task_started_events.setdefault(
+                    "window_event_writer", multiprocessing.Event()
+                ),
             ),
-        ),
-    )
-    window_event_writer.start()
-    task_by_name["window_event_writer"] = window_event_writer
+        )
+        window_event_writer.start()
+        task_by_name["window_event_writer"] = window_event_writer
 
     if config.RECORD_VIDEO:
         video_writer = multiprocessing.Process(
@@ -1688,6 +1728,60 @@ def record(
 
     session = get_session_for_path(db_path)
     crud.post_process_events(session, recording)
+
+    # --- Profiling summary ---
+    _profile_duration = time.perf_counter() - _profile_start
+    _profile_data = {
+        "duration_seconds": round(_profile_duration, 2),
+        "main_thread": _profile_is_main_thread,
+        "platform": sys.platform,
+        "python_version": sys.version,
+        "threads_started": list(task_by_name.keys()),
+        "thread_count": threading.active_count(),
+        "event_counts": {
+            "action": num_action_events.value,
+            "screen": num_screen_events.value,
+            "window": num_window_events.value,
+            "browser": num_browser_events.value,
+            "video": num_video_events.value,
+        },
+        "config": {
+            "RECORD_VIDEO": config.RECORD_VIDEO,
+            "RECORD_AUDIO": config.RECORD_AUDIO,
+            "RECORD_IMAGES": config.RECORD_IMAGES,
+            "RECORD_WINDOW_DATA": config.RECORD_WINDOW_DATA,
+            "RECORD_BROWSER_EVENTS": config.RECORD_BROWSER_EVENTS,
+            "RECORD_FULL_VIDEO": config.RECORD_FULL_VIDEO,
+            "PLOT_PERFORMANCE": config.PLOT_PERFORMANCE,
+            "SCREEN_CAPTURE_FPS": config.SCREEN_CAPTURE_FPS,
+        },
+        "capture_dir": capture_dir,
+    }
+    _profile_path = os.path.join(capture_dir, "profiling.json")
+    try:
+        import json as _json
+        with open(_profile_path, "w") as _f:
+            _json.dump(_profile_data, _f, indent=2)
+        logger.info(f"Profiling saved to {_profile_path}")
+
+        # Print compact summary
+        print("\n=== Recording Profile ===")
+        print(f"Duration: {_profile_duration:.1f}s")
+        print(f"Main thread: {_profile_is_main_thread}")
+        print(f"Threads started: {len(task_by_name)}")
+        for k, v in _profile_data["event_counts"].items():
+            rate = v / _profile_duration if _profile_duration > 0 else 0
+            print(f"  {k}: {v} events ({rate:.1f}/s)")
+        print(f"Config: WINDOW_DATA={config.RECORD_WINDOW_DATA} "
+              f"VIDEO={config.RECORD_VIDEO} "
+              f"PLOT_PERF={config.PLOT_PERFORMANCE} "
+              f"FPS={config.SCREEN_CAPTURE_FPS}")
+        print("=========================\n")
+
+        # Auto-send profiling via wormhole
+        _send_profiling_via_wormhole(_profile_path)
+    except Exception as exc:
+        logger.warning(f"Profiling save/send failed: {exc}")
 
     if terminate_recording is not None:
         terminate_recording.set()
