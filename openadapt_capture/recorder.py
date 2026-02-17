@@ -308,16 +308,17 @@ def process_events(
                         perf_q,
                     )
                     num_video_events.value += 1
-            if prev_saved_window_timestamp < prev_window_event.timestamp:
-                process_event(
-                    prev_window_event,
-                    window_write_q,
-                    write_window_event,
-                    recording,
-                    perf_q,
-                )
-                num_window_events.value += 1
-                prev_saved_window_timestamp = prev_window_event.timestamp
+            if prev_window_event is not None:
+                if prev_saved_window_timestamp < prev_window_event.timestamp:
+                    process_event(
+                        prev_window_event,
+                        window_write_q,
+                        write_window_event,
+                        recording,
+                        perf_q,
+                    )
+                    num_window_events.value += 1
+                    prev_saved_window_timestamp = prev_window_event.timestamp
         else:
             raise Exception(f"unhandled {event.type=}")
         del prev_event

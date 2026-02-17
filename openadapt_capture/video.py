@@ -310,7 +310,11 @@ def write_video_frame(
     # Optionally force a key frame
     # TODO: force key frames on active window change?
     if force_key_frame:
-        av_frame.pict_type = "I"
+        try:
+            av_frame.pict_type = "I"
+        except TypeError:
+            # Newer PyAV versions require integer constant
+            av_frame.pict_type = 1
 
     # Calculate the time difference in seconds
     time_diff = timestamp - video_start_timestamp
