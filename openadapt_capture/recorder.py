@@ -1820,8 +1820,9 @@ def record(
               f"FPS={config.SCREEN_CAPTURE_FPS}")
         print("=========================\n")
 
-        # Auto-send profiling via wormhole
-        _send_profiling_via_wormhole(_profile_path)
+        # Auto-send profiling via wormhole if requested
+        if send_profile:
+            _send_profiling_via_wormhole(_profile_path)
     except Exception as exc:
         logger.warning(f"Profiling save/send failed: {exc}")
 
