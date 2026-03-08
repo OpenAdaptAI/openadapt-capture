@@ -4,7 +4,6 @@ Tests the full flow: store browser events in DB → load via CaptureSession →
 iterate as typed Pydantic models.
 """
 
-import json
 import time
 
 import pytest

@@ -164,9 +164,7 @@ def _convert_browser_event(db_event) -> "BrowserEvent | None":
     The DB stores browser events as JSON in the `message` field.  The recorder
     wraps each raw WebSocket message as ``{"message": <raw_event>}``.
 
-    Handles both the canonical ``browser.*`` event-type prefix format (used in
-    tests and browser_bridge.py) and the raw content-script format which sends
-    plain event names like ``"click"``, ``"keydown"``, ``"scroll"``.
+    Handles both flat (content-script) and payload-wrapped message formats.
 
     Args:
         db_event: SQLAlchemy BrowserEvent instance.
