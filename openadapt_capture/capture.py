@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
 from openadapt_capture.browser_events import (
+    BoundingBox,
     BrowserClickEvent,
     BrowserEventType,
     BrowserFocusEvent,
@@ -18,6 +19,9 @@ from openadapt_capture.browser_events import (
     BrowserMouseMoveEvent,
     BrowserNavigationEvent,
     BrowserScrollEvent,
+    ElementState,
+    NavigationType,
+    SemanticElementRef,
 )
 from openadapt_capture.events import (
     ActionEvent as PydanticActionEvent,
@@ -111,18 +115,12 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
     return None
 
 
-def _parse_element_ref(raw: dict | None):
+def _parse_element_ref(raw: dict | None) -> SemanticElementRef | None:
     """Parse a raw element dict into a SemanticElementRef.
 
-    Handles both the canonical format (from browser_bridge.py tests) and the
-    raw content-script format which uses different field names.
+    Handles field name variations between the content-script format
+    (e.g. ``dataId``, ``tagName``, ``classList``) and snake_case alternatives.
     """
-    from openadapt_capture.browser_events import (
-        BoundingBox,
-        ElementState,
-        SemanticElementRef,
-    )
-
     if not raw or not isinstance(raw, dict):
         return None
 
@@ -251,8 +249,6 @@ def _convert_browser_event(db_event) -> "BrowserEvent | None":
                 element=elem,
             )
         elif event_type == BrowserEventType.NAVIGATE:
-            from openadapt_capture.browser_events import NavigationType
-
             nav_type = payload.get("navigationType", "link")
             valid = [e.value for e in NavigationType]
             return BrowserNavigationEvent(
@@ -289,8 +285,9 @@ def _convert_browser_event(db_event) -> "BrowserEvent | None":
                 tab_id=tab_id,
                 element=elem,
             )
-    except Exception:
-        pass
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug("Failed to parse browser event: %s", e)
     return None
 
 

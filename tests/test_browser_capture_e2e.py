@@ -6,8 +6,6 @@ iterate as typed Pydantic models.
 
 import time
 
-import pytest
-
 from openadapt_capture.browser_events import (
     BrowserClickEvent,
     BrowserEventType,
@@ -20,7 +18,6 @@ from openadapt_capture.browser_events import (
 from openadapt_capture.capture import CaptureSession
 from openadapt_capture.db import create_db
 from openadapt_capture.db.crud import insert_browser_event, insert_recording
-from openadapt_capture.db.models import Recording
 
 
 def _make_element_payload(
@@ -61,8 +58,8 @@ def _setup_capture_db(tmp_path):
     return session, recording, db_path
 
 
-class TestBrowserEventsAPI:
-    """Test CaptureSession.browser_events() with synthetic DB data."""
+class TestBrowserEventsPayloadWrapped:
+    """Test browser events stored with payload-wrapped message format."""
 
     def test_empty_browser_events(self, tmp_path):
         """Capture with no browser events returns empty list."""
@@ -383,8 +380,8 @@ class TestBrowserEventsAPI:
         capture.close()
 
 
-class TestRawContentScriptFormat:
-    """Test parsing of raw content-script events (no 'browser.' prefix)."""
+class TestContentScriptFlatFormat:
+    """Test parsing of flat content-script events (real Chrome extension format)."""
 
     def test_raw_click_event(self, tmp_path):
         """Click from content script with flat format is parsed correctly."""
