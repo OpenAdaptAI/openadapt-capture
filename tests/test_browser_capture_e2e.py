@@ -8,7 +8,6 @@ import time
 
 from openadapt_capture.browser_events import (
     BrowserClickEvent,
-    BrowserEventType,
     BrowserInputEvent,
     BrowserKeyEvent,
     BrowserMouseMoveEvent,
