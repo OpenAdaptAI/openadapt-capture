@@ -71,9 +71,9 @@ class SynchronizedQueue(Queue):
     https://docs.python.org/3/library/pickle.html#pickling-class-instances
     """
 
-    def __init__(self) -> None:
+    def __init__(self, maxsize: int = 0) -> None:
         """Initialize the synchronized queue."""
-        super().__init__(ctx=multiprocessing.get_context())
+        super().__init__(maxsize=maxsize, ctx=multiprocessing.get_context())
         self.size = SharedCounter(0)
 
     def __getstate__(self) -> dict[str, int]:

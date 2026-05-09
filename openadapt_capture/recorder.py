@@ -399,6 +399,7 @@ def write_screen_event(
         with io.BytesIO() as output:
             image.save(output, format="PNG")
             png_data = output.getvalue()
+        image.close()
         event_data = {"png_data": png_data}
     else:
         event_data = {}
@@ -644,13 +645,16 @@ def write_video_event(
 
 
 def trigger_action_event(
-    event_q: queue.Queue, action_event_args: dict[str, Any]
+    event_q: queue.Queue,
+    action_event_args: dict[str, Any],
+    screenshot_trigger: threading.Event | None = None,
 ) -> None:
     """Triggers an action event and adds it to the event queue.
 
     Args:
         event_q: The event queue to add the action event to.
         action_event_args: A dictionary containing the arguments for the action event.
+        screenshot_trigger: Optional event to set after queuing the action event.
 
     Returns:
         None
@@ -664,9 +668,17 @@ def trigger_action_event(
             element_state = {}
         action_event_args["element_state"] = element_state
     event_q.put(Event(utils.get_timestamp(), "action", action_event_args))
+    if screenshot_trigger is not None:
+        screenshot_trigger.set()
 
 
-def on_move(event_q: queue.Queue, x: int, y: int, injected: bool = False) -> None:
+def on_move(
+    event_q: queue.Queue,
+    x: int,
+    y: int,
+    injected: bool = False,
+    screenshot_trigger: threading.Event | None = None,
+) -> None:
     """Handles the 'move' event.
 
     Args:
@@ -674,6 +686,7 @@ def on_move(event_q: queue.Queue, x: int, y: int, injected: bool = False) -> Non
         x: The x-coordinate of the mouse.
         y: The y-coordinate of the mouse.
         injected: Whether the event was injected or not.
+        screenshot_trigger: Optional event to set after queuing the action event.
 
     Returns:
         None
@@ -683,6 +696,7 @@ def on_move(event_q: queue.Queue, x: int, y: int, injected: bool = False) -> Non
         trigger_action_event(
             event_q,
             {"name": "move", "mouse_x": x, "mouse_y": y},
+            None,  # mouse moves don't change screen content
         )
 
 
@@ -693,6 +707,7 @@ def on_click(
     button: mouse.Button,
     pressed: bool,
     injected: bool = False,
+    screenshot_trigger: threading.Event | None = None,
 ) -> None:
     """Handles the 'click' event.
 
@@ -703,6 +718,7 @@ def on_click(
         button: The mouse button.
         pressed: Whether the button is pressed or released.
         injected: Whether the event was injected or not.
+        screenshot_trigger: Optional event to set after queuing the action event.
 
     Returns:
         None
@@ -718,6 +734,7 @@ def on_click(
                 "mouse_button_name": button.name,
                 "mouse_pressed": pressed,
             },
+            screenshot_trigger,
         )
 
 
@@ -728,6 +745,7 @@ def on_scroll(
     dx: int,
     dy: int,
     injected: bool = False,
+    screenshot_trigger: threading.Event | None = None,
 ) -> None:
     """Handles the 'scroll' event.
 
@@ -738,6 +756,7 @@ def on_scroll(
         dx: The horizontal scroll amount.
         dy: The vertical scroll amount.
         injected: Whether the event was injected or not.
+        screenshot_trigger: Optional event to set after queuing the action event.
 
     Returns:
         None
@@ -753,6 +772,7 @@ def on_scroll(
                 "mouse_dx": dx,
                 "mouse_dy": dy,
             },
+            None,  # scrolls don't change content meaningfully mid-scroll
         )
 
 
@@ -761,6 +781,7 @@ def handle_key(
     event_name: str,
     key: keyboard.KeyCode,
     canonical_key: keyboard.KeyCode,
+    screenshot_trigger: threading.Event | None = None,
 ) -> None:
     """Handles a key event.
 
@@ -769,6 +790,7 @@ def handle_key(
         event_name: The name of the key event.
         key: The key code of the key event.
         canonical_key: The canonical key code of the key event.
+        screenshot_trigger: Optional event to set after queuing the action event.
 
     Returns:
         None
@@ -787,7 +809,9 @@ def handle_key(
         for attr_name in attr_names
     }
     logger.debug(f"{canonical_attrs=}")
-    trigger_action_event(event_q, {"name": event_name, **attrs, **canonical_attrs})
+    trigger_action_event(
+        event_q, {"name": event_name, **attrs, **canonical_attrs}, screenshot_trigger
+    )
 
 
 def read_screen_events(
@@ -795,47 +819,58 @@ def read_screen_events(
     terminate_processing: multiprocessing.Event,
     recording: Recording,
     started_event: threading.Event,
+    screenshot_trigger: threading.Event | None = None,
     _screen_timing: _ScreenTimingStats | None = None,
 ) -> None:
     """Read screen events and add them to the event queue.
-
-    Captures at most ``config.SCREEN_CAPTURE_FPS`` frames per second.
-    Set to 0 for unlimited (legacy behaviour).
 
     Args:
         event_q: A queue for adding screen events.
         terminate_processing: An event to signal the termination of the process.
         recording: The recording object.
         started_event: Event to set once started.
+        screenshot_trigger: If provided, only capture when this event is set (action-gated).
         _screen_timing: If provided, record (screenshot_dur, total_dur) per iteration.
     """
     utils.set_start_time(recording.timestamp)
+    logger.info("Starting (action-gated mode)")
+    started_event.set()  # signal ready immediately; no initial screenshot needed
 
-    fps = config.SCREEN_CAPTURE_FPS
-    min_interval = 1.0 / fps if fps > 0 else 0.0
-
-    logger.info(f"Starting (fps={fps}, min_interval={min_interval:.3f}s)")
-    started = False
     while not terminate_processing.is_set():
+        # Block until an action fires or termination is requested
+        if screenshot_trigger is not None:
+            triggered = screenshot_trigger.wait(timeout=1.0)
+            if not triggered:
+                continue  # timeout — just check terminate flag and loop
+            screenshot_trigger.clear()
+            time.sleep(0.30)  # let the UI react before capturing
+        else:
+            # fallback: legacy FPS-based capture if no trigger provided
+            fps = config.SCREEN_CAPTURE_FPS
+            min_interval = 1.0 / fps if fps > 0 else 0.0
+            time.sleep(min_interval)
+
         t_start = time.perf_counter()
         screenshot = utils.take_screenshot()
         t_screenshot = time.perf_counter()
+
         if screenshot is None:
             logger.warning("Screenshot was None")
             continue
-        if not started:
-            started_event.set()
-            started = True
+
+        # Discard blank/black frames captured during display sleep or lock transition
+        mean_brightness = np.array(screenshot).mean()
+        if mean_brightness < 8.0:
+            logger.debug(f"Discarding blank screenshot (mean={mean_brightness:.1f})")
+            screenshot.close()
+            continue
+
         event_q.put(Event(utils.get_timestamp(), "screen", screenshot))
-        # Throttle: sleep for the remainder of the frame interval
-        if min_interval > 0:
-            elapsed = time.perf_counter() - t_start
-            sleep_time = min_interval - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+
         if _screen_timing is not None:
             t_end = time.perf_counter()
             _screen_timing.append((t_screenshot - t_start, t_end - t_start))
+
     logger.info("Done")
 
 
@@ -860,7 +895,11 @@ def read_window_events(
     prev_window_data = {}
     started = False
     while not terminate_processing.is_set():
-        window_data = window.get_active_window_data()
+        try:
+            window_data = window.get_active_window_data()
+        except Exception:
+            time.sleep(0.1)
+            continue
         if not window_data:
             time.sleep(0.1)
             continue
@@ -1041,6 +1080,7 @@ def read_keyboard_events(
     terminate_processing: multiprocessing.Event,
     recording: Recording,
     started_event: threading.Event,
+    screenshot_trigger: threading.Event | None = None,
 ) -> None:
     """Reads keyboard events and adds them to the event queue.
 
@@ -1050,6 +1090,7 @@ def read_keyboard_events(
           of event reading.
         recording (Recording): The recording object.
         started_event: Event to set once started.
+        screenshot_trigger: Optional event to set on each key action.
 
     Returns:
         None
@@ -1078,7 +1119,7 @@ def read_keyboard_events(
         canonical_key = keyboard_listener.canonical(key)
         logger.debug(f"{key=} {injected=} {canonical_key=}")
         if not injected:
-            handle_key(event_q, "press", key, canonical_key)
+            handle_key(event_q, "press", key, canonical_key, screenshot_trigger)
 
         # stop sequence code
         nonlocal stop_sequence_indices
@@ -1130,7 +1171,7 @@ def read_keyboard_events(
         canonical_key = keyboard_listener.canonical(key)
         logger.debug(f"{key=} {injected=} {canonical_key=}")
         if not injected:
-            handle_key(event_q, "release", key, canonical_key)
+            handle_key(event_q, "release", key, canonical_key, screenshot_trigger)
 
     utils.set_start_time(recording.timestamp)
 
@@ -1153,6 +1194,7 @@ def read_mouse_events(
     terminate_processing: multiprocessing.Event,
     recording: Recording,
     started_event: threading.Event,
+    screenshot_trigger: threading.Event | None = None,
 ) -> None:
     """Reads mouse events and adds them to the event queue.
 
@@ -1161,6 +1203,7 @@ def read_mouse_events(
         terminate_processing: The event to signal termination of event reading.
         recording: The recording object.
         started_event: Event to set once started.
+        screenshot_trigger: Optional event to set on each mouse action.
 
     Returns:
         None
@@ -1168,9 +1211,9 @@ def read_mouse_events(
     utils.set_start_time(recording.timestamp)
 
     mouse_listener = mouse.Listener(
-        on_move=partial(on_move, event_q),
-        on_click=partial(on_click, event_q),
-        on_scroll=partial(on_scroll, event_q),
+        on_move=partial(on_move, event_q, screenshot_trigger=screenshot_trigger),
+        on_click=partial(on_click, event_q, screenshot_trigger=screenshot_trigger),
+        on_scroll=partial(on_scroll, event_q, screenshot_trigger=screenshot_trigger),
     )
     mouse_listener.start()
 
@@ -1441,14 +1484,16 @@ def record(
     recording, db_path = create_recording(task_description, capture_dir)
     recording_timestamp = recording.timestamp
 
-    event_q = queue.Queue()
-    screen_write_q = sq.SynchronizedQueue()
-    action_write_q = sq.SynchronizedQueue()
-    window_write_q = sq.SynchronizedQueue()
-    browser_write_q = sq.SynchronizedQueue()
-    video_write_q = sq.SynchronizedQueue()
+    screenshot_trigger = threading.Event()
+
+    event_q = queue.Queue(maxsize=50)
+    screen_write_q = sq.SynchronizedQueue(maxsize=50)
+    action_write_q = sq.SynchronizedQueue(maxsize=50)
+    window_write_q = sq.SynchronizedQueue(maxsize=50)
+    browser_write_q = sq.SynchronizedQueue(maxsize=50)
+    video_write_q = sq.SynchronizedQueue(maxsize=50)
     # TODO: save write times to DB; display performance plot in visualize.py
-    perf_q = sq.SynchronizedQueue()
+    perf_q = sq.SynchronizedQueue(maxsize=50)
     if terminate_processing is None:
         terminate_processing = multiprocessing.Event()
     task_by_name = {}
@@ -1492,6 +1537,7 @@ def record(
             terminate_processing,
             recording,
             task_started_events.setdefault("screen_event_reader", threading.Event()),
+            screenshot_trigger,
             _screen_timing,
         ),
     )
@@ -1505,6 +1551,7 @@ def record(
             terminate_processing,
             recording,
             task_started_events.setdefault("keyboard_event_reader", threading.Event()),
+            screenshot_trigger,
         ),
     )
     keyboard_event_reader.start()
@@ -1517,6 +1564,7 @@ def record(
             terminate_processing,
             recording,
             task_started_events.setdefault("mouse_event_reader", threading.Event()),
+            screenshot_trigger,
         ),
     )
     mouse_event_reader.start()
