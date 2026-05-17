@@ -546,6 +546,8 @@ class BrowserBridge:
             tag_name=data.get("tag_name", data.get("tagName", "")),
             id=data.get("id"),
             class_list=data.get("class_list", data.get("classList", [])),
+            input_type=data.get("input_type", data.get("inputType")),
+            autocomplete=data.get("autocomplete"),
         )
 
     async def _handle_dom_snapshot(self, data: dict) -> None:

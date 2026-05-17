@@ -354,7 +354,12 @@ function extractSemanticElementRef(element) {
     screenBbox: element.getAttribute('data-tlbr-screen'),
     tagName: element.tagName.toLowerCase(),
     id: element.id || null,
-    classList: element.classList.length > 0 ? Array.from(element.classList) : null
+    classList: element.classList.length > 0 ? Array.from(element.classList) : null,
+    // HTML input attributes for downstream password-field detection.
+    // input[type] only meaningful on <input>; autocomplete applies to
+    // input/select/textarea/form. getAttribute returns null if unset.
+    input_type: element.tagName === 'INPUT' ? element.getAttribute('type') : null,
+    autocomplete: element.getAttribute('autocomplete')
   };
 }
 

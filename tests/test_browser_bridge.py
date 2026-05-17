@@ -94,6 +94,27 @@ class TestSemanticElementRef:
         assert state.checked is True
         assert state.selected is None
 
+    def test_element_ref_has_input_type_and_autocomplete_defaults(self):
+        """Newly-added fields default to None for backwards compatibility."""
+        bbox = BoundingBox(x=0, y=0, width=10, height=10)
+        ref = SemanticElementRef(role="button", bbox=bbox, xpath="/html/body/button")
+        assert ref.input_type is None
+        assert ref.autocomplete is None
+
+    def test_element_ref_carries_input_type_and_autocomplete(self):
+        """Setting the new fields round-trips through the model."""
+        bbox = BoundingBox(x=0, y=0, width=100, height=20)
+        ref = SemanticElementRef(
+            role="textbox",
+            bbox=bbox,
+            xpath="/html/body/form/input",
+            tag_name="input",
+            input_type="password",
+            autocomplete="current-password",
+        )
+        assert ref.input_type == "password"
+        assert ref.autocomplete == "current-password"
+
 
 class TestBrowserClickEvent:
     """Tests for BrowserClickEvent schema."""
@@ -820,3 +841,39 @@ class TestBrowserMode:
         assert BrowserMode("idle") == BrowserMode.IDLE
         assert BrowserMode("record") == BrowserMode.RECORD
         assert BrowserMode("replay") == BrowserMode.REPLAY
+
+
+@pytest.mark.skipif(not WEBSOCKETS_AVAILABLE, reason="websockets not installed")
+class TestParseElementRefInputAttrs:
+    """Verify _parse_element_ref forwards HTML input attrs to the model."""
+
+    def test_parses_input_type_and_autocomplete_snake_case(self):
+        bridge = BrowserBridge(host="127.0.0.1", port=8769)
+        parsed = bridge._parse_element_ref({
+            "role": "textbox",
+            "tagName": "input",
+            "input_type": "password",
+            "autocomplete": "current-password",
+            "bbox": {"x": 0, "y": 0, "width": 100, "height": 20},
+        })
+        assert parsed.input_type == "password"
+        assert parsed.autocomplete == "current-password"
+
+    def test_parses_input_type_camel_case_fallback(self):
+        bridge = BrowserBridge(host="127.0.0.1", port=8770)
+        parsed = bridge._parse_element_ref({
+            "role": "textbox",
+            "tagName": "input",
+            "inputType": "email",
+            "bbox": {"x": 0, "y": 0, "width": 100, "height": 20},
+        })
+        assert parsed.input_type == "email"
+
+    def test_defaults_to_none_when_attrs_absent(self):
+        bridge = BrowserBridge(host="127.0.0.1", port=8771)
+        parsed = bridge._parse_element_ref({
+            "role": "button",
+            "bbox": {"x": 0, "y": 0, "width": 1, "height": 1},
+        })
+        assert parsed.input_type is None
+        assert parsed.autocomplete is None

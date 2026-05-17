@@ -106,6 +106,16 @@ class SemanticElementRef(BaseModel):
     id: str | None = Field(default=None, description="Element ID if present")
     class_list: list[str] = Field(default_factory=list, description="CSS classes")
 
+    # HTML input attributes (used by downstream privacy-redaction wrappers
+    # to detect password fields without resorting to URL substring matching).
+    input_type: str | None = Field(
+        default=None, description="HTML input[type] attribute (e.g. 'password')"
+    )
+    autocomplete: str | None = Field(
+        default=None,
+        description="HTML autocomplete attribute (e.g. 'current-password')",
+    )
+
 
 # =============================================================================
 # Base Browser Event
