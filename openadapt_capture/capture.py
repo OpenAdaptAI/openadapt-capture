@@ -627,9 +627,18 @@ class CaptureSession:
             return None
 
     def close(self) -> None:
-        """Close the capture and release resources."""
+        """Close the capture and release resources.
+
+        Disposes the session's engine as well: SQLAlchemy's connection pool
+        keeps the SQLite file handle open after ``Session.close()``, which on
+        Windows leaves ``recording.db`` locked — deleting the capture
+        directory would fail with WinError 32 (sharing violation).
+        """
         if self._session is not None:
+            bind = self._session.get_bind()
             self._session.close()
+            if bind is not None:
+                bind.dispose()
             self._session = None
 
     def __enter__(self) -> "CaptureSession":

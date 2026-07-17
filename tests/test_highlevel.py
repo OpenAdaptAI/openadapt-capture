@@ -19,11 +19,20 @@ except ImportError:
     Recorder = None
 
 
+# Engines created by _create_test_recording, disposed by temp_capture_dir
+# teardown BEFORE the TemporaryDirectory is removed: SQLAlchemy's pool keeps
+# the SQLite file handle open after the test body, and on Windows an open
+# recording.db makes the rmtree fail with WinError 32 (sharing violation).
+_HELPER_ENGINES = []
+
+
 @pytest.fixture
 def temp_capture_dir():
     """Create a temporary directory for captures."""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield tmpdir
+        while _HELPER_ENGINES:
+            _HELPER_ENGINES.pop().dispose()
 
 
 def _create_test_recording(capture_dir, task_description="Test task"):
@@ -34,6 +43,7 @@ def _create_test_recording(capture_dir, task_description="Test task"):
     os.makedirs(capture_dir, exist_ok=True)
     db_path = os.path.join(capture_dir, "recording.db")
     engine, Session = create_db(db_path)
+    _HELPER_ENGINES.append(engine)
     session = Session()
 
     timestamp = time.time()
@@ -513,6 +523,7 @@ class TestPixelRatio:
             },
         )
         session.close()
+        engine.dispose()
 
         # The column is real: it is present in the on-disk schema.
         con = sqlite3.connect(db_path)
