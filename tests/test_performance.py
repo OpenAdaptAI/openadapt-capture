@@ -7,12 +7,12 @@ performance characteristics.
 Marked as 'slow' — skip with:  pytest -m "not slow"
 Run only these:                pytest -m slow -v
 
-NOTE: The legacy recorder uses multiprocessing.Process for writer tasks.
-On macOS (Python "spawn" start method), writer processes may fail to start
-because each child re-imports modules and triggers side effects like
-take_screenshot(). These tests are designed for Windows (the primary
-recording platform) and will skip on macOS/Linux if the recorder
-cannot start all processes within a timeout.
+NOTE: The recorder uses multiprocessing.Process for writer tasks. On macOS
+(Python "spawn" start method) writer processes historically failed to start
+because each child re-imported modules with display side effects; imports are
+side-effect free since 0.5.4, but the spawn path on macOS/Linux is not yet
+validated end to end. These tests target Windows (the primary recording
+platform) and are exercised in CI on windows-latest.
 """
 
 import os
@@ -33,11 +33,13 @@ try:
 except ImportError:
     Recorder = None
 
-# Skip on non-Windows platforms where the legacy recorder has known issues
+# Skip on non-Windows platforms where the live pipeline is not yet validated
 _SKIP_REASON = (
-    "Legacy recorder uses multiprocessing.Process which requires Windows "
-    "or fork-safe environment. On macOS/Linux with 'spawn' start method, "
-    "writer processes may fail to start."
+    "Live recorder integration tests target Windows (the primary recording "
+    "platform, exercised in CI on windows-latest). The multiprocessing "
+    "'spawn' writer path on macOS/Linux is not yet validated end to end; "
+    "on GitHub macOS runners pynput input injection also needs Accessibility "
+    "permissions that cannot be granted."
 )
 _ON_WINDOWS = sys.platform == "win32"
 
