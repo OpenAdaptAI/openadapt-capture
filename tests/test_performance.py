@@ -131,9 +131,10 @@ class TestRecorderIntegration:
         input_stop = threading.Event()
         cycles = [0]
 
-        with Recorder(capture_dir, task_description="Integration test"):
-            # Give recorder a moment to start listeners
-            time.sleep(1)
+        with Recorder(capture_dir, task_description="Integration test") as rec:
+            # Wait until listeners + writers are actually up (cold CI runners
+            # can take several seconds; a fixed sleep races the startup).
+            assert rec.wait_for_ready(timeout=120), "recorder failed to start"
 
             # Generate synthetic input in background thread
             def run_input():
@@ -181,8 +182,8 @@ class TestRecorderIntegration:
             d = str(tmp_path / f"capture_{i}")
             input_stop = threading.Event()
 
-            with Recorder(d, task_description=f"Reuse test {i}"):
-                time.sleep(1)
+            with Recorder(d, task_description=f"Reuse test {i}") as rec:
+                assert rec.wait_for_ready(timeout=120), "recorder failed to start"
 
                 def run_input():
                     _generate_synthetic_input(1, input_stop)
@@ -205,8 +206,8 @@ class TestRecorderIntegration:
         duration = 2
         input_stop = threading.Event()
 
-        with Recorder(capture_dir, task_description="Shutdown test"):
-            time.sleep(0.5)
+        with Recorder(capture_dir, task_description="Shutdown test") as rec:
+            assert rec.wait_for_ready(timeout=120), "recorder failed to start"
 
             def run_input():
                 _generate_synthetic_input(duration, input_stop)
@@ -241,8 +242,8 @@ class TestRecorderIntegration:
         )
         mem_thread.start()
 
-        with Recorder(capture_dir, task_description="Memory test"):
-            time.sleep(0.5)
+        with Recorder(capture_dir, task_description="Memory test") as rec:
+            assert rec.wait_for_ready(timeout=120), "recorder failed to start"
 
             def run_input():
                 _generate_synthetic_input(duration, input_stop)
@@ -271,8 +272,8 @@ class TestRecorderIntegration:
         """Test that recording.db is created in the capture directory."""
         input_stop = threading.Event()
 
-        with Recorder(capture_dir, task_description="DB test"):
-            time.sleep(0.5)
+        with Recorder(capture_dir, task_description="DB test") as rec:
+            assert rec.wait_for_ready(timeout=120), "recorder failed to start"
 
             def run_input():
                 _generate_synthetic_input(1, input_stop)
@@ -293,8 +294,8 @@ class TestRecorderIntegration:
         input_stop = threading.Event()
         cycles = [0]
 
-        with Recorder(capture_dir, task_description="Throughput test"):
-            time.sleep(0.5)
+        with Recorder(capture_dir, task_description="Throughput test") as rec:
+            assert rec.wait_for_ready(timeout=120), "recorder failed to start"
 
             def run_input():
                 cycles[0] = _generate_synthetic_input(duration, input_stop)

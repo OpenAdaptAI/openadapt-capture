@@ -263,7 +263,14 @@ def process_events(
     prev_saved_window_timestamp = 0
     started = False
     while not terminate_processing.is_set() or not event_q.empty():
-        event = event_q.get()
+        # Bounded get: a bare event_q.get() deadlocks shutdown when terminate
+        # is set while the queue is empty and the readers have already exited
+        # (nobody left to feed an event, so the loop condition is never
+        # re-checked and join_tasks() hangs forever on this thread).
+        try:
+            event = event_q.get(timeout=1)
+        except queue.Empty:
+            continue
         if not started:
             started_event.set()
             started = True
