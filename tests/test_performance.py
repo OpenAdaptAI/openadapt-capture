@@ -43,6 +43,20 @@ _SKIP_REASON = (
 )
 _ON_WINDOWS = sys.platform == "win32"
 
+# GitHub-hosted Windows runners execute jobs in a non-interactive session:
+# SendInput-injected events never reach the low-level hooks pynput uses, so
+# listener-dependent tests capture zero events there. The CI workflow sets
+# this flag; the live-pipeline tests that do not depend on captured input
+# (startup/shutdown, db creation, bounded memory) still run for real. Run the
+# full set on an interactive Windows desktop (developer machine or an
+# interactive self-hosted runner).
+_NO_INPUT_INJECTION = os.environ.get("OPENADAPT_CI_NO_INPUT_INJECTION") == "1"
+_INJECTION_SKIP_REASON = (
+    "OPENADAPT_CI_NO_INPUT_INJECTION=1: injected input does not reach pynput "
+    "hooks in a non-interactive session, so event-capture assertions cannot "
+    "hold (hosted CI runner limitation, not a recorder bug)"
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -124,6 +138,7 @@ def capture_dir(tmp_path):
 class TestRecorderIntegration:
     """Integration tests that run the full recording pipeline."""
 
+    @pytest.mark.skipif(_NO_INPUT_INJECTION, reason=_INJECTION_SKIP_REASON)
     def test_record_and_load_roundtrip(self, capture_dir):
         """Record synthetic input, stop, reload, and verify events round-trip."""
         duration = 3  # seconds
@@ -173,6 +188,7 @@ class TestRecorderIntegration:
 
         capture.close()
 
+    @pytest.mark.skipif(_NO_INPUT_INJECTION, reason=_INJECTION_SKIP_REASON)
     def test_recorder_reuse(self, tmp_path):
         """Test that Recorder can be used twice in the same process.
 
@@ -288,6 +304,7 @@ class TestRecorderIntegration:
         assert db_path.exists(), f"recording.db not found in {capture_dir}"
         assert db_path.stat().st_size > 0, "recording.db is empty"
 
+    @pytest.mark.skipif(_NO_INPUT_INJECTION, reason=_INJECTION_SKIP_REASON)
     def test_event_throughput(self, capture_dir):
         """Test that event capture rate is reasonable."""
         duration = 3

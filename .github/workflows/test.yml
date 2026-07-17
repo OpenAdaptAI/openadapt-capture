@@ -38,10 +38,14 @@ jobs:
 
   # Windows is the primary live-recording platform: this job runs the full
   # unit suite AND the live Recorder integration tests (tests/test_performance.py,
-  # marked 'slow'), which inject synthetic pynput input, record it through the
-  # real multiprocessing pipeline (listeners -> writer processes -> per-capture
-  # SQLite + video), and verify the capture round-trips. These tests skip
-  # everywhere except Windows, so this job is the org's live-recording CI proof.
+  # marked 'slow'), which start the real multiprocessing pipeline (pynput
+  # listeners -> writer processes -> per-capture SQLite + video) and verify
+  # clean startup, bounded shutdown/memory, and db creation. The three
+  # listener-dependent tests (roundtrip/reuse/throughput) skip here via
+  # OPENADAPT_CI_NO_INPUT_INJECTION: hosted runners execute jobs in a
+  # non-interactive session, so injected input never reaches pynput's hooks;
+  # run those on an interactive Windows desktop. These tests skip everywhere
+  # except Windows, so this job is the org's live-recording CI proof.
   test-windows:
     runs-on: windows-latest
     steps:
@@ -63,6 +67,12 @@ jobs:
         timeout-minutes: 10
 
       - name: Run live recorder integration tests
+        env:
+          # Non-interactive session: SendInput never reaches pynput's
+          # low-level hooks, so the event-capture tests skip (see
+          # tests/test_performance.py); pipeline start/stop/db/memory
+          # tests still run the live recorder for real.
+          OPENADAPT_CI_NO_INPUT_INJECTION: "1"
         run: uv run pytest tests/test_performance.py -v -m slow --timeout=300
         timeout-minutes: 20
 
