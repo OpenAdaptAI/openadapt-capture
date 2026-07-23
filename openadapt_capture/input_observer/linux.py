@@ -514,21 +514,46 @@ class LinuxXInputObserver(ThreadedInputObserver):
             )
         self._waiting_baseline_marker = True
         self._query_pointer_baseline()
-        marker_deadline = time.monotonic() + self.startup_timeout
-        while not self._baseline_marker_seen:
-            self._xtst.XRecordProcessReplies(self._data_display)
-            self._raise_callback_failure()
-            if time.monotonic() >= marker_deadline:
-                raise InputObserverError(
-                    "X RECORD did not deliver the ordered pointer-baseline marker "
-                    f"within {self.startup_timeout:.1f}s"
-                )
-            self._stop_requested.wait(0.001)
+        self._wait_for_baseline_marker()
+        self._raise_if_setup_cancelled()
         if not self._accepting_events:
             raise InputObserverError(
                 "X RECORD observed the pointer-baseline marker without arming input"
             )
         self._setup_complete = True
+
+    def _raise_if_setup_cancelled(self) -> None:
+        """Keep an outer readiness timeout from becoming a partial start."""
+        if (
+            not self._stop_requested.is_set()
+            and self._startup_failure is None
+        ):
+            return
+        self._waiting_baseline_marker = False
+        self._accepting_events = False
+        raise InputObserverError(
+            "X RECORD setup was cancelled before the input boundary was ready"
+        )
+
+    def _wait_for_baseline_marker(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """Wait interruptibly for the ordered QueryPointer boundary."""
+        marker_timeout = self.startup_timeout if timeout is None else timeout
+        marker_deadline = time.monotonic() + marker_timeout
+        while not self._baseline_marker_seen:
+            self._raise_if_setup_cancelled()
+            self._xtst.XRecordProcessReplies(self._data_display)
+            self._raise_if_setup_cancelled()
+            self._raise_callback_failure()
+            if time.monotonic() >= marker_deadline:
+                raise InputObserverError(
+                    "X RECORD did not deliver the ordered pointer-baseline marker "
+                    f"within {marker_timeout:.1f}s"
+                )
+            self._stop_requested.wait(0.001)
 
     def _configure_api(self) -> None:
         self._x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
@@ -716,6 +741,12 @@ class LinuxXInputObserver(ThreadedInputObserver):
                 and payload[0] == 1
             ):
                 self._waiting_baseline_marker = False
+                if (
+                    self._stop_requested.is_set()
+                    or self._startup_failure is not None
+                ):
+                    self._accepting_events = False
+                    return
                 self._baseline_marker_seen = True
                 self._accepting_events = True
                 return
@@ -1068,14 +1099,10 @@ class LinuxXInputObserver(ThreadedInputObserver):
 
     def _drain_record_tail(self) -> None:
         """Drain DisableContext's complete tail through EndOfData, or refuse."""
-        cleanup_reserve = min(
-            0.5,
-            max(
-                2 * _LOOP_INTERVAL_SECONDS,
-                self.shutdown_timeout * 0.1,
-            ),
-        )
-        drain_budget = max(0.0, self.shutdown_timeout - cleanup_reserve)
+        # This drain runs inside the outer observer thread's join window.  Use
+        # at most 80% so native frees, display closes, delivery shutdown, and
+        # scheduler jitter retain a meaningful cleanup budget.
+        drain_budget = max(0.0, self.shutdown_timeout * 0.8)
         deadline = time.monotonic() + drain_budget
         while not self._record_ended:
             self._xtst.XRecordProcessReplies(self._data_display)
@@ -1116,10 +1143,14 @@ class LinuxXInputObserver(ThreadedInputObserver):
                 cleanup_failures.append(exc)
                 return None
 
-        if self._record_enabled and not self._setup_complete:
+        if self._record_enabled and (
+            not self._setup_complete or self._startup_failure is not None
+        ):
             # A startup timeout can leave the ordered QueryPointer marker in
-            # the server tail.  Teardown must free that marker and subsequent
-            # records without letting a failed start arm event acceptance.
+            # the server tail, including after _setup completes but before the
+            # base lifecycle publishes readiness.  Teardown must free that
+            # marker and subsequent records without letting a failed start
+            # arm or retain event acceptance.
             self._waiting_baseline_marker = False
             self._accepting_events = False
         if (

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import time
 
 import pytest
 
@@ -1176,3 +1177,175 @@ def test_failed_start_drain_never_arms_or_emits_buffered_input() -> None:
     assert not observer._baseline_marker_seen
     assert not observer._waiting_baseline_marker
     assert not observer._accepting_events
+
+
+def exercise_cancelled_start_lifecycle(
+    *,
+    include_buffered_tail: bool,
+    enter_marker_wait_after_cancel: bool = False,
+    complete_setup_before_cancel: bool = False,
+) -> tuple[LinuxXInputObserver, list, object, float]:
+    events = []
+
+    class LifecycleX11:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def XCloseDisplay(self, _display) -> int:
+            self.close_count += 1
+            return 0
+
+    class LifecycleXtst:
+        def __init__(self) -> None:
+            self.observer: LinuxXInputObserver | None = None
+            self.disabled = False
+            self.tail_sent = False
+            self.process_before_disable = 0
+            self.free_data_count = 0
+            self.free_context_count = 0
+
+        def XRecordDisableContext(self, _display, _context) -> int:
+            self.disabled = True
+            return 1
+
+        def XRecordProcessReplies(self, _display) -> None:
+            if not self.disabled:
+                self.process_before_disable += 1
+                return
+            if self.tail_sent:
+                return
+            self.tail_sent = True
+            assert self.observer is not None
+            if include_buffered_tail:
+                marker = bytearray(32)
+                marker[0] = 1
+                intercept_record(
+                    self.observer,
+                    category=linux_module._XRECORD_FROM_SERVER,
+                    payload=bytes(marker),
+                    id_base=self.observer._control_id_base,
+                )
+                intercept_record(
+                    self.observer,
+                    category=linux_module._XRECORD_FROM_SERVER,
+                    payload=wire_event(
+                        event_type=linux_module._KEY_PRESS,
+                        detail=38,
+                        event_time=700,
+                    ),
+                )
+                intercept_record(
+                    self.observer,
+                    category=linux_module._XRECORD_FROM_SERVER,
+                    payload=wire_event(
+                        event_type=linux_module._KEY_PRESS,
+                        detail=38,
+                        event_time=700,
+                        state=1,
+                    ),
+                    id_base=0x800000,
+                )
+            intercept_record(
+                self.observer,
+                category=linux_module._XRECORD_END_OF_DATA,
+            )
+
+        def XRecordFreeData(self, _pointer) -> None:
+            self.free_data_count += 1
+
+        def XRecordFreeContext(self, _display, _context) -> int:
+            self.free_context_count += 1
+            return 1
+
+    x11 = LifecycleX11()
+    xtst = LifecycleXtst()
+
+    class ControlledLifecycleObserver(LinuxXInputObserver):
+        def _setup(self) -> None:
+            self._x11 = x11
+            self._xtst = xtst
+            self._xkbcommon = None
+            self._control_display = object()
+            self._data_display = object()
+            self._record_context = 11
+            self._record_enabled = True
+            self._record_started = True
+            self._control_id_base = 0x400000
+            self._waiting_baseline_marker = True
+            if complete_setup_before_cancel:
+                self._waiting_baseline_marker = False
+                self._baseline_marker_seen = True
+                self._accepting_events = True
+                self._setup_complete = True
+                assert self._stop_requested.wait(self.shutdown_timeout)
+                return
+            if enter_marker_wait_after_cancel:
+                assert self._stop_requested.wait(self.shutdown_timeout)
+            self._wait_for_baseline_marker(timeout=self.shutdown_timeout * 2)
+            self._raise_if_setup_cancelled()
+            if not self._accepting_events:
+                raise InputObserverError(
+                    "test boundary was observed without arming input"
+                )
+            self._setup_complete = True
+
+    observer = ControlledLifecycleObserver(
+        events.append,
+        observe_keyboard=True,
+        observe_mouse=True,
+        capture_mouse_moves=True,
+        startup_timeout=0.02,
+        shutdown_timeout=0.2,
+        environ={"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11"},
+    )
+    xtst.observer = observer
+    started_at = time.monotonic()
+    with pytest.raises(InputObserverError, match="did not become ready"):
+        observer.start()
+    elapsed = time.monotonic() - started_at
+
+    assert x11.close_count == 2
+    return observer, events, xtst, elapsed
+
+
+def test_start_timeout_discards_delayed_marker_and_buffered_input_tail() -> None:
+    observer, events, xtst, elapsed = exercise_cancelled_start_lifecycle(
+        include_buffered_tail=True,
+    )
+
+    assert events == []
+    assert xtst.tail_sent
+    assert xtst.free_data_count == 4
+    assert xtst.free_context_count == 1
+    assert observer._thread is None
+    assert observer._delivery_thread is None
+    assert elapsed < observer.startup_timeout + observer.shutdown_timeout + 0.1
+
+
+def test_start_cancellation_before_marker_wait_returns_without_polling() -> None:
+    observer, events, xtst, elapsed = exercise_cancelled_start_lifecycle(
+        include_buffered_tail=False,
+        enter_marker_wait_after_cancel=True,
+    )
+
+    assert events == []
+    assert xtst.tail_sent
+    assert xtst.process_before_disable == 0
+    assert xtst.free_data_count == 1
+    assert xtst.free_context_count == 1
+    assert observer._thread is None
+    assert elapsed < observer.startup_timeout + observer.shutdown_timeout + 0.1
+
+
+def test_timeout_after_setup_before_ready_still_suppresses_tail() -> None:
+    observer, events, xtst, elapsed = exercise_cancelled_start_lifecycle(
+        include_buffered_tail=True,
+        complete_setup_before_cancel=True,
+    )
+
+    assert events == []
+    assert xtst.tail_sent
+    assert xtst.free_data_count == 4
+    assert xtst.free_context_count == 1
+    assert observer._thread is None
+    assert elapsed < observer.startup_timeout + observer.shutdown_timeout + 0.1
