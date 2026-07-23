@@ -61,6 +61,7 @@ class FakeUser32:
         translation_entered: threading.Event | None = None,
         translation_release: threading.Event | None = None,
         translation_error: BaseException | None = None,
+        translation_result: int = 1,
     ) -> None:
         self.hook_results = list(hook_results or [101, 102])
         self.last_error = last_error
@@ -74,6 +75,7 @@ class FakeUser32:
         self.translation_entered = translation_entered
         self.translation_release = translation_release
         self.translation_error = translation_error
+        self.translation_result = translation_result
         self.async_key_state: dict[int, int] = {}
         self.toggle_key_state: dict[int, int] = {}
         self.layout_thread_ids: list[int] = []
@@ -148,7 +150,7 @@ class FakeUser32:
         else:
             character = character.lower()
         buffer[0] = character
-        return 1
+        return self.translation_result
 
     def GetKeyboardLayout(self, thread_id):
         self.layout_thread_ids.append(thread_id)
@@ -514,6 +516,31 @@ def test_keyboard_state_tracks_toggle_without_repeat_retoggling() -> None:
         timestamp=1234.5,
     )
     assert observer._keyboard_state[VK_CAPITAL] & 0x01
+    observer.stop()
+
+
+def test_dead_key_preserves_physical_identity_without_claiming_text() -> None:
+    events = []
+    user32 = FakeUser32(translation_result=-1)
+    observer = make_observer(events.append, user32=user32)
+    observer.start()
+    dead_key = KBDLLHOOKSTRUCT(vkCode=0xDE, scanCode=0x28)
+
+    observer._keyboard_hook_callback(
+        HC_ACTION,
+        WM_KEYDOWN,
+        ctypes.addressof(dead_key),
+    )
+
+    assert wait_until(lambda: len(events) == 1)
+    assert events == [
+        ObservedKey(
+            pressed=True,
+            key_vk="222",
+            canonical_key_vk="222",
+            timestamp=1234.5,
+        )
+    ]
     observer.stop()
 
 

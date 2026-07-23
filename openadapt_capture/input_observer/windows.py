@@ -722,7 +722,12 @@ class WindowsInputObserver(ThreadedInputObserver):
         )
         if count == 0:
             return None
-        character_count = abs(count)
+        if count < 0:
+            # A dead key is composition state, not committed text. Preserve
+            # physical identity but do not claim that its spacing accent was
+            # typed before a later key resolves the composition.
+            return None
+        character_count = count
         if ctypes.sizeof(ctypes.c_wchar) == 2:
             raw = ctypes.string_at(buffer, character_count * 2)
             return raw.decode("utf-16-le")
