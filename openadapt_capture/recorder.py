@@ -33,7 +33,6 @@ from collections import namedtuple
 from functools import partial
 from typing import Any, Callable
 
-import av
 import fire
 import numpy as np
 import psutil
@@ -730,8 +729,8 @@ def write_video_event(
     recording_timestamp: float,
     event: Event,
     perf_q: sq.SynchronizedQueue,
-    video_container: av.container.OutputContainer,
-    video_stream: av.stream.Stream,
+    video_container: Any,
+    video_stream: Any,
     video_start_timestamp: float,
     last_pts: int = 0,
     num_copies: int = 2,
@@ -744,9 +743,8 @@ def write_video_event(
         recording_timestamp: The timestamp of the recording.
         event: A screen event to be written.
         perf_q: A queue for collecting performance data.
-        video_container (av.container.OutputContainer): The output container to which
-            the frame is written.
-        video_stream (av.stream.Stream): The video stream within the container.
+        video_container: The external-encoder staging container.
+        video_stream: The configured external-encoder stream.
         video_start_timestamp (float): The base timestamp from which the video
             recording started.
         last_pts: The last presentation timestamp.
@@ -1620,6 +1618,16 @@ def record(
         config.RECORD_VIDEO,
         config.RECORD_IMAGES,
     )
+    # Refuse before touching the display or starting any worker. Capture never
+    # downloads or bundles FFmpeg; Desktop/standalone provisioning owns it.
+    if config.RECORD_VIDEO:
+        video.require_video_encoder(
+            ffmpeg_path=config.VIDEO_FFMPEG_PATH,
+            ffprobe_path=config.VIDEO_FFPROBE_PATH,
+            codec=config.VIDEO_ENCODING,
+            pixel_format=config.VIDEO_PIXEL_FORMAT,
+            muxer=config.VIDEO_MUXER,
+        )
 
     # Configure loguru level for recording (without destroying global config)
     logger.configure(handlers=[{"sink": sys.stderr, "level": LOG_LEVEL}])
@@ -2141,6 +2149,10 @@ class Recorder:
         capture_full_video: bool | None = None,
         video_encoding: str | None = None,
         video_pixel_format: str | None = None,
+        video_muxer: str | None = None,
+        ffmpeg_path: str | None = None,
+        ffprobe_path: str | None = None,
+        ffmpeg_timeout_seconds: float | None = None,
         stop_sequences: list[list[str]] | None = None,
         log_memory: bool | None = None,
         plot_performance: bool | None = None,
@@ -2170,6 +2182,10 @@ class Recorder:
             capture_full_video=capture_full_video,
             video_encoding=video_encoding,
             video_pixel_format=video_pixel_format,
+            video_muxer=video_muxer,
+            ffmpeg_path=ffmpeg_path,
+            ffprobe_path=ffprobe_path,
+            ffmpeg_timeout_seconds=ffmpeg_timeout_seconds,
             stop_sequences=stop_sequences,
             log_memory=log_memory,
             plot_performance=plot_performance,
