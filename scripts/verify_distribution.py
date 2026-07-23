@@ -8,8 +8,8 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-FORBIDDEN_DEPENDENCIES = ("oa-atomacos",)
-FORBIDDEN_SOURCE_TOKENS = ("oa_atomacos",)
+FORBIDDEN_DEPENDENCIES = ("oa-atomacos", "pynput")
+FORBIDDEN_SOURCE_TOKENS = ("oa_atomacos", "pynput")
 
 
 def _archive_files(path: Path) -> dict[str, bytes]:

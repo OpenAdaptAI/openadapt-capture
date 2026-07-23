@@ -22,7 +22,6 @@ classifiers = [
 
 dependencies = [
     "pydantic>=2.0.0",
-    "pynput>=1.7.6",
     "av>=12.0.0",
     "Pillow>=10.1.0",
     "fire>=0.7.1",
@@ -133,5 +132,7 @@ patch_tags = ["fix", "perf"]
 dev = [
     "numpy>=2.2.6",
     "psutil>=7.2.2",
+    # Test-only synthetic input driver; excluded from package metadata/runtime.
+    "pynput>=1.7.6",
     "pytest>=9.0.2",
 ]

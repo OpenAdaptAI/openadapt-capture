@@ -140,10 +140,18 @@ class DarwinInputObserver(ThreadedInputObserver):
         quartz = self._quartz
 
         if not self._has_observation_permission():
-            raise InputObserverPermissionError(
-                "macOS denied global input observation. Enable Input Monitoring "
-                "for OpenAdapt in System Settings > Privacy & Security."
+            request_permission = getattr(
+                quartz,
+                "CGRequestListenEventAccess",
+                None,
             )
+            if callable(request_permission):
+                request_permission()
+            if not self._has_observation_permission():
+                raise InputObserverPermissionError(
+                    "macOS denied global input observation. Enable Input Monitoring "
+                    "for OpenAdapt in System Settings > Privacy & Security."
+                )
 
         event_mask = 0
         for event_type in self._observed_event_types():
@@ -294,18 +302,23 @@ class DarwinInputObserver(ThreadedInputObserver):
         ):
             if self._event_tap is not None:
                 quartz.CGEventTapEnable(self._event_tap, True)
+            self._fail(
+                InputObserverError(
+                    "macOS disabled the input event tap; recording coverage is "
+                    "incomplete"
+                )
+            )
             return event
 
         try:
             self._handle_event(event_type, event)
         except BaseException as exc:
-            self._failure = (
+            failure = (
                 exc
                 if isinstance(exc, InputObserverError)
                 else InputObserverError(f"macOS input callback failed: {exc}")
             )
-            self._stop_requested.set()
-            self._wake()
+            self._fail(failure)
         return event
 
     def _handle_event(self, event_type: int, event: Any) -> None:

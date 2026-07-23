@@ -74,9 +74,12 @@ class FakeQuartz:
         self,
         *,
         permission: bool = True,
+        grant_on_request: bool = False,
         create_tap: bool = True,
     ) -> None:
         self.permission = permission
+        self.grant_on_request = grant_on_request
+        self.permission_requests = 0
         self.create_tap = create_tap
         self.tap = object()
         self.loop = object()
@@ -91,6 +94,12 @@ class FakeQuartz:
         self.invalidated_ports = []
 
     def CGPreflightListenEventAccess(self):
+        return self.permission
+
+    def CGRequestListenEventAccess(self):
+        self.permission_requests += 1
+        if self.grant_on_request:
+            self.permission = True
         return self.permission
 
     @staticmethod
@@ -222,6 +231,18 @@ def test_permission_denial_fails_before_event_tap_creation() -> None:
     with pytest.raises(InputObserverPermissionError, match="Input Monitoring"):
         observer.start()
     assert quartz.callback is None
+    assert quartz.permission_requests == 1
+
+
+def test_permission_request_can_complete_explicit_observer_start() -> None:
+    quartz = FakeQuartz(permission=False, grant_on_request=True)
+    observer = make_observer(quartz, lambda _event: None)
+
+    observer.start()
+    observer.stop()
+
+    assert quartz.permission_requests == 1
+    assert quartz.callback is not None
 
 
 def test_accessibility_permission_is_fallback_on_older_macos() -> None:
@@ -255,6 +276,7 @@ def test_mouse_move_button_and_scroll_normalization() -> None:
     observer = make_observer(quartz, events.append)
     physical = {quartz.kCGEventSourceUnixProcessID: 0}
 
+    observer.start()
     observer._handle_event(
         quartz.kCGEventMouseMoved,
         FakeEvent(x=11.5, y=22.5, fields=physical),
@@ -286,6 +308,7 @@ def test_mouse_move_button_and_scroll_normalization() -> None:
             },
         ),
     )
+    observer.stop()
 
     assert events == [
         ObservedMouseMove(x=11.5, y=22.5),
@@ -314,8 +337,10 @@ def test_move_filter_does_not_disable_buttons() -> None:
         capture_mouse_moves=False,
     )
 
+    observer.start()
     observer._handle_event(quartz.kCGEventMouseMoved, FakeEvent())
     observer._handle_event(quartz.kCGEventRightMouseUp, FakeEvent())
+    observer.stop()
 
     assert events == [
         ObservedMouseButton(
@@ -333,6 +358,7 @@ def test_key_press_release_and_modifier_canonicalization() -> None:
     events = []
     observer = make_observer(quartz, events.append)
 
+    observer.start()
     observer._handle_event(
         quartz.kCGEventKeyDown,
         FakeEvent(
@@ -359,6 +385,7 @@ def test_key_press_release_and_modifier_canonicalization() -> None:
     )
     observer._handle_event(quartz.kCGEventFlagsChanged, shift_press)
     observer._handle_event(quartz.kCGEventFlagsChanged, shift_release)
+    observer.stop()
 
     assert events == [
         ObservedKey(
@@ -398,6 +425,7 @@ def test_first_observed_modifier_release_does_not_toggle_to_press() -> None:
     events = []
     observer = make_observer(quartz, events.append)
 
+    observer.start()
     observer._handle_event(
         quartz.kCGEventFlagsChanged,
         FakeEvent(
@@ -405,6 +433,7 @@ def test_first_observed_modifier_release_does_not_toggle_to_press() -> None:
             flags=0,
         ),
     )
+    observer.stop()
 
     assert events == [
         ObservedKey(
@@ -422,6 +451,7 @@ def test_caps_lock_state_comes_from_event_flags() -> None:
     events = []
     observer = make_observer(quartz, events.append)
 
+    observer.start()
     observer._handle_event(
         quartz.kCGEventFlagsChanged,
         FakeEvent(
@@ -436,6 +466,7 @@ def test_caps_lock_state_comes_from_event_flags() -> None:
             flags=0,
         ),
     )
+    observer.stop()
 
     assert [(event.key_name, event.pressed) for event in events] == [
         ("caps_lock", True),
@@ -448,6 +479,7 @@ def test_releasing_one_shift_ignores_the_sibling_aggregate_flag() -> None:
     events = []
     observer = make_observer(quartz, events.append)
 
+    observer.start()
     for keycode, flags in [
         (56, quartz.kCGEventFlagMaskShift),
         (60, quartz.kCGEventFlagMaskShift),
@@ -461,6 +493,7 @@ def test_releasing_one_shift_ignores_the_sibling_aggregate_flag() -> None:
                 flags=flags,
             ),
         )
+    observer.stop()
 
     assert [(event.key_name, event.pressed) for event in events] == [
         ("shift_l", True),
@@ -470,13 +503,13 @@ def test_releasing_one_shift_ignores_the_sibling_aggregate_flag() -> None:
     ]
 
 
-def test_disabled_tap_is_reenabled_without_emitting_input() -> None:
+def test_disabled_tap_fails_loud_instead_of_hiding_incomplete_coverage() -> None:
     quartz = FakeQuartz()
     events = []
     observer = make_observer(quartz, events.append)
-    observer._event_tap = quartz.tap
     event = FakeEvent()
 
+    observer.start()
     assert (
         observer._event_callback(
             None,
@@ -486,7 +519,11 @@ def test_disabled_tap_is_reenabled_without_emitting_input() -> None:
         )
         is event
     )
-    assert quartz.tap_enabled == [True]
+    with pytest.raises(InputObserverError, match="coverage is incomplete"):
+        observer.check_health()
+    with pytest.raises(InputObserverError, match="coverage is incomplete"):
+        observer.stop()
+    assert quartz.tap_enabled == [True, True, False]
     assert events == []
 
 
@@ -502,8 +539,19 @@ def test_callback_failure_becomes_health_failure() -> None:
         ObservedMouseMove(1, 2)
     )
 
+    observer.start()
     observer._event_callback(None, quartz.kCGEventMouseMoved, event, None)
 
-    with pytest.raises(InputObserverError, match="callback boom"):
-        observer.check_health()
+    deadline = time.monotonic() + 1
+    while True:
+        try:
+            observer.check_health()
+        except InputObserverError as exc:
+            assert "callback boom" in str(exc)
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("asynchronous callback failure did not reach observer health")
+        time.sleep(0.001)
     assert observer._stop_requested.is_set()
+    with pytest.raises(InputObserverError, match="callback boom"):
+        observer.stop()

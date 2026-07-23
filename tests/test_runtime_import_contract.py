@@ -43,6 +43,16 @@ def test_macos_accessibility_uses_permissive_runtime_dependencies() -> None:
     assert "oa_atomacos" not in package_sources
 
 
+def test_native_input_observers_do_not_ship_pynput() -> None:
+    """The default runtime and packaged source stay outside pynput's LGPL path."""
+    assert "pynput" not in _runtime_dependency_names()
+    package_sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "openadapt_capture").rglob("*.py")
+    )
+    assert "pynput" not in package_sources
+
+
 def test_default_install_exposes_recorder() -> None:
     """Recorder import never fails because a runtime dependency is undeclared."""
     result = subprocess.run(

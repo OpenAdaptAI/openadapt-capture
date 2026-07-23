@@ -10,18 +10,10 @@ from pathlib import Path
 
 import pytest
 
+from openadapt_capture import recorder as recorder_module
 from openadapt_capture.capture import Capture
 from openadapt_capture.db import create_db, crud
-
-# Recorder requires pynput which needs a display server
-try:
-    from openadapt_capture import recorder as recorder_module
-
-    Recorder = recorder_module.Recorder
-except ImportError:
-    recorder_module = None
-    Recorder = None
-
+from openadapt_capture.recorder import Recorder
 
 # Sessions/engines created by _create_test_recording, released by the
 # temp_capture_dir teardown BEFORE the TemporaryDirectory is removed. Both
@@ -70,7 +62,6 @@ def _create_test_recording(capture_dir, task_description="Test task"):
     return recording, db_path, session
 
 
-@pytest.mark.skipif(Recorder is None, reason="pynput unavailable (headless)")
 class TestRecorder:
     """Tests for Recorder class."""
 
