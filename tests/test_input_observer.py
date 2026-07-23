@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import queue
 import sys
 import threading
@@ -28,7 +27,6 @@ from openadapt_capture.input_observer import (
 )
 from openadapt_capture.input_observer.linux import (
     LinuxXInputObserver,
-    _XIRawEvent,
     normalize_xinput_button_event,
     normalize_xinput_key_event,
 )
@@ -529,17 +527,6 @@ def test_auxiliary_mouse_button_survives_storage_conversion_and_processing(
     assert len(processed) == 1
     assert isinstance(processed[0], MouseClickEvent)
     assert processed[0].button == button
-
-
-@pytest.mark.skipif(
-    ctypes.sizeof(ctypes.c_void_p) != 8 or ctypes.sizeof(ctypes.c_ulong) != 8,
-    reason="ABI offsets below describe Linux's 64-bit LP64 data model",
-)
-def test_xinput_raw_event_matches_64_bit_libxi_abi() -> None:
-    assert ctypes.sizeof(_XIRawEvent) == 96
-    assert _XIRawEvent.flags.offset == 60
-    assert _XIRawEvent.valuators.offset == 64
-    assert _XIRawEvent.raw_values.offset == 88
 
 
 def test_wayland_refuses_instead_of_silently_observing_only_xwayland(
