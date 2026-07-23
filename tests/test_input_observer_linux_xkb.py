@@ -1349,3 +1349,154 @@ def test_timeout_after_setup_before_ready_still_suppresses_tail() -> None:
     assert xtst.free_context_count == 1
     assert observer._thread is None
     assert elapsed < observer.startup_timeout + observer.shutdown_timeout + 0.1
+
+
+def test_outer_timeout_cancels_already_armed_record_batch_transactionally() -> None:
+    events = []
+
+    class LifecycleX11:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def XCloseDisplay(self, _display) -> int:
+            self.close_count += 1
+            return 0
+
+    class CancelledBatchObserver(LinuxXInputObserver):
+        def __init__(self) -> None:
+            super().__init__(
+                events.append,
+                observe_keyboard=True,
+                observe_mouse=True,
+                capture_mouse_moves=True,
+                startup_timeout=0.02,
+                shutdown_timeout=0.2,
+                environ={"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11"},
+            )
+            self.device_records_processed = 0
+            self.delivered_records_processed = 0
+
+        def _handle_device_event(self, event: _CoreWireEvent) -> None:
+            self.device_records_processed += 1
+            super()._handle_device_event(event)
+
+        def _handle_delivered_event(
+            self,
+            event: _CoreWireEvent,
+            *,
+            id_base: int,
+        ) -> None:
+            self.delivered_records_processed += 1
+            super()._handle_delivered_event(event, id_base=id_base)
+
+        def _setup(self) -> None:
+            self._x11 = x11
+            self._xtst = xtst
+            self._xkbcommon = None
+            self._control_display = object()
+            self._data_display = object()
+            self._record_context = 11
+            self._record_enabled = True
+            self._record_started = True
+            self._control_id_base = 0x400000
+            self._waiting_baseline_marker = True
+            self._wait_for_baseline_marker(timeout=self.shutdown_timeout * 2)
+            self._raise_if_setup_cancelled()
+            self._setup_complete = True
+
+    class LifecycleXtst:
+        def __init__(self) -> None:
+            self.observer: CancelledBatchObserver | None = None
+            self.disabled = False
+            self.pre_disable_batch_sent = False
+            self.end_sent = False
+            self.free_data_count = 0
+            self.free_context_count = 0
+
+        def XRecordDisableContext(self, _display, _context) -> int:
+            self.disabled = True
+            return 1
+
+        def XRecordProcessReplies(self, _display) -> None:
+            assert self.observer is not None
+            if not self.disabled and not self.pre_disable_batch_sent:
+                self.pre_disable_batch_sent = True
+                marker = bytearray(32)
+                marker[0] = 1
+                intercept_record(
+                    self.observer,
+                    category=linux_module._XRECORD_FROM_SERVER,
+                    payload=bytes(marker),
+                    id_base=self.observer._control_id_base,
+                )
+                assert self.observer._accepting_events
+                # Model a native batch already copied by ProcessReplies while
+                # the parent start() deadline expires between its marker and
+                # remaining records.
+                assert self.observer._stop_requested.wait(timeout=1)
+                intercept_record(
+                    self.observer,
+                    category=linux_module._XRECORD_FROM_SERVER,
+                    payload=wire_event(
+                        event_type=linux_module._KEY_PRESS,
+                        detail=38,
+                        event_time=800,
+                    ),
+                )
+                intercept_record(
+                    self.observer,
+                    category=linux_module._XRECORD_FROM_SERVER,
+                    payload=wire_event(
+                        event_type=linux_module._KEY_PRESS,
+                        detail=38,
+                        event_time=800,
+                        state=1,
+                    ),
+                    id_base=0x800000,
+                )
+                intercept_record(
+                    self.observer,
+                    category=linux_module._XRECORD_FROM_SERVER,
+                    payload=wire_event(
+                        event_type=linux_module._MOTION_NOTIFY,
+                        detail=0,
+                        event_time=801,
+                        root_x=30,
+                        root_y=40,
+                    ),
+                )
+                assert self.observer.device_records_processed == 0
+                assert self.observer.delivered_records_processed == 0
+                return
+            if self.disabled and not self.end_sent:
+                self.end_sent = True
+                intercept_record(
+                    self.observer,
+                    category=linux_module._XRECORD_END_OF_DATA,
+                )
+
+        def XRecordFreeData(self, _pointer) -> None:
+            self.free_data_count += 1
+
+        def XRecordFreeContext(self, _display, _context) -> int:
+            self.free_context_count += 1
+            return 1
+
+    x11 = LifecycleX11()
+    xtst = LifecycleXtst()
+    observer = CancelledBatchObserver()
+    xtst.observer = observer
+
+    with pytest.raises(InputObserverError, match="did not become ready"):
+        observer.start()
+
+    assert events == []
+    assert observer.device_records_processed == 0
+    assert observer.delivered_records_processed == 0
+    assert xtst.pre_disable_batch_sent
+    assert xtst.end_sent
+    assert xtst.free_data_count == 5
+    assert xtst.free_context_count == 1
+    assert x11.close_count == 2
+    assert observer._thread is None
+    assert observer._delivery_thread is None

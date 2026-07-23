@@ -140,6 +140,9 @@ class ThreadedInputObserver(InputObserver):
         )
         self._delivery_sentinel = object()
         self._delivery_stop_requested = threading.Event()
+        self._delivery_decided = threading.Event()
+        self._delivery_state_lock = threading.Lock()
+        self._delivery_state = "inactive"
         self._failure: BaseException | None = None
         self._failure_lock = threading.Lock()
         self._startup_failure: BaseException | None = None
@@ -160,13 +163,23 @@ class ThreadedInputObserver(InputObserver):
         """Wake a blocked event loop during shutdown, when needed."""
 
     def _emit(self, event: ObservedInput) -> None:
-        try:
-            self._delivery_queue.put_nowait(event)
-        except queue.Full:
-            failure = InputObserverError(
-                f"{type(self).__name__} input delivery queue overflowed; "
-                "recording coverage is incomplete"
-            )
+        # Keep the state check and enqueue atomic with startup cancellation.
+        # Otherwise an abort could drain the queue and exit its delivery thread
+        # between these two operations, leaving a late setup event stranded.
+        failure: InputObserverError | None = None
+        with self._delivery_state_lock:
+            if self._delivery_state in {"aborted", "inactive"}:
+                return
+            try:
+                self._delivery_queue.put_nowait(event)
+            except queue.Full:
+                failure = InputObserverError(
+                    f"{type(self).__name__} input delivery queue overflowed; "
+                    "recording coverage is incomplete"
+                )
+        if failure is not None:
+            # Wake hooks are platform-defined and may re-enter lifecycle code;
+            # never call them while holding the delivery-state lock.
             self._fail(failure)
             raise failure
 
@@ -190,6 +203,23 @@ class ThreadedInputObserver(InputObserver):
         return primary
 
     def _delivery_main(self) -> None:
+        # Native setup may need to process events before it can prove that the
+        # observation boundary is ready. Preserve those events, but do not make
+        # them externally visible until the parent start() transaction commits.
+        self._delivery_decided.wait()
+        with self._delivery_state_lock:
+            delivery_state = self._delivery_state
+        if delivery_state == "aborted":
+            self._discard_delivery_queue()
+            return
+        if delivery_state != "committed":
+            self._fail(
+                InputObserverError(
+                    f"{type(self).__name__} delivery started without a valid "
+                    "startup decision"
+                )
+            )
+            return
         while True:
             if (
                 self._delivery_stop_requested.is_set()
@@ -217,6 +247,39 @@ class ThreadedInputObserver(InputObserver):
             finally:
                 self._delivery_queue.task_done()
 
+    def _discard_delivery_queue(self) -> None:
+        """Discard every event buffered by a startup that did not commit."""
+        while True:
+            try:
+                self._delivery_queue.get_nowait()
+            except queue.Empty:
+                return
+            else:
+                self._delivery_queue.task_done()
+
+    def _abort_delivery_start(self) -> None:
+        """Prevent setup-time events from escaping a failed start transaction."""
+        with self._delivery_state_lock:
+            if self._delivery_state == "pending":
+                self._delivery_state = "aborted"
+                self._delivery_decided.set()
+
+    def _commit_delivery_start(self) -> None:
+        """Publish setup-time events after readiness and health are proven."""
+        with self._delivery_state_lock:
+            if self._delivery_state != "pending":
+                raise InputObserverError(
+                    f"{type(self).__name__} cannot commit input delivery from "
+                    f"state {self._delivery_state!r}"
+                )
+            self._delivery_state = "committed"
+            self._delivery_decided.set()
+
+    def _delivery_start_was_aborted(self) -> bool:
+        """Return whether the current startup transaction was cancelled."""
+        with self._delivery_state_lock:
+            return self._delivery_state == "aborted"
+
     def _start_delivery(self) -> None:
         if self._delivery_thread is not None:
             state = "live" if self._delivery_thread.is_alive() else "stopped"
@@ -226,6 +289,9 @@ class ThreadedInputObserver(InputObserver):
             )
         self._delivery_queue = queue.Queue(maxsize=self.delivery_queue_size)
         self._delivery_stop_requested.clear()
+        self._delivery_decided.clear()
+        with self._delivery_state_lock:
+            self._delivery_state = "pending"
         thread = threading.Thread(
             target=self._delivery_main,
             name=f"{type(self).__name__}-delivery",
@@ -235,6 +301,8 @@ class ThreadedInputObserver(InputObserver):
         try:
             thread.start()
         except BaseException:
+            with self._delivery_state_lock:
+                self._delivery_state = "inactive"
             self._delivery_thread = None
             raise
 
@@ -242,6 +310,7 @@ class ThreadedInputObserver(InputObserver):
         thread = self._delivery_thread
         if thread is None:
             return
+        self._abort_delivery_start()
         self._delivery_stop_requested.set()
         if thread is threading.current_thread():
             # A consumer callback may intentionally stop its listener (for
@@ -249,7 +318,9 @@ class ThreadedInputObserver(InputObserver):
             # lets the callback unwind; the delivery loop then drains events
             # already received before exiting without attempting a self-join.
             return
-        if thread.is_alive():
+        with self._delivery_state_lock:
+            delivery_state = self._delivery_state
+        if thread.is_alive() and delivery_state == "committed":
             try:
                 self._delivery_queue.put(
                     self._delivery_sentinel,
@@ -263,6 +334,10 @@ class ThreadedInputObserver(InputObserver):
                     )
                 )
             thread.join(self.shutdown_timeout)
+        elif thread.is_alive():
+            # A rejected start wakes the delivery thread through
+            # _delivery_decided and discards its buffered events.
+            thread.join(self.shutdown_timeout)
         if thread.is_alive():
             self._fail(
                 InputObserverError(
@@ -272,6 +347,8 @@ class ThreadedInputObserver(InputObserver):
             )
         else:
             self._delivery_thread = None
+            with self._delivery_state_lock:
+                self._delivery_state = "inactive"
 
     def _thread_main(self) -> None:
         try:
@@ -344,10 +421,15 @@ class ThreadedInputObserver(InputObserver):
             self.check_health()
         except BaseException as exc:
             self._abort_start(exc)
+        try:
+            self._commit_delivery_start()
+        except BaseException as exc:
+            self._abort_start(exc)
 
     def _abort_start(self, primary: BaseException) -> None:
         """Make a failed ``start`` transactional before surfacing its cause."""
         self._startup_failure = primary
+        self._abort_delivery_start()
         thread = self._thread
         if thread is None:
             self._stop_delivery()

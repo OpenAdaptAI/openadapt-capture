@@ -750,6 +750,15 @@ class LinuxXInputObserver(ThreadedInputObserver):
                 self._baseline_marker_seen = True
                 self._accepting_events = True
                 return
+            if self._delivery_start_was_aborted():
+                # XRecordProcessReplies may have copied a complete native batch
+                # before the outer start() deadline fired. Once that transaction
+                # is cancelled, do not process the remaining non-marker records
+                # from the already-armed batch. A normal committed shutdown still
+                # drains its tail through EndOfData below.
+                self._waiting_baseline_marker = False
+                self._accepting_events = False
+                return
             event = _decode_core_event(
                 payload,
                 client_swapped=bool(recorded.client_swapped),

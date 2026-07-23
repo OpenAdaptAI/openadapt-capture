@@ -94,6 +94,89 @@ class _ReadyObserver(ThreadedInputObserver):
         self.release_loop.set()
 
 
+class _SetupEmittingObserver(_ReadyObserver):
+    def __init__(
+        self,
+        callback,
+        *,
+        fail_setup: bool = False,
+        delivery_queue_size: int = 4096,
+    ) -> None:
+        self.callback_invoked = threading.Event()
+
+        def observe_delivery(event) -> None:
+            self.callback_invoked.set()
+            callback(event)
+
+        super().__init__(observe_delivery)
+        self.delivery_queue_size = delivery_queue_size
+        self.fail_setup = fail_setup
+        self.health_checked = False
+        self.callback_observed_during_setup = False
+        self.events = [
+            ObservedKey(pressed=True, key_char="a", timestamp=1.0),
+            ObservedKey(pressed=False, key_char="a", timestamp=2.0),
+        ]
+
+    def _setup(self) -> None:
+        for event in self.events:
+            self._emit(event)
+        self.callback_observed_during_setup = self.callback_invoked.wait(timeout=0.05)
+        if self.fail_setup:
+            raise RuntimeError("setup failed after receiving input")
+
+    def check_health(self) -> None:
+        self.health_checked = True
+        super().check_health()
+
+
+def test_setup_events_are_delivered_in_order_only_after_start_commits() -> None:
+    delivered = []
+    observer = _SetupEmittingObserver(delivered.append)
+
+    observer.start()
+    deadline = time.monotonic() + 1
+    while len(delivered) < len(observer.events):
+        if time.monotonic() >= deadline:
+            pytest.fail("committed setup events were not delivered")
+        time.sleep(0.001)
+    observer.stop()
+
+    assert observer.health_checked
+    assert not observer.callback_observed_during_setup
+    assert delivered == observer.events
+
+
+def test_setup_events_are_discarded_when_start_fails() -> None:
+    delivered = []
+    observer = _SetupEmittingObserver(delivered.append, fail_setup=True)
+
+    with pytest.raises(InputObserverError, match="setup failed after receiving input"):
+        observer.start()
+
+    assert observer.health_checked
+    assert delivered == []
+    assert observer._delivery_queue.empty()
+    assert observer._thread is None
+    assert observer._delivery_thread is None
+
+
+def test_setup_delivery_queue_overflow_still_fails_loud() -> None:
+    delivered = []
+    observer = _SetupEmittingObserver(
+        delivered.append,
+        delivery_queue_size=1,
+    )
+
+    with pytest.raises(InputObserverError, match="delivery queue overflowed"):
+        observer.start()
+
+    assert delivered == []
+    assert observer._delivery_queue.empty()
+    assert observer._thread is None
+    assert observer._delivery_thread is None
+
+
 def test_failed_startup_joins_and_tears_down_before_raising() -> None:
     observer = _CooperativeNeverReadyObserver()
 
