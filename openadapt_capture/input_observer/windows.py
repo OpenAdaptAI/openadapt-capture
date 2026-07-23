@@ -149,6 +149,7 @@ class _RawKeyboardTransition:
     vk_code: int
     scan_code: int
     flags: int
+    keyboard_layout: int
     timestamp: float
 
 
@@ -413,6 +414,8 @@ class WindowsInputObserver(ThreadedInputObserver):
         self._translation_thread: threading.Thread | None = None
         self._keyboard_state = (ctypes.c_ubyte * 256)()
         self._keys_down: set[int] = set()
+        self._dead_key_pending = False
+        self._unverifiable_text_keys: set[int] = set()
 
     def _load_apis(self) -> None:
         if self._user32 is not None and self._kernel32 is not None:
@@ -647,6 +650,8 @@ class WindowsInputObserver(ThreadedInputObserver):
         assert user32 is not None
         self._keyboard_state = (ctypes.c_ubyte * 256)()
         self._keys_down.clear()
+        self._dead_key_pending = False
+        self._unverifiable_text_keys.clear()
         for vk_code in {
             VK_LSHIFT,
             VK_RSHIFT,
@@ -682,7 +687,7 @@ class WindowsInputObserver(ThreadedInputObserver):
         self._sync_generic_modifier_state()
         return physical_vk
 
-    def _foreground_keyboard_layout(self) -> object:
+    def _foreground_keyboard_layout(self) -> int:
         user32 = self._user32
         assert user32 is not None
         foreground = user32.GetForegroundWindow()
@@ -700,12 +705,12 @@ class WindowsInputObserver(ThreadedInputObserver):
             raise InputObserverUnavailableError(
                 "Windows could not resolve the foreground keyboard layout"
             )
-        return layout
+        return _handle_value(layout)
 
     def _keyboard_character(
         self,
         transition: _RawKeyboardTransition,
-    ) -> str | None:
+    ) -> tuple[str | None, bool]:
         user32 = self._user32
         assert user32 is not None
         buffer = ctypes.create_unicode_buffer(8)
@@ -717,21 +722,52 @@ class WindowsInputObserver(ThreadedInputObserver):
                 buffer,
                 len(buffer),
                 TO_UNICODE_NO_STATE_CHANGE,
-                self._foreground_keyboard_layout(),
+                transition.keyboard_layout,
             )
         )
         if count == 0:
-            return None
+            return None, False
         if count < 0:
             # A dead key is composition state, not committed text. Preserve
             # physical identity but do not claim that its spacing accent was
             # typed before a later key resolves the composition.
-            return None
+            return None, True
         character_count = count
         if ctypes.sizeof(ctypes.c_wchar) == 2:
             raw = ctypes.string_at(buffer, character_count * 2)
-            return raw.decode("utf-16-le")
-        return "".join(buffer[:character_count])
+            return raw.decode("utf-16-le"), False
+        return "".join(buffer[:character_count]), False
+
+    def _translated_character(
+        self,
+        transition: _RawKeyboardTransition,
+        physical_vk: int,
+    ) -> str | None:
+        """Return committed text without guessing across dead-key composition.
+
+        ``TO_UNICODE_NO_STATE_CHANGE`` prevents the observer from mutating the
+        application's keyboard state, but it also means Windows cannot give us
+        a trustworthy committed character for the key that resolves a dead-key
+        sequence.  Preserve both physical events and suppress their text until
+        the resolving key is released; the following normal key then recovers.
+        """
+
+        if not transition.pressed and physical_vk in self._unverifiable_text_keys:
+            self._unverifiable_text_keys.discard(physical_vk)
+            return None
+
+        character, is_dead_key = self._keyboard_character(transition)
+        if is_dead_key:
+            self._dead_key_pending = True
+            self._unverifiable_text_keys.add(physical_vk)
+            return None
+
+        if transition.pressed and self._dead_key_pending:
+            self._dead_key_pending = False
+            self._unverifiable_text_keys.add(physical_vk)
+            return None
+
+        return character
 
     def _translate_keyboard(
         self,
@@ -739,7 +775,9 @@ class WindowsInputObserver(ThreadedInputObserver):
     ) -> ObservedKey:
         physical_vk = self._apply_keyboard_transition(transition)
         character = (
-            None if physical_vk in _PHYSICAL_KEY_NAMES else self._keyboard_character(transition)
+            None
+            if physical_vk in _PHYSICAL_KEY_NAMES
+            else self._translated_character(transition, physical_vk)
         )
         return ObservedKey(
             pressed=transition.pressed,
@@ -863,12 +901,14 @@ class WindowsInputObserver(ThreadedInputObserver):
                 ).contents
                 injected = bool(payload.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED))
                 if not injected:
+                    keyboard_layout = self._foreground_keyboard_layout()
                     self._enqueue_input(
                         _RawKeyboardTransition(
                             pressed=wparam in {WM_KEYDOWN, WM_SYSKEYDOWN},
                             vk_code=int(payload.vkCode),
                             scan_code=int(payload.scanCode),
                             flags=int(payload.flags),
+                            keyboard_layout=keyboard_layout,
                             timestamp=timestamp,
                         )
                     )

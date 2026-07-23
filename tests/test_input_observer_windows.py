@@ -62,6 +62,7 @@ class FakeUser32:
         translation_release: threading.Event | None = None,
         translation_error: BaseException | None = None,
         translation_result: int = 1,
+        translation_script: list[tuple[int, str | None]] | None = None,
     ) -> None:
         self.hook_results = list(hook_results or [101, 102])
         self.last_error = last_error
@@ -76,9 +77,11 @@ class FakeUser32:
         self.translation_release = translation_release
         self.translation_error = translation_error
         self.translation_result = translation_result
+        self.translation_script = list(translation_script or [])
         self.async_key_state: dict[int, int] = {}
         self.toggle_key_state: dict[int, int] = {}
         self.layout_thread_ids: list[int] = []
+        self.translation_layouts: list[int] = []
 
     def PeekMessageW(self, *_args) -> int:
         return 0
@@ -136,12 +139,18 @@ class FakeUser32:
         _layout,
     ) -> int:
         assert flags == 4
+        self.translation_layouts.append(int(_layout))
         if self.translation_entered is not None:
             self.translation_entered.set()
         if self.translation_release is not None:
             self.translation_release.wait(timeout=2)
         if self.translation_error is not None:
             raise self.translation_error
+        if self.translation_script:
+            result, scripted_character = self.translation_script.pop(0)
+            if scripted_character is not None:
+                buffer[0] = scripted_character
+            return result
         character = chr(vk_code)
         shift = bool(keyboard_state[VK_SHIFT] & 0x80)
         caps_lock = bool(keyboard_state[VK_CAPITAL] & 0x01)
@@ -415,39 +424,50 @@ def test_slow_consumer_never_blocks_hook_callback_or_hook_chain() -> None:
     ]
 
 
-def test_keyboard_translation_is_off_hook_and_uses_foreground_layout() -> None:
+def test_keyboard_translation_uses_layout_snapshotted_at_hook_receipt() -> None:
+    translation_entered = threading.Event()
+    translation_release = threading.Event()
     events = []
-    user32 = FakeUser32(foreground_thread_id=8765, keyboard_layout=44)
+    user32 = FakeUser32(
+        foreground_thread_id=8765,
+        keyboard_layout=44,
+        translation_entered=translation_entered,
+        translation_release=translation_release,
+    )
     observer = make_observer(events.append, user32=user32)
     observer.start()
 
-    shift = KBDLLHOOKSTRUCT(vkCode=VK_SHIFT, scanCode=0x2A)
-    letter = KBDLLHOOKSTRUCT(vkCode=0x41, scanCode=0x1E)
+    first = KBDLLHOOKSTRUCT(vkCode=0x41, scanCode=0x1E)
+    second = KBDLLHOOKSTRUCT(vkCode=0x42, scanCode=0x30)
     assert (
         observer._keyboard_hook_callback(
             HC_ACTION,
             WM_KEYDOWN,
-            ctypes.addressof(shift),
+            ctypes.addressof(first),
         )
         == 73
     )
+    assert translation_entered.wait(timeout=1)
     assert (
         observer._keyboard_hook_callback(
             HC_ACTION,
             WM_KEYDOWN,
-            ctypes.addressof(letter),
+            ctypes.addressof(second),
         )
         == 73
     )
 
-    assert wait_until(lambda: len(events) == 2)
     user32.foreground_thread_id = 9876
     user32.keyboard_layout = 55
+    translation_release.set()
+    assert wait_until(lambda: len(events) == 2)
+
+    third = KBDLLHOOKSTRUCT(vkCode=0x43, scanCode=0x2E)
     assert (
         observer._keyboard_hook_callback(
             HC_ACTION,
-            WM_KEYUP,
-            ctypes.addressof(letter),
+            WM_KEYDOWN,
+            ctypes.addressof(third),
         )
         == 73
     )
@@ -455,30 +475,31 @@ def test_keyboard_translation_is_off_hook_and_uses_foreground_layout() -> None:
     assert events == [
         ObservedKey(
             pressed=True,
-            key_name="shift_l",
-            key_vk="160",
-            canonical_key_name="shift",
-            canonical_key_vk="16",
+            key_char="a",
+            key_vk="65",
+            canonical_key_char="a",
+            canonical_key_vk="65",
             timestamp=1234.5,
         ),
         ObservedKey(
             pressed=True,
-            key_char="A",
-            key_vk="65",
-            canonical_key_char="a",
-            canonical_key_vk="65",
+            key_char="b",
+            key_vk="66",
+            canonical_key_char="b",
+            canonical_key_vk="66",
             timestamp=1234.5,
         ),
         ObservedKey(
-            pressed=False,
-            key_char="A",
-            key_vk="65",
-            canonical_key_char="a",
-            canonical_key_vk="65",
+            pressed=True,
+            key_char="c",
+            key_vk="67",
+            canonical_key_char="c",
+            canonical_key_vk="67",
             timestamp=1234.5,
         ),
     ]
-    assert user32.layout_thread_ids == [8765, 9876]
+    assert user32.layout_thread_ids == [8765, 8765, 9876]
+    assert user32.translation_layouts == [44, 44, 55]
     observer.stop()
 
 
@@ -541,6 +562,86 @@ def test_dead_key_preserves_physical_identity_without_claiming_text() -> None:
             timestamp=1234.5,
         )
     ]
+    observer.stop()
+
+
+def test_dead_key_resolution_is_unverifiable_then_normal_text_recovers() -> None:
+    events = []
+    user32 = FakeUser32(
+        translation_script=[
+            (-1, "´"),
+            (1, "e"),
+            (1, "x"),
+        ]
+    )
+    observer = make_observer(events.append, user32=user32)
+    observer.start()
+    dead_key = KBDLLHOOKSTRUCT(vkCode=0xDE, scanCode=0x28)
+    resolving_key = KBDLLHOOKSTRUCT(vkCode=0x45, scanCode=0x12)
+    normal_key = KBDLLHOOKSTRUCT(vkCode=0x58, scanCode=0x2D)
+
+    observer._keyboard_hook_callback(
+        HC_ACTION,
+        WM_KEYDOWN,
+        ctypes.addressof(dead_key),
+    )
+    observer._keyboard_hook_callback(
+        HC_ACTION,
+        WM_KEYUP,
+        ctypes.addressof(dead_key),
+    )
+    observer._keyboard_hook_callback(
+        HC_ACTION,
+        WM_KEYDOWN,
+        ctypes.addressof(resolving_key),
+    )
+    observer._keyboard_hook_callback(
+        HC_ACTION,
+        WM_KEYUP,
+        ctypes.addressof(resolving_key),
+    )
+    observer._keyboard_hook_callback(
+        HC_ACTION,
+        WM_KEYDOWN,
+        ctypes.addressof(normal_key),
+    )
+
+    assert wait_until(lambda: len(events) == 5)
+    assert events == [
+        ObservedKey(
+            pressed=True,
+            key_vk="222",
+            canonical_key_vk="222",
+            timestamp=1234.5,
+        ),
+        ObservedKey(
+            pressed=False,
+            key_vk="222",
+            canonical_key_vk="222",
+            timestamp=1234.5,
+        ),
+        ObservedKey(
+            pressed=True,
+            key_vk="69",
+            canonical_key_vk="69",
+            timestamp=1234.5,
+        ),
+        ObservedKey(
+            pressed=False,
+            key_vk="69",
+            canonical_key_vk="69",
+            timestamp=1234.5,
+        ),
+        ObservedKey(
+            pressed=True,
+            key_char="x",
+            key_vk="88",
+            canonical_key_char="x",
+            canonical_key_vk="88",
+            timestamp=1234.5,
+        ),
+    ]
+    assert user32.translation_script == []
     observer.stop()
 
 
