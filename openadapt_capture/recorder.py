@@ -43,7 +43,7 @@ from pympler import tracker
 from pynput import keyboard, mouse
 from tqdm import tqdm
 
-from openadapt_capture import platform, plotting, utils, video, window
+from openadapt_capture import platform, utils, video, window
 from openadapt_capture.config import config
 from openadapt_capture.db import create_db, crud, get_session_for_path
 from openadapt_capture.db.models import ActionEvent, Recording
@@ -154,9 +154,100 @@ PROC_WRITE_BY_EVENT_TYPE = {
     "browser": True,
 }
 NUM_MEMORY_STATS_TO_LOG = 3
+STARTUP_WAIT_POLL_SECONDS = 0.1
+PRE_READY_TASK_JOIN_TIMEOUT_SECONDS = 2.0
 
 stop_sequence_detected = False
 ws_server_instance = None
+
+
+def _wait_for_tasks_started(
+    task_by_name: dict[str, Any],
+    task_started_events: dict[str, Any],
+    terminate_processing: Any,
+) -> bool:
+    """Wait for pipeline readiness while honoring shutdown and worker failure.
+
+    Returns ``True`` only when every task has announced readiness. A shutdown
+    request or a task that exits before setting its readiness event fails the
+    startup and signals the rest of the pipeline to stop.
+    """
+    expected_starts = len(task_by_name)
+    logger.info(f"{expected_starts=}")
+
+    while True:
+        if terminate_processing.is_set():
+            logger.info("Recording startup cancelled before all tasks were ready")
+            return False
+
+        waiting_for = [
+            name
+            for name, event in task_started_events.items()
+            if not event.is_set()
+        ]
+        if not waiting_for:
+            return True
+
+        stopped_before_ready = [
+            name
+            for name in waiting_for
+            if name in task_by_name and not task_by_name[name].is_alive()
+        ]
+        if stopped_before_ready:
+            logger.error(
+                "Recording tasks exited before readiness: "
+                f"{stopped_before_ready}"
+            )
+            terminate_processing.set()
+            return False
+
+        logger.info(f"Waiting for tasks to start: {waiting_for}")
+        logger.info(
+            f"Started tasks: {expected_starts - len(waiting_for)}/{expected_starts}"
+        )
+        terminate_processing.wait(STARTUP_WAIT_POLL_SECONDS)
+
+
+def _join_tasks(
+    task_by_name: dict[str, Any],
+    task_names: list[str],
+    *,
+    timeout: float | None = None,
+) -> list[str]:
+    """Join pipeline tasks, bounding teardown when startup never completed."""
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    lingering: list[str] = []
+
+    for task_name in task_names:
+        task = task_by_name.get(task_name)
+        if task is None:
+            continue
+
+        logger.info(f"joining {task_name=}...")
+        if deadline is None:
+            task.join()
+        else:
+            task.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        if not task.is_alive():
+            continue
+
+        # Processes can be stopped after the shared graceful-shutdown deadline.
+        # Python cannot forcibly stop threads; recorder-owned threads are daemons
+        # and all receive terminate_processing before this helper is called.
+        if isinstance(task, multiprocessing.process.BaseProcess):
+            logger.warning(
+                f"terminating {task_name!r} after pre-ready shutdown timeout"
+            )
+            task.terminate()
+            task.join(timeout=0.5)
+
+        if task.is_alive():
+            lingering.append(task_name)
+
+    if lingering:
+        logger.warning(f"tasks still exiting after bounded shutdown: {lingering}")
+    return lingering
 
 
 def collect_stats(performance_snapshots: list[tracemalloc.Snapshot]) -> None:
@@ -1613,6 +1704,7 @@ def record(
     if config.RECORD_WINDOW_DATA and window_scope is None:
         window_event_reader = threading.Thread(
             target=read_window_events,
+            daemon=True,
             args=(
                 event_q,
                 terminate_processing,
@@ -1628,6 +1720,7 @@ def record(
     if config.RECORD_BROWSER_EVENTS:
         browser_event_reader = threading.Thread(
             target=run_browser_event_server,
+            daemon=True,
             args=(
                 event_q,
                 terminate_processing,
@@ -1642,6 +1735,7 @@ def record(
 
     screen_event_reader = threading.Thread(
         target=read_screen_events,
+        daemon=True,
         args=(
             event_q,
             terminate_processing,
@@ -1656,6 +1750,7 @@ def record(
 
     keyboard_event_reader = threading.Thread(
         target=read_keyboard_events,
+        daemon=True,
         args=(
             event_q,
             terminate_processing,
@@ -1668,6 +1763,7 @@ def record(
 
     mouse_event_reader = threading.Thread(
         target=read_mouse_events,
+        daemon=True,
         args=(
             event_q,
             terminate_processing,
@@ -1692,6 +1788,7 @@ def record(
 
     event_processor = threading.Thread(
         target=process_events,
+        daemon=True,
         args=(
             event_q,
             screen_write_q,
@@ -1875,35 +1972,31 @@ def record(
 
     # TODO: discard events until everything is ready
 
-    # Wait for all to signal they've started
-    expected_starts = len(task_by_name)
-    logger.info(f"{expected_starts=}")
-    while True:
-        started_tasks = sum(event.is_set() for event in task_started_events.values())
-        if started_tasks >= expected_starts:
-            break
-        waiting_for = [
-            task for task, event in task_started_events.items() if not event.is_set()
-        ]
-        logger.info(f"Waiting for tasks to start: {waiting_for}")
-        logger.info(f"Started tasks: {started_tasks}/{expected_starts}")
-        time.sleep(1)  # Sleep to reduce busy waiting
-
-    for _ in range(5):
-        logger.info("*" * 40)
-    logger.info("All readers and writers have started. Waiting for input events...")
-
-    if status_pipe:
-        status_pipe.send({"type": "record.started"})
-
     global stop_sequence_detected
     stop_sequence_detected = False
-    try:
-        while not (stop_sequence_detected or terminate_processing.is_set()):
-            time.sleep(1)
-        terminate_processing.set()
-    except KeyboardInterrupt:
-        terminate_processing.set()
+    startup_ready = _wait_for_tasks_started(
+        task_by_name,
+        task_started_events,
+        terminate_processing,
+    )
+    if startup_ready:
+        for _ in range(5):
+            logger.info("*" * 40)
+        logger.info(
+            "All readers and writers have started. Waiting for input events..."
+        )
+
+        if status_pipe:
+            status_pipe.send({"type": "record.started"})
+
+        try:
+            while not (stop_sequence_detected or terminate_processing.is_set()):
+                terminate_processing.wait(1)
+        except KeyboardInterrupt:
+            terminate_processing.set()
+    else:
+        logger.info("Tearing down recording after incomplete startup")
+    terminate_processing.set()
 
     if status_pipe:
         status_pipe.send({"type": "record.stopping"})
@@ -1912,14 +2005,11 @@ def record(
         collect_stats(performance_snapshots)
         log_memory_usage(_tracker, performance_snapshots)
 
-    def join_tasks(task_names: list[str]) -> None:
-        for task_name in task_names:
-            if task_name in task_by_name:
-                logger.info(f"joining {task_name=}...")
-                task = task_by_name[task_name]
-                task.join()
-
-    join_tasks(
+    pre_ready_timeout = (
+        None if startup_ready else PRE_READY_TASK_JOIN_TIMEOUT_SECONDS
+    )
+    _join_tasks(
+        task_by_name,
         [
             "window_event_reader",
             "browser_event_reader",
@@ -1933,18 +2023,23 @@ def record(
             "window_event_writer",
             "video_writer",
             "audio_recorder",
-        ]
+        ],
+        timeout=pre_ready_timeout,
     )
 
     terminate_perf_event.set()
-    join_tasks(
+    _join_tasks(
+        task_by_name,
         [
             "perf_stats_writer",
             "mem_writer",
-        ]
+        ],
+        timeout=pre_ready_timeout,
     )
 
-    if config.PLOT_PERFORMANCE:
+    if config.PLOT_PERFORMANCE and startup_ready:
+        from openadapt_capture import plotting
+
         session = get_session_for_path(db_path)
         plotting.plot_performance(
             session, recording, save_dir=capture_dir,
@@ -2119,6 +2214,7 @@ class Recorder:
         self._status_recv, self._status_send = multiprocessing.Pipe(duplex=False)
         self._ready_event = threading.Event()
         self._stopped_event = threading.Event()
+        self._ready_or_stopped_event = threading.Event()
 
         # Internal
         self._record_thread: threading.Thread | None = None
@@ -2134,8 +2230,10 @@ class Recorder:
                     if isinstance(msg, dict):
                         if msg.get("type") == "record.started":
                             self._ready_event.set()
+                            self._ready_or_stopped_event.set()
                         elif msg.get("type") == "record.stopped":
                             self._stopped_event.set()
+                            self._ready_or_stopped_event.set()
         except (EOFError, OSError):
             pass
 
@@ -2143,20 +2241,30 @@ class Recorder:
         """Thread target: apply config overrides, then call record()."""
         from openadapt_capture.config import config_override
 
-        with config_override(self._recording_config):
-            record(
-                task_description=self.task_description,
-                capture_dir=self.capture_dir,
-                terminate_processing=self._terminate_processing,
-                terminate_recording=self._terminate_recording,
-                status_pipe=self._status_send,
-                num_action_events=self._num_action_events,
-                num_screen_events=self._num_screen_events,
-                num_window_events=self._num_window_events,
-                num_browser_events=self._num_browser_events,
-                num_video_events=self._num_video_events,
-                send_profile=self._send_profile,
-            )
+        try:
+            with config_override(self._recording_config):
+                record(
+                    task_description=self.task_description,
+                    capture_dir=self.capture_dir,
+                    terminate_processing=self._terminate_processing,
+                    terminate_recording=self._terminate_recording,
+                    status_pipe=self._status_send,
+                    num_action_events=self._num_action_events,
+                    num_screen_events=self._num_screen_events,
+                    num_window_events=self._num_window_events,
+                    num_browser_events=self._num_browser_events,
+                    num_video_events=self._num_video_events,
+                    send_profile=self._send_profile,
+                )
+        except BaseException:
+            # A setup exception must wake wait_for_ready() and let context-manager
+            # teardown finish instead of leaving callers blocked for its timeout.
+            try:
+                self._status_send.send({"type": "record.stopped"})
+            except (BrokenPipeError, EOFError, OSError):
+                self._stopped_event.set()
+                self._ready_or_stopped_event.set()
+            raise
 
     def __enter__(self) -> "Recorder":
         # Start status drain thread
@@ -2185,9 +2293,10 @@ class Recorder:
     def wait_for_ready(self, timeout: float = 60) -> bool:
         """Block until all recording threads/processes have started.
 
-        Returns True if ready, False if timeout expired.
+        Returns True if ready, False if startup stopped or the timeout expired.
         """
-        return self._ready_event.wait(timeout=timeout)
+        self._ready_or_stopped_event.wait(timeout=timeout)
+        return self._ready_event.is_set()
 
     @property
     def is_recording(self) -> bool:
