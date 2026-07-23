@@ -752,8 +752,9 @@ class WindowsInputObserver(ThreadedInputObserver):
         the resolving key is released; the following normal key then recovers.
         """
 
-        if not transition.pressed and physical_vk in self._unverifiable_text_keys:
-            self._unverifiable_text_keys.discard(physical_vk)
+        if physical_vk in self._unverifiable_text_keys:
+            if not transition.pressed:
+                self._unverifiable_text_keys.discard(physical_vk)
             return None
 
         character, is_dead_key = self._keyboard_character(transition)

@@ -597,6 +597,11 @@ def test_dead_key_resolution_is_unverifiable_then_normal_text_recovers() -> None
     )
     observer._keyboard_hook_callback(
         HC_ACTION,
+        WM_KEYDOWN,
+        ctypes.addressof(resolving_key),
+    )
+    observer._keyboard_hook_callback(
+        HC_ACTION,
         WM_KEYUP,
         ctypes.addressof(resolving_key),
     )
@@ -606,7 +611,7 @@ def test_dead_key_resolution_is_unverifiable_then_normal_text_recovers() -> None
         ctypes.addressof(normal_key),
     )
 
-    assert wait_until(lambda: len(events) == 5)
+    assert wait_until(lambda: len(events) == 6)
     assert events == [
         ObservedKey(
             pressed=True,
@@ -618,6 +623,12 @@ def test_dead_key_resolution_is_unverifiable_then_normal_text_recovers() -> None
             pressed=False,
             key_vk="222",
             canonical_key_vk="222",
+            timestamp=1234.5,
+        ),
+        ObservedKey(
+            pressed=True,
+            key_vk="69",
+            canonical_key_vk="69",
             timestamp=1234.5,
         ),
         ObservedKey(

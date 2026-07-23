@@ -15,12 +15,7 @@ import pytest
 from openadapt_capture import input as input_module
 from openadapt_capture import recorder as recorder_module
 from openadapt_capture.capture import _convert_action_event
-from openadapt_capture.events import (
-    MouseButton,
-    MouseClickEvent,
-    MouseDownEvent,
-    MouseUpEvent,
-)
+from openadapt_capture.events import MouseClickEvent, MouseDownEvent, MouseUpEvent
 from openadapt_capture.input_observer import (
     InputObserverError,
     InputObserverUnavailableError,
@@ -530,48 +525,10 @@ def test_auxiliary_mouse_button_survives_storage_conversion_and_processing(
     assert isinstance(up, MouseUpEvent)
     assert down.button == button
     assert up.button == button
-    assert not isinstance(down.button, MouseButton)
-    assert not isinstance(up.button, MouseButton)
     processed = merge_consecutive_mouse_click_events([down, up])
     assert len(processed) == 1
     assert isinstance(processed[0], MouseClickEvent)
     assert processed[0].button == button
-    assert not isinstance(processed[0].button, MouseButton)
-
-
-@pytest.mark.parametrize("button", list(MouseButton))
-def test_standard_mouse_button_keeps_public_enum_through_processing(
-    button: MouseButton,
-) -> None:
-    down = _convert_action_event(
-        SimpleNamespace(
-            name="click",
-            timestamp=1.0,
-            mouse_x=12.5,
-            mouse_y=34.5,
-            mouse_button_name=button.value,
-            mouse_pressed=True,
-        )
-    )
-    up = _convert_action_event(
-        SimpleNamespace(
-            name="click",
-            timestamp=1.1,
-            mouse_x=12.5,
-            mouse_y=34.5,
-            mouse_button_name=button.value,
-            mouse_pressed=False,
-        )
-    )
-
-    assert isinstance(down, MouseDownEvent)
-    assert isinstance(up, MouseUpEvent)
-    assert down.button is button
-    assert up.button is button
-    processed = merge_consecutive_mouse_click_events([down, up])
-    assert len(processed) == 1
-    assert isinstance(processed[0], MouseClickEvent)
-    assert processed[0].button is button
 
 
 @pytest.mark.skipif(

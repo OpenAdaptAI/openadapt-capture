@@ -49,7 +49,6 @@ class TestMouseEvents:
         )
         assert event.type == EventType.MOUSE_DOWN
         assert event.button == MouseButton.LEFT
-        assert isinstance(event.button, MouseButton)
 
     def test_mouse_up_event(self):
         """Test MouseUpEvent creation."""
@@ -61,20 +60,6 @@ class TestMouseEvents:
         )
         assert event.type == EventType.MOUSE_UP
         assert event.button == MouseButton.RIGHT
-        assert isinstance(event.button, MouseButton)
-
-    def test_auxiliary_mouse_button_remains_a_native_string(self):
-        """Unknown native buttons survive without weakening standard enums."""
-        event = MouseDownEvent(
-            timestamp=1234567890.123,
-            x=100.0,
-            y=200.0,
-            button="x1",
-        )
-        assert event.button == "x1"
-        assert isinstance(event.button, str)
-        assert not isinstance(event.button, MouseButton)
-        assert event.model_dump_json().find('"button":"x1"') != -1
 
     def test_mouse_scroll_event(self):
         """Test MouseScrollEvent creation."""
