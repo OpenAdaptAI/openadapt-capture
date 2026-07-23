@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import multiprocessing
 import shutil
 import subprocess
 import time
@@ -41,6 +42,22 @@ def _png_bytes(color: str = "black") -> bytes:
     output = io.BytesIO()
     Image.new("RGB", (2, 2), color).save(output, format="PNG")
     return output.getvalue()
+
+
+def _spawn_initialize_video_writer(
+    output_path: str,
+    provision: video.FFmpegProvision,
+) -> None:
+    """Spawn-safe target for exercising the writer's serialized preflight."""
+    utils.set_start_time(time.time())
+    container, _, _ = video.initialize_video_writer(
+        output_path,
+        2,
+        2,
+        timeout_seconds=1,
+        preflight_provision=provision,
+    )
+    container.close()
 
 
 def test_resolve_explicit_path_precedes_other_sources(tmp_path, monkeypatch):
@@ -371,6 +388,37 @@ def test_record_refuses_missing_encoder_before_display_or_listeners(tmp_path, mo
     with pytest.raises(video.FFmpegUnavailableError, match="no provisioned"):
         recorder_module.record("test", capture_dir=str(tmp_path / "capture"))
     assert display_touched is False
+
+
+def test_preflight_provision_survives_spawn_without_child_config(
+    tmp_path, monkeypatch
+):
+    """Spawned writers use the exact parent-selected provision, not fresh defaults."""
+    executable = tmp_path / "managed-ffmpeg"
+    executable.write_bytes(b"preflighted in parent")
+    provision = video.FFmpegProvision(
+        executable=str(executable),
+        ffprobe=None,
+        codec="mpeg4",
+        pixel_format="yuv420p",
+        muxer="mp4",
+        source="parent preflight",
+    )
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("OPENADAPT_PLATFORM_OVERRIDE", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "no-desktop-runtime"))
+    monkeypatch.delenv("OPENADAPT_FFMPEG_PATH", raising=False)
+    monkeypatch.delenv("OPENADAPT_DESKTOP_FFMPEG_PATH", raising=False)
+
+    process = multiprocessing.get_context("spawn").Process(
+        target=_spawn_initialize_video_writer,
+        args=(str(tmp_path / "spawned.mp4"), provision),
+    )
+    process.start()
+    process.join(timeout=15)
+
+    assert not process.is_alive()
+    assert process.exitcode == 0
 
 
 def test_extract_frames_preserves_nearest_within_tolerance_and_order(tmp_path, monkeypatch):

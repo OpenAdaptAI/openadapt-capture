@@ -798,15 +798,23 @@ def initialize_video_writer(
     ffmpeg_path: str | os.PathLike[str] | None = None,
     ffprobe_path: str | os.PathLike[str] | None = None,
     timeout_seconds: float | None = None,
+    preflight_provision: FFmpegProvision | None = None,
 ) -> tuple[FFmpegFrameStage, FFmpegVideoStream, float]:
-    selected_path = ffmpeg_path or config.VIDEO_FFMPEG_PATH
-    provision = require_video_encoder(
-        ffmpeg_path=selected_path,
-        ffprobe_path=ffprobe_path or config.VIDEO_FFPROBE_PATH,
-        codec=codec or config.VIDEO_ENCODING,
-        pixel_format=pix_fmt or config.VIDEO_PIXEL_FORMAT,
-        muxer=muxer or config.VIDEO_MUXER,
-    )
+    if preflight_provision is None:
+        selected_path = ffmpeg_path or config.VIDEO_FFMPEG_PATH
+        provision = require_video_encoder(
+            ffmpeg_path=selected_path,
+            ffprobe_path=ffprobe_path or config.VIDEO_FFPROBE_PATH,
+            codec=codec or config.VIDEO_ENCODING,
+            pixel_format=pix_fmt or config.VIDEO_PIXEL_FORMAT,
+            muxer=muxer or config.VIDEO_MUXER,
+        )
+    else:
+        provision = preflight_provision
+        if not provision.codec or not provision.pixel_format or not provision.muxer:
+            raise FFmpegUnavailableError(
+                "Preflight FFmpeg provision must include codec, pixel format, and muxer"
+            )
     selected_codec = provision.codec or codec or config.VIDEO_ENCODING or DEFAULT_CODEC
     selected_pixel_format = (
         provision.pixel_format or pix_fmt or config.VIDEO_PIXEL_FORMAT or DEFAULT_PIXEL_FORMAT

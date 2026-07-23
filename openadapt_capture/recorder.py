@@ -271,6 +271,22 @@ def _join_tasks(
     return lingering
 
 
+def _raise_for_failed_processes(task_by_name: dict[str, Any]) -> None:
+    """Surface required child-process failures through the recording boundary."""
+    failures = {
+        name: task.exitcode
+        for name, task in task_by_name.items()
+        if isinstance(task, multiprocessing.process.BaseProcess)
+        and task.exitcode not in (None, 0)
+    }
+    if failures:
+        detail = ", ".join(
+            f"{name} (exit code {exitcode})"
+            for name, exitcode in sorted(failures.items())
+        )
+        raise RuntimeError(f"Recording child process failed: {detail}")
+
+
 def collect_stats(performance_snapshots: list[tracemalloc.Snapshot]) -> None:
     """Collects and appends performance snapshots using tracemalloc.
 
@@ -669,6 +685,8 @@ def video_pre_callback(
     recording: Recording,
     video_dir: str = None,
     frame_size: tuple[int, int] | None = None,
+    provision: video.FFmpegProvision | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Function to call before main loop.
 
@@ -679,6 +697,9 @@ def video_pre_callback(
         frame_size: Explicit (width, height) for the video stream. Used by
             window-scoped capture, whose frames are the target window's pixels
             rather than the monitor's. Defaults to the full-screen size.
+        provision: Parent-preflighted encoder contract. Passing this immutable
+            value keeps spawn-based writers on the exact executable and codec.
+        timeout_seconds: Bound for final encoding and verification.
 
     Returns:
         dict[str, Any]: The updated state.
@@ -690,7 +711,13 @@ def video_pre_callback(
         # TODO XXX replace with utils.get_monitor_dims() once fixed
         monitor_width, monitor_height = utils.take_screenshot().size
     video_container, video_stream, video_start_timestamp = (
-        video.initialize_video_writer(video_file_path, monitor_width, monitor_height)
+        video.initialize_video_writer(
+            video_file_path,
+            monitor_width,
+            monitor_height,
+            timeout_seconds=timeout_seconds,
+            preflight_provision=provision,
+        )
     )
     crud.update_video_start_time(db, recording, video_start_timestamp)
     return {
@@ -1620,8 +1647,9 @@ def record(
     )
     # Refuse before touching the display or starting any worker. Capture never
     # downloads or bundles FFmpeg; Desktop/standalone provisioning owns it.
+    video_provision = None
     if config.RECORD_VIDEO:
-        video.require_video_encoder(
+        video_provision = video.require_video_encoder(
             ffmpeg_path=config.VIDEO_FFMPEG_PATH,
             ffprobe_path=config.VIDEO_FFPROBE_PATH,
             codec=config.VIDEO_ENCODING,
@@ -1892,6 +1920,8 @@ def record(
                         if initial_window_frame is not None
                         else None
                     ),
+                    provision=video_provision,
+                    timeout_seconds=config.VIDEO_FFMPEG_TIMEOUT_SECONDS,
                 ),
                 video_post_callback,
             ),
@@ -2021,6 +2051,7 @@ def record(
         task_name, task_error = task_errors.get_nowait()
         add_exception_note(task_error, f"recording task {task_name!r} failed")
         raise task_error
+    _raise_for_failed_processes(task_by_name)
 
     if config.PLOT_PERFORMANCE and startup_ready:
         from openadapt_capture import plotting
