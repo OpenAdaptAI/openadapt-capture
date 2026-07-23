@@ -166,10 +166,7 @@ class ThreadedInputObserver(InputObserver):
             raise failure
 
     def _fail(self, failure: BaseException) -> None:
-        with self._failure_lock:
-            if self._failure is None:
-                self._failure = failure
-            primary = self._failure
+        primary = self._store_failure(failure)
         self._stop_requested.set()
         try:
             self._wake()
@@ -178,6 +175,14 @@ class ThreadedInputObserver(InputObserver):
                 primary,
                 f"waking the failed observer also failed: {wake_error}",
             )
+
+    def _store_failure(self, failure: BaseException) -> BaseException:
+        """Record and return the first failure atomically."""
+        with self._failure_lock:
+            if self._failure is None:
+                self._failure = failure
+            primary = self._failure
+        return primary
 
     def _delivery_main(self) -> None:
         while True:
@@ -200,13 +205,24 @@ class ThreadedInputObserver(InputObserver):
                 self._delivery_queue.task_done()
 
     def _start_delivery(self) -> None:
+        if self._delivery_thread is not None:
+            state = "live" if self._delivery_thread.is_alive() else "stopped"
+            raise InputObserverError(
+                f"{type(self).__name__} has a {state} delivery thread from a "
+                "previous lifecycle; stop it or create a new observer"
+            )
         self._delivery_queue = queue.Queue(maxsize=self.delivery_queue_size)
-        self._delivery_thread = threading.Thread(
+        thread = threading.Thread(
             target=self._delivery_main,
             name=f"{type(self).__name__}-delivery",
             daemon=True,
         )
-        self._delivery_thread.start()
+        self._delivery_thread = thread
+        try:
+            thread.start()
+        except BaseException:
+            self._delivery_thread = None
+            raise
 
     def _stop_delivery(self) -> None:
         thread = self._delivery_thread
@@ -250,22 +266,41 @@ class ThreadedInputObserver(InputObserver):
             try:
                 self._teardown()
             except BaseException as exc:
-                if self._failure is None:
-                    self._failure = exc
+                self._store_failure(exc)
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            if self._startup_failure is not None:
-                raise InputObserverError(
-                    f"{type(self).__name__} still has a live thread from a "
-                    "failed startup; create a new observer after fixing the cause"
-                ) from self._startup_failure
-            return
+        if self._thread is not None:
+            if self._thread.is_alive():
+                if self._startup_failure is not None:
+                    raise InputObserverError(
+                        f"{type(self).__name__} still has a live thread from a "
+                        "failed startup; create a new observer after fixing the cause"
+                    ) from self._startup_failure
+                self.check_health()
+                return
+            self._stop_delivery()
+            self._thread = None
+            self.check_health()
+            raise InputObserverError(
+                f"{type(self).__name__} cannot restart after its event loop "
+                "stopped unexpectedly; create a new observer"
+            )
+        if self._delivery_thread is not None:
+            state = "live" if self._delivery_thread.is_alive() else "stopped"
+            raise InputObserverError(
+                f"{type(self).__name__} still has a {state} delivery thread "
+                "from a previous lifecycle; stop it or create a new observer"
+            )
         self._ready.clear()
         self._stop_requested.clear()
         self._failure = None
         self._startup_failure = None
-        self._start_delivery()
+        try:
+            self._start_delivery()
+        except BaseException as exc:
+            self._startup_failure = exc
+            self._stop_delivery()
+            raise
         self._thread = threading.Thread(
             target=self._thread_main,
             name=f"{type(self).__name__}-event-loop",
@@ -335,15 +370,38 @@ class ThreadedInputObserver(InputObserver):
     def stop(self) -> None:
         thread = self._thread
         if thread is None:
+            self._stop_delivery()
+            self.check_health()
             return
         self._stop_requested.set()
-        self._wake()
+        primary: BaseException | None = None
+        try:
+            self._wake()
+        except BaseException as wake_error:
+            primary = wake_error
         thread.join(self.shutdown_timeout)
         if thread.is_alive():
-            raise InputObserverError(
+            timeout_error = InputObserverError(
                 f"{type(self).__name__} did not stop within "
                 f"{self.shutdown_timeout:.1f}s"
             )
-        self._thread = None
+            if primary is None:
+                primary = timeout_error
+            else:
+                add_exception_note(
+                    primary,
+                    f"observer event loop also failed to stop: {timeout_error}",
+                )
+        else:
+            self._thread = None
         self._stop_delivery()
+        if primary is not None:
+            with self._failure_lock:
+                cleanup_failure = self._failure
+            if cleanup_failure is not None:
+                add_exception_note(
+                    primary,
+                    f"observer shutdown also recorded: {cleanup_failure}",
+                )
+            raise primary
         self.check_health()
