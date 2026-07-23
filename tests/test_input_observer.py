@@ -181,7 +181,11 @@ def test_first_failure_is_preserved_when_wake_also_fails() -> None:
     with pytest.raises(InputObserverError, match="primary observer failure") as caught:
         observer.check_health()
     assert caught.value is primary
-    assert any("wake failed" in note for note in getattr(primary, "__notes__", []))
+    notes = getattr(primary, "__notes__", [])
+    if hasattr(primary, "add_note"):
+        assert any("wake failed" in note for note in notes)
+    else:
+        assert notes == []
 
 
 def test_idempotent_start_surfaces_live_delivery_consumer_failure() -> None:
@@ -528,8 +532,8 @@ def test_auxiliary_mouse_button_survives_storage_conversion_and_processing(
 
 
 @pytest.mark.skipif(
-    ctypes.sizeof(ctypes.c_void_p) != 8,
-    reason="ABI offsets below describe the supported 64-bit Linux runners",
+    ctypes.sizeof(ctypes.c_void_p) != 8 or ctypes.sizeof(ctypes.c_ulong) != 8,
+    reason="ABI offsets below describe Linux's 64-bit LP64 data model",
 )
 def test_xinput_raw_event_matches_64_bit_libxi_abi() -> None:
     assert ctypes.sizeof(_XIRawEvent) == 96

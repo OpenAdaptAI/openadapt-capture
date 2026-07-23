@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ctypes
 
+import pytest
+
 from openadapt_capture.input_observer import ObservedKey
 from openadapt_capture.input_observer import linux as linux_module
 from openadapt_capture.input_observer.linux import (
@@ -109,6 +111,10 @@ def make_observer() -> LinuxXInputObserver:
     )
 
 
+@pytest.mark.skipif(
+    ctypes.sizeof(ctypes.c_void_p) != 8 or ctypes.sizeof(ctypes.c_ulong) != 8,
+    reason="ABI offsets below describe Linux's 64-bit LP64 data model",
+)
 def test_xinput_raw_event_matches_primary_header_lp64_abi() -> None:
     assert ctypes.sizeof(_XIRawEvent) == 96
     assert _XIRawEvent.flags.offset == 60
