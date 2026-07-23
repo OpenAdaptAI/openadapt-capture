@@ -1095,3 +1095,84 @@ def test_setup_failure_without_enabled_context_skips_shutdown_drain() -> None:
 
     assert xtst.process_count == 0
     assert xtst.free_context_count == 1
+
+
+def test_failed_start_drain_never_arms_or_emits_buffered_input() -> None:
+    events = []
+    observer = make_observer()
+    observer._emit = events.append  # type: ignore[method-assign]
+    observer._record_enabled = True
+    observer._record_context = 7
+    observer._control_display = object()
+    observer._data_display = object()
+    observer._control_id_base = 0x400000
+    observer._waiting_baseline_marker = True
+    observer._accepting_events = False
+    observer._setup_complete = False
+
+    class FailedStartXtst:
+        def __init__(self) -> None:
+            self.free_data_count = 0
+
+        def XRecordDisableContext(self, _display, _context) -> int:
+            return 1
+
+        def XRecordProcessReplies(self, _display) -> None:
+            marker = bytearray(32)
+            marker[0] = 1
+            device = wire_event(
+                event_type=linux_module._KEY_PRESS,
+                detail=38,
+                event_time=500,
+            )
+            delivered = wire_event(
+                event_type=linux_module._KEY_PRESS,
+                detail=38,
+                event_time=500,
+                state=1,
+            )
+            intercept_record(
+                observer,
+                category=linux_module._XRECORD_FROM_SERVER,
+                payload=bytes(marker),
+                id_base=observer._control_id_base,
+            )
+            intercept_record(
+                observer,
+                category=linux_module._XRECORD_FROM_SERVER,
+                payload=device,
+            )
+            intercept_record(
+                observer,
+                category=linux_module._XRECORD_FROM_SERVER,
+                payload=delivered,
+                id_base=0x800000,
+            )
+            intercept_record(
+                observer,
+                category=linux_module._XRECORD_END_OF_DATA,
+            )
+
+        def XRecordFreeData(self, _pointer) -> None:
+            self.free_data_count += 1
+
+        def XRecordFreeContext(self, _display, _context) -> int:
+            return 1
+
+    class FailedStartX11:
+        def XCloseDisplay(self, _display) -> int:
+            return 0
+
+    xtst = FailedStartXtst()
+    observer._xtst = xtst
+    observer._x11 = FailedStartX11()
+    observer._xkbcommon = None
+
+    observer._teardown()
+
+    assert events == []
+    assert xtst.free_data_count == 4
+    assert not observer._setup_complete
+    assert not observer._baseline_marker_seen
+    assert not observer._waiting_baseline_marker
+    assert not observer._accepting_events

@@ -356,6 +356,7 @@ class LinuxXInputObserver(ThreadedInputObserver):
         self._record_enabled = False
         self._record_started = False
         self._record_ended = False
+        self._setup_complete = False
         self._accepting_events = False
         self._waiting_baseline_marker = False
         self._baseline_marker_seen = False
@@ -527,6 +528,7 @@ class LinuxXInputObserver(ThreadedInputObserver):
             raise InputObserverError(
                 "X RECORD observed the pointer-baseline marker without arming input"
             )
+        self._setup_complete = True
 
     def _configure_api(self) -> None:
         self._x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
@@ -1114,6 +1116,12 @@ class LinuxXInputObserver(ThreadedInputObserver):
                 cleanup_failures.append(exc)
                 return None
 
+        if self._record_enabled and not self._setup_complete:
+            # A startup timeout can leave the ordered QueryPointer marker in
+            # the server tail.  Teardown must free that marker and subsequent
+            # records without letting a failed start arm event acceptance.
+            self._waiting_baseline_marker = False
+            self._accepting_events = False
         if (
             self._record_enabled
             and self._record_context
@@ -1205,6 +1213,7 @@ class LinuxXInputObserver(ThreadedInputObserver):
         self._record_callback_failure = None
         self._record_started = False
         self._record_ended = False
+        self._setup_complete = False
         self._accepting_events = False
         self._waiting_baseline_marker = False
         self._baseline_marker_seen = False
