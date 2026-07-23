@@ -532,14 +532,10 @@ def test_auxiliary_mouse_button_survives_storage_conversion_and_processing(
     reason="ABI offsets below describe the supported 64-bit Linux runners",
 )
 def test_xinput_raw_event_matches_64_bit_libxi_abi() -> None:
-    assert ctypes.sizeof(_XIRawEvent) == 144
-    assert _XIRawEvent.root.offset == 64
-    assert _XIRawEvent.root_x.offset == 72
-    assert _XIRawEvent.root_y.offset == 80
-    assert _XIRawEvent.flags.offset == 88
-    assert _XIRawEvent.buttons.offset == 96
-    assert _XIRawEvent.valuators.offset == 112
-    assert _XIRawEvent.raw_values.offset == 136
+    assert ctypes.sizeof(_XIRawEvent) == 96
+    assert _XIRawEvent.flags.offset == 60
+    assert _XIRawEvent.valuators.offset == 64
+    assert _XIRawEvent.raw_values.offset == 88
 
 
 def test_wayland_refuses_instead_of_silently_observing_only_xwayland(

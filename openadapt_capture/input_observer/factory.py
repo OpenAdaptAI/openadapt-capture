@@ -38,4 +38,3 @@ def create_input_observer(
     raise InputObserverUnavailableError(
         f"native input observation is not implemented for platform {selected!r}"
     )
-

@@ -6,6 +6,7 @@ import ctypes
 import ctypes.util
 import os
 import sys
+import time
 from typing import Any
 
 from .base import (
@@ -27,6 +28,9 @@ _XI_RAW_KEY_RELEASE = 14
 _XI_RAW_BUTTON_PRESS = 15
 _XI_RAW_BUTTON_RELEASE = 16
 _XI_RAW_MOTION = 17
+_XKB_USE_CORE_KBD = 0x0100
+_XKB_GROUP_SHIFT = 13
+_MAX_PENDING_BATCH = 256
 
 _SPECIAL_KEY_NAMES = {
     "Alt_L": "alt",
@@ -98,13 +102,6 @@ class _XIEventMask(ctypes.Structure):
     ]
 
 
-class _XIButtonState(ctypes.Structure):
-    _fields_ = [
-        ("mask_len", ctypes.c_int),
-        ("mask", ctypes.POINTER(ctypes.c_ubyte)),
-    ]
-
-
 class _XIValuatorState(ctypes.Structure):
     _fields_ = [
         ("mask_len", ctypes.c_int),
@@ -146,13 +143,28 @@ class _XIRawEvent(ctypes.Structure):
         ("deviceid", ctypes.c_int),
         ("sourceid", ctypes.c_int),
         ("detail", ctypes.c_int),
-        ("root", ctypes.c_ulong),
-        ("root_x", ctypes.c_double),
-        ("root_y", ctypes.c_double),
         ("flags", ctypes.c_int),
-        ("buttons", _XIButtonState),
         ("valuators", _XIValuatorState),
         ("raw_values", ctypes.POINTER(ctypes.c_double)),
+    ]
+
+
+class _XkbStateRec(ctypes.Structure):
+    _fields_ = [
+        ("group", ctypes.c_ubyte),
+        ("locked_group", ctypes.c_ubyte),
+        ("base_group", ctypes.c_ushort),
+        ("latched_group", ctypes.c_ushort),
+        ("mods", ctypes.c_ubyte),
+        ("base_mods", ctypes.c_ubyte),
+        ("latched_mods", ctypes.c_ubyte),
+        ("locked_mods", ctypes.c_ubyte),
+        ("compat_state", ctypes.c_ubyte),
+        ("grab_mods", ctypes.c_ubyte),
+        ("compat_grab_mods", ctypes.c_ubyte),
+        ("lookup_mods", ctypes.c_ubyte),
+        ("compat_lookup_mods", ctypes.c_ubyte),
+        ("ptr_buttons", ctypes.c_ushort),
     ]
 
 
@@ -163,6 +175,7 @@ def normalize_xinput_button_event(
     x: float,
     y: float,
     injected: bool = False,
+    timestamp: float | None = None,
 ) -> ObservedInput | None:
     """Map X11 button numbers to a click or normalized wheel event."""
     if detail in {4, 5, 6, 7}:
@@ -181,6 +194,7 @@ def normalize_xinput_button_event(
             dx=dx,
             dy=dy,
             injected=injected,
+            timestamp=timestamp,
         )
     button_by_detail = {
         1: "left",
@@ -200,6 +214,7 @@ def normalize_xinput_button_event(
         button=button,
         pressed=pressed,
         injected=injected,
+        timestamp=timestamp,
     )
 
 
@@ -209,11 +224,13 @@ def normalize_xinput_key_event(
     pressed: bool,
     keysym_name: str | None,
     injected: bool = False,
+    character: str | None = None,
+    derive_character: bool = True,
+    timestamp: float | None = None,
 ) -> ObservedKey:
     """Normalize an XInput2 keycode and XKB keysym name."""
     key_name = _SPECIAL_KEY_NAMES.get(keysym_name or "")
-    character = None
-    if keysym_name:
+    if derive_character and keysym_name:
         if len(keysym_name) == 1 and keysym_name.isprintable():
             character = keysym_name
         else:
@@ -230,6 +247,7 @@ def normalize_xinput_key_event(
         canonical_key_char=character.lower() if character else None,
         canonical_key_vk=virtual_key,
         injected=injected,
+        timestamp=timestamp,
     )
 
 
@@ -241,11 +259,13 @@ class LinuxXInputObserver(ThreadedInputObserver):
         self._environ = environ if environ is not None else os.environ
         self._x11: Any = None
         self._xi: Any = None
+        self._xkbcommon: Any = None
         self._display: Any = None
         self._root = 0
         self._xi_opcode = 0
         self._event_mask_buffer: Any = None
-        self._shift_keys_down: set[int] = set()
+        self._composition_mode: str | None = None
+        self._unverifiable_keycodes: set[int] = set()
 
     @staticmethod
     def _set_mask(mask: ctypes.Array[ctypes.c_ubyte], event_type: int) -> None:
@@ -271,13 +291,16 @@ class LinuxXInputObserver(ThreadedInputObserver):
 
         x11_name = ctypes.util.find_library("X11")
         xi_name = ctypes.util.find_library("Xi")
-        if not x11_name or not xi_name:
+        xkbcommon_name = ctypes.util.find_library("xkbcommon")
+        if not x11_name or not xi_name or not xkbcommon_name:
             raise InputObserverUnavailableError(
-                "XInput2 requires the system libX11 and libXi runtime libraries"
+                "Linux input observation requires the system libX11, libXi, "
+                "and permissively licensed libxkbcommon runtime libraries"
             )
         try:
             self._x11 = ctypes.CDLL(x11_name)
             self._xi = ctypes.CDLL(xi_name)
+            self._xkbcommon = ctypes.CDLL(xkbcommon_name)
         except OSError as exc:
             raise InputObserverUnavailableError(
                 f"could not load X11 input libraries: {exc}"
@@ -377,13 +400,20 @@ class LinuxXInputObserver(ThreadedInputObserver):
             ctypes.POINTER(ctypes.c_uint),
         ]
         self._x11.XQueryPointer.restype = ctypes.c_int
-        self._x11.XkbKeycodeToKeysym.argtypes = [
+        self._x11.XkbGetState.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.POINTER(_XkbStateRec),
+        ]
+        self._x11.XkbGetState.restype = ctypes.c_int
+        self._x11.XkbLookupKeySym.argtypes = [
             ctypes.c_void_p,
             ctypes.c_ubyte,
-            ctypes.c_int,
-            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_ulong),
         ]
-        self._x11.XkbKeycodeToKeysym.restype = ctypes.c_ulong
+        self._x11.XkbLookupKeySym.restype = ctypes.c_int
         self._x11.XKeysymToString.argtypes = [ctypes.c_ulong]
         self._x11.XKeysymToString.restype = ctypes.c_char_p
 
@@ -400,6 +430,12 @@ class LinuxXInputObserver(ThreadedInputObserver):
             ctypes.c_int,
         ]
         self._xi.XISelectEvents.restype = ctypes.c_int
+        self._xkbcommon.xkb_keysym_to_utf8.argtypes = [
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_char),
+            ctypes.c_size_t,
+        ]
+        self._xkbcommon.xkb_keysym_to_utf8.restype = ctypes.c_int
 
     def _query_pointer(self) -> tuple[float, float]:
         root_return = ctypes.c_ulong()
@@ -426,35 +462,106 @@ class LinuxXInputObserver(ThreadedInputObserver):
             )
         return float(root_x.value), float(root_y.value)
 
-    def _keysym_name(self, keycode: int, pressed: bool) -> str | None:
-        unshifted = self._x11.XkbKeycodeToKeysym(
-            self._display, keycode, 0, 0
-        )
-        unshifted_name_ptr = self._x11.XKeysymToString(unshifted) if unshifted else None
-        unshifted_name = (
-            unshifted_name_ptr.decode(errors="replace")
-            if unshifted_name_ptr
-            else None
-        )
-        is_shift = unshifted_name in {"Shift_L", "Shift_R"}
-        if is_shift:
-            if pressed:
-                self._shift_keys_down.add(keycode)
-            else:
-                self._shift_keys_down.discard(keycode)
-            return unshifted_name
+    def _lookup_keysym(self, keycode: int) -> tuple[int, str | None]:
+        state = _XkbStateRec()
+        if self._x11.XkbGetState(
+            self._display,
+            _XKB_USE_CORE_KBD,
+            ctypes.byref(state),
+        ) != 0:
+            raise InputObserverError(
+                "XKB could not read the active keyboard group and modifier state"
+            )
+        core_state = int(state.lookup_mods) | (int(state.group) << _XKB_GROUP_SHIFT)
+        consumed_modifiers = ctypes.c_uint()
+        keysym = ctypes.c_ulong()
+        if not self._x11.XkbLookupKeySym(
+            self._display,
+            keycode,
+            core_state,
+            ctypes.byref(consumed_modifiers),
+            ctypes.byref(keysym),
+        ):
+            raise InputObserverError(
+                f"XKB could not resolve keycode {keycode} in active group "
+                f"{int(state.group)}"
+            )
+        name_ptr = self._x11.XKeysymToString(keysym.value) if keysym.value else None
+        name = name_ptr.decode(errors="replace") if name_ptr else None
+        return int(keysym.value), name
 
-        level = 1 if self._shift_keys_down else 0
-        keysym = self._x11.XkbKeycodeToKeysym(self._display, keycode, 0, level)
-        name_ptr = self._x11.XKeysymToString(keysym) if keysym else None
-        return name_ptr.decode(errors="replace") if name_ptr else unshifted_name
+    def _keysym_character(self, keysym: int) -> str | None:
+        buffer = ctypes.create_string_buffer(64)
+        length = int(
+            self._xkbcommon.xkb_keysym_to_utf8(
+                keysym,
+                buffer,
+                len(buffer),
+            )
+        )
+        if length <= 1:
+            return None
+        return buffer.value.decode("utf-8", errors="strict")
+
+    def _resolved_character(
+        self,
+        *,
+        keycode: int,
+        keysym: int,
+        keysym_name: str | None,
+        pressed: bool,
+    ) -> str | None:
+        if not pressed and keycode in self._unverifiable_keycodes:
+            self._unverifiable_keycodes.discard(keycode)
+            return None
+        if keysym_name and (
+            keysym_name.startswith("dead_")
+            or keysym_name in {"Multi_key", "Compose"}
+        ):
+            if pressed:
+                self._composition_mode = (
+                    "dead" if keysym_name.startswith("dead_") else "multi"
+                )
+                self._unverifiable_keycodes.add(keycode)
+            return None
+
+        special_name = _SPECIAL_KEY_NAMES.get(keysym_name or "")
+        if self._composition_mode is not None and special_name in {
+            "enter",
+            "esc",
+            "space",
+        }:
+            if pressed:
+                self._composition_mode = None
+                self._unverifiable_keycodes.add(keycode)
+            return None
+        if self._composition_mode is not None and special_name is None:
+            if pressed:
+                self._unverifiable_keycodes.add(keycode)
+                if self._composition_mode == "dead":
+                    # A dead-key sequence resolves (or is rejected) on the
+                    # next non-modifier key. Without the target app's IME
+                    # result, that key's text is deliberately unverifiable.
+                    self._composition_mode = None
+            return None
+        if special_name is not None:
+            return None
+        return self._keysym_character(keysym)
 
     def _handle_raw_event(self, raw: _XIRawEvent) -> None:
         injected = bool(raw.send_event)
+        observed_at = time.time()
         if raw.evtype == _XI_RAW_MOTION:
             if self.observe_mouse and self.capture_mouse_moves:
                 x, y = self._query_pointer()
-                self._emit(ObservedMouseMove(x=x, y=y, injected=injected))
+                self._emit(
+                    ObservedMouseMove(
+                        x=x,
+                        y=y,
+                        injected=injected,
+                        timestamp=observed_at,
+                    )
+                )
             return
         if raw.evtype in {_XI_RAW_BUTTON_PRESS, _XI_RAW_BUTTON_RELEASE}:
             if self.observe_mouse:
@@ -465,6 +572,7 @@ class LinuxXInputObserver(ThreadedInputObserver):
                     x=x,
                     y=y,
                     injected=injected,
+                    timestamp=observed_at,
                 )
                 if event is not None:
                     self._emit(event)
@@ -472,18 +580,33 @@ class LinuxXInputObserver(ThreadedInputObserver):
         if raw.evtype in {_XI_RAW_KEY_PRESS, _XI_RAW_KEY_RELEASE}:
             if self.observe_keyboard:
                 pressed = raw.evtype == _XI_RAW_KEY_PRESS
+                keysym, keysym_name = self._lookup_keysym(raw.detail)
                 self._emit(
                     normalize_xinput_key_event(
                         keycode=raw.detail,
                         pressed=pressed,
-                        keysym_name=self._keysym_name(raw.detail, pressed),
+                        keysym_name=keysym_name,
                         injected=injected,
+                        character=self._resolved_character(
+                            keycode=raw.detail,
+                            keysym=keysym,
+                            keysym_name=keysym_name,
+                            pressed=pressed,
+                        ),
+                        derive_character=False,
+                        timestamp=observed_at,
                     )
                 )
 
     def _run_loop(self) -> None:
         while not self._stop_requested.is_set():
-            while self._x11.XPending(self._display):
+            processed = 0
+            while (
+                not self._stop_requested.is_set()
+                and processed < _MAX_PENDING_BATCH
+                and self._x11.XPending(self._display)
+            ):
+                processed += 1
                 event = _XEvent()
                 self._x11.XNextEvent(self._display, ctypes.byref(event))
                 cookie = event.xcookie
@@ -515,6 +638,8 @@ class LinuxXInputObserver(ThreadedInputObserver):
             self._x11.XCloseDisplay(self._display)
         self._display = None
         self._event_mask_buffer = None
+        self._composition_mode = None
+        self._unverifiable_keycodes.clear()
 
 
 __all__ = [
