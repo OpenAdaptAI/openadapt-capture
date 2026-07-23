@@ -31,6 +31,9 @@ _XI_RAW_MOTION = 17
 _XKB_USE_CORE_KBD = 0x0100
 _XKB_GROUP_SHIFT = 13
 _MAX_PENDING_BATCH = 256
+_XKB_COMPOSE_COMPOSING = 1
+_XKB_COMPOSE_COMPOSED = 2
+_XKB_COMPOSE_CANCELLED = 3
 
 _SPECIAL_KEY_NAMES = {
     "Alt_L": "alt",
@@ -265,7 +268,11 @@ class LinuxXInputObserver(ThreadedInputObserver):
         self._xi_opcode = 0
         self._event_mask_buffer: Any = None
         self._composition_mode: str | None = None
+        self._composition_remaining = 0
         self._unverifiable_keycodes: set[int] = set()
+        self._compose_context: Any = None
+        self._compose_table: Any = None
+        self._compose_state: Any = None
 
     @staticmethod
     def _set_mask(mask: ctypes.Array[ctypes.c_ubyte], event_type: int) -> None:
@@ -306,6 +313,7 @@ class LinuxXInputObserver(ThreadedInputObserver):
                 f"could not load X11 input libraries: {exc}"
             ) from exc
         self._configure_api()
+        self._initialize_compose()
         self._display = self._x11.XOpenDisplay(display_name.encode())
         if not self._display:
             raise InputObserverPermissionError(
@@ -436,6 +444,92 @@ class LinuxXInputObserver(ThreadedInputObserver):
             ctypes.c_size_t,
         ]
         self._xkbcommon.xkb_keysym_to_utf8.restype = ctypes.c_int
+        self._xkbcommon.xkb_context_new.argtypes = [ctypes.c_int]
+        self._xkbcommon.xkb_context_new.restype = ctypes.c_void_p
+        self._xkbcommon.xkb_context_unref.argtypes = [ctypes.c_void_p]
+        self._xkbcommon.xkb_compose_table_new_from_locale.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        self._xkbcommon.xkb_compose_table_new_from_locale.restype = ctypes.c_void_p
+        self._xkbcommon.xkb_compose_table_unref.argtypes = [ctypes.c_void_p]
+        self._xkbcommon.xkb_compose_state_new.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        self._xkbcommon.xkb_compose_state_new.restype = ctypes.c_void_p
+        self._xkbcommon.xkb_compose_state_unref.argtypes = [ctypes.c_void_p]
+        self._xkbcommon.xkb_compose_state_feed.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        self._xkbcommon.xkb_compose_state_feed.restype = ctypes.c_int
+        self._xkbcommon.xkb_compose_state_get_status.argtypes = [ctypes.c_void_p]
+        self._xkbcommon.xkb_compose_state_get_status.restype = ctypes.c_int
+        self._xkbcommon.xkb_compose_state_get_utf8.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_char),
+            ctypes.c_size_t,
+        ]
+        self._xkbcommon.xkb_compose_state_get_utf8.restype = ctypes.c_int
+        self._xkbcommon.xkb_compose_state_reset.argtypes = [ctypes.c_void_p]
+
+    def _initialize_compose(self) -> None:
+        locale_name = (
+            self._environ.get("LC_ALL")
+            or self._environ.get("LC_CTYPE")
+            or self._environ.get("LANG")
+            or "C"
+        )
+        self._compose_context = self._xkbcommon.xkb_context_new(0)
+        if not self._compose_context:
+            raise InputObserverUnavailableError(
+                "libxkbcommon could not create a compose context"
+            )
+        self._compose_table = self._xkbcommon.xkb_compose_table_new_from_locale(
+            self._compose_context,
+            locale_name.encode(),
+            0,
+        )
+        if not self._compose_table:
+            raise InputObserverUnavailableError(
+                f"libxkbcommon could not load compose rules for locale {locale_name!r}"
+            )
+        self._compose_state = self._xkbcommon.xkb_compose_state_new(
+            self._compose_table,
+            0,
+        )
+        if not self._compose_state:
+            raise InputObserverUnavailableError(
+                "libxkbcommon could not create compose state"
+            )
+
+    def _compose_character(self, keysym: int) -> tuple[bool, str | None]:
+        """Return whether compose consumed this press and any committed text."""
+        self._xkbcommon.xkb_compose_state_feed(self._compose_state, keysym)
+        status = int(
+            self._xkbcommon.xkb_compose_state_get_status(self._compose_state)
+        )
+        if status == _XKB_COMPOSE_COMPOSING:
+            return True, None
+        if status == _XKB_COMPOSE_COMPOSED:
+            buffer = ctypes.create_string_buffer(64)
+            length = int(
+                self._xkbcommon.xkb_compose_state_get_utf8(
+                    self._compose_state,
+                    buffer,
+                    len(buffer),
+                )
+            )
+            self._xkbcommon.xkb_compose_state_reset(self._compose_state)
+            if length <= 0:
+                return True, None
+            return True, buffer.value.decode("utf-8", errors="strict")
+        if status == _XKB_COMPOSE_CANCELLED:
+            self._xkbcommon.xkb_compose_state_reset(self._compose_state)
+            return True, None
+        return False, None
 
     def _query_pointer(self) -> tuple[float, float]:
         root_return = ctypes.c_ulong()
@@ -514,6 +608,14 @@ class LinuxXInputObserver(ThreadedInputObserver):
         if not pressed and keycode in self._unverifiable_keycodes:
             self._unverifiable_keycodes.discard(keycode)
             return None
+        if pressed and self._compose_state is not None:
+            consumed, composed_text = self._compose_character(keysym)
+            if consumed:
+                self._unverifiable_keycodes.add(keycode)
+                return composed_text
+
+        # Pure-unit and defensive fallback when no compose state exists.
+        # Production setup fails unless locale-aware compose state was created.
         if keysym_name and (
             keysym_name.startswith("dead_")
             or keysym_name in {"Multi_key", "Compose"}
@@ -521,6 +623,9 @@ class LinuxXInputObserver(ThreadedInputObserver):
             if pressed:
                 self._composition_mode = (
                     "dead" if keysym_name.startswith("dead_") else "multi"
+                )
+                self._composition_remaining = (
+                    1 if self._composition_mode == "dead" else 2
                 )
                 self._unverifiable_keycodes.add(keycode)
             return None
@@ -533,16 +638,19 @@ class LinuxXInputObserver(ThreadedInputObserver):
         }:
             if pressed:
                 self._composition_mode = None
+                self._composition_remaining = 0
                 self._unverifiable_keycodes.add(keycode)
             return None
         if self._composition_mode is not None and special_name is None:
             if pressed:
                 self._unverifiable_keycodes.add(keycode)
-                if self._composition_mode == "dead":
-                    # A dead-key sequence resolves (or is rejected) on the
-                    # next non-modifier key. Without the target app's IME
-                    # result, that key's text is deliberately unverifiable.
+                self._composition_remaining -= 1
+                if self._composition_remaining <= 0:
+                    # This fallback is only reachable without initialized
+                    # production compose state. It never guesses sequence
+                    # text and bounds how long later unrelated text is hidden.
                     self._composition_mode = None
+                    self._composition_remaining = 0
             return None
         if special_name is not None:
             return None
@@ -636,9 +744,20 @@ class LinuxXInputObserver(ThreadedInputObserver):
     def _teardown(self) -> None:
         if self._display and self._x11 is not None:
             self._x11.XCloseDisplay(self._display)
+        if self._xkbcommon is not None:
+            if self._compose_state:
+                self._xkbcommon.xkb_compose_state_unref(self._compose_state)
+            if self._compose_table:
+                self._xkbcommon.xkb_compose_table_unref(self._compose_table)
+            if self._compose_context:
+                self._xkbcommon.xkb_context_unref(self._compose_context)
+        self._compose_state = None
+        self._compose_table = None
+        self._compose_context = None
         self._display = None
         self._event_mask_buffer = None
         self._composition_mode = None
+        self._composition_remaining = 0
         self._unverifiable_keycodes.clear()
 
 

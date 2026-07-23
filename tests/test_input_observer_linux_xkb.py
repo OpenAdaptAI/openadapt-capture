@@ -69,6 +69,36 @@ class FakeXkbCommon:
         return len(encoded) + 1
 
 
+class FakeComposeXkbCommon(FakeXkbCommon):
+    def __init__(self) -> None:
+        super().__init__({0x65: "e", 0x78: "x"})
+        self.statuses = iter(
+            [
+                linux_module._XKB_COMPOSE_COMPOSING,
+                linux_module._XKB_COMPOSE_COMPOSED,
+                0,
+            ]
+        )
+        self.status = 0
+        self.reset_count = 0
+
+    def xkb_compose_state_feed(self, _state, _keysym) -> int:
+        self.status = next(self.statuses)
+        return 1
+
+    def xkb_compose_state_get_status(self, _state) -> int:
+        return self.status
+
+    def xkb_compose_state_get_utf8(self, _state, buffer, size) -> int:
+        encoded = "é".encode()
+        assert len(encoded) + 1 <= int(size)
+        ctypes.memmove(buffer, encoded + b"\0", len(encoded) + 1)
+        return len(encoded)
+
+    def xkb_compose_state_reset(self, _state) -> None:
+        self.reset_count += 1
+
+
 def make_observer() -> LinuxXInputObserver:
     return LinuxXInputObserver(
         lambda _event: None,
@@ -174,12 +204,42 @@ def test_multi_key_sequence_never_guesses_application_compose_text() -> None:
             is None
         )
 
-    observer._resolved_character(
-        keycode=36,
-        keysym=0xFF0D,
-        keysym_name="Return",
-        pressed=True,
+    assert (
+        observer._resolved_character(
+            keycode=53,
+            keysym=0x78,
+            keysym_name="x",
+            pressed=True,
+        )
+        == "x"
     )
+
+
+def test_locale_compose_state_commits_exact_text_then_resumes_normal_text() -> None:
+    observer = make_observer()
+    xkbcommon = FakeComposeXkbCommon()
+    observer._xkbcommon = xkbcommon
+    observer._compose_state = object()
+
+    assert (
+        observer._resolved_character(
+            keycode=48,
+            keysym=0xFE51,
+            keysym_name="dead_acute",
+            pressed=True,
+        )
+        is None
+    )
+    assert (
+        observer._resolved_character(
+            keycode=26,
+            keysym=0x65,
+            keysym_name="e",
+            pressed=True,
+        )
+        == "é"
+    )
+    assert xkbcommon.reset_count == 1
     assert (
         observer._resolved_character(
             keycode=53,
