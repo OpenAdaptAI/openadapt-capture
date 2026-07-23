@@ -169,8 +169,15 @@ class ThreadedInputObserver(InputObserver):
         with self._failure_lock:
             if self._failure is None:
                 self._failure = failure
+            primary = self._failure
         self._stop_requested.set()
-        self._wake()
+        try:
+            self._wake()
+        except BaseException as wake_error:
+            add_exception_note(
+                primary,
+                f"waking the failed observer also failed: {wake_error}",
+            )
 
     def _delivery_main(self) -> None:
         while True:
@@ -264,7 +271,13 @@ class ThreadedInputObserver(InputObserver):
             name=f"{type(self).__name__}-event-loop",
             daemon=True,
         )
-        self._thread.start()
+        try:
+            self._thread.start()
+        except BaseException as exc:
+            self._startup_failure = exc
+            self._thread = None
+            self._stop_delivery()
+            raise
         if not self._ready.wait(self.startup_timeout):
             primary = InputObserverError(
                 f"{type(self).__name__} did not become ready within "
