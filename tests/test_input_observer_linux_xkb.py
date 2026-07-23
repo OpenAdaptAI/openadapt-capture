@@ -132,6 +132,52 @@ def wire_event(
     return bytes(data)
 
 
+def intercept_record(
+    observer: LinuxXInputObserver,
+    *,
+    category: int,
+    payload: bytes = b"",
+    id_base: int = 0,
+    client_swapped: bool = False,
+) -> None:
+    buffer = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+    recorded = _XRecordInterceptData(
+        id_base=id_base,
+        category=category,
+        client_swapped=client_swapped,
+        data=ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)),
+        data_len=len(payload) // 4,
+    )
+    observer._record_intercept(None, ctypes.pointer(recorded))
+
+
+def test_direct_setup_initializes_xlib_threads_before_loading_x11(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer = make_observer()
+    monkeypatch.setattr(linux_module.sys, "platform", "linux")
+
+    def reject_xlib_threading() -> None:
+        raise RuntimeError("XInitThreads refused")
+
+    monkeypatch.setattr(
+        linux_module,
+        "ensure_xlib_thread_support",
+        reject_xlib_threading,
+    )
+    monkeypatch.setattr(
+        linux_module.ctypes.util,
+        "find_library",
+        lambda _name: pytest.fail("loaded Xlib before XInitThreads succeeded"),
+    )
+
+    with pytest.raises(RuntimeError, match="XInitThreads refused"):
+        observer._setup()
+
+    assert observer._x11 is None
+    assert observer._control_display is None
+
+
 @pytest.mark.skipif(
     ctypes.sizeof(ctypes.c_void_p) != 8 or ctypes.sizeof(ctypes.c_ulong) != 8,
     reason="ABI offsets below describe X11's 64-bit LP64 data model",
@@ -829,3 +875,223 @@ def test_idle_timeout_finalizes_unmatched_event(
     observer._finalize_expired_pending()
     assert len(events) == 1
     assert isinstance(events[0], ObservedKey)
+
+
+def test_shutdown_drain_emits_buffered_tail_through_end_of_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    observer = make_observer()
+    observer._emit = events.append  # type: ignore[method-assign]
+    observer._accepting_events = True
+    observer._x11 = FakeX11(keysym=0x61, keysym_name="a")
+    observer._control_display = object()
+    observer._xkbcommon = FakeXkbCommon({0x61: "a"})
+    monkeypatch.setattr(linux_module.time, "time", lambda: 51.0)
+
+    class TailXtst:
+        def __init__(self) -> None:
+            self.process_count = 0
+            self.free_count = 0
+
+        def XRecordProcessReplies(self, _display) -> None:
+            self.process_count += 1
+            device = wire_event(
+                event_type=linux_module._KEY_PRESS,
+                detail=38,
+                event_time=500,
+            )
+            delivered = wire_event(
+                event_type=linux_module._KEY_PRESS,
+                detail=38,
+                event_time=500,
+                state=1,
+            )
+            intercept_record(
+                observer,
+                category=linux_module._XRECORD_FROM_SERVER,
+                payload=device,
+            )
+            intercept_record(
+                observer,
+                category=linux_module._XRECORD_FROM_SERVER,
+                payload=delivered,
+                id_base=0x400000,
+            )
+            intercept_record(
+                observer,
+                category=linux_module._XRECORD_END_OF_DATA,
+            )
+
+        def XRecordFreeData(self, _pointer) -> None:
+            self.free_count += 1
+
+    xtst = TailXtst()
+    observer._xtst = xtst
+
+    observer._drain_record_tail()
+
+    assert observer._record_ended
+    assert xtst.process_count == 1
+    assert xtst.free_count == 3
+    assert events == [
+        ObservedKey(
+            pressed=True,
+            key_char="a",
+            key_vk="38",
+            canonical_key_char="a",
+            canonical_key_vk="38",
+            timestamp=51.0,
+        )
+    ]
+
+
+def test_shutdown_drain_times_out_without_end_of_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer = make_observer()
+    observer.shutdown_timeout = 0.05
+    process_count = 0
+
+    class NeverEndsXtst:
+        def XRecordProcessReplies(self, _display) -> None:
+            nonlocal process_count
+            process_count += 1
+
+    observer._xtst = NeverEndsXtst()
+    moments = iter([10.0, 10.1])
+    monkeypatch.setattr(linux_module.time, "monotonic", lambda: next(moments))
+
+    with pytest.raises(InputObserverError, match="did not deliver EndOfData"):
+        observer._drain_record_tail()
+
+    assert process_count == 1
+
+
+def test_teardown_drains_then_releases_every_native_resource() -> None:
+    observer = make_observer()
+    observer.shutdown_timeout = 0.1
+    control_display = object()
+    data_display = object()
+    record_range = object()
+    compose_state = object()
+    compose_table = object()
+    compose_context = object()
+    observer._record_enabled = True
+    observer._record_context = 7
+    observer._control_display = control_display
+    observer._data_display = data_display
+    observer._record_range = record_range
+    observer._compose_state = compose_state
+    observer._compose_table = compose_table
+    observer._compose_context = compose_context
+
+    class TeardownXtst:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.free_data_count = 0
+
+        def XRecordDisableContext(self, display, context) -> int:
+            assert display is control_display
+            assert context == 7
+            self.calls.append("disable")
+            return 1
+
+        def XRecordProcessReplies(self, display) -> None:
+            assert display is data_display
+            self.calls.append("process")
+            intercept_record(
+                observer,
+                category=linux_module._XRECORD_END_OF_DATA,
+            )
+
+        def XRecordFreeData(self, _pointer) -> None:
+            self.free_data_count += 1
+
+        def XRecordFreeContext(self, display, context) -> int:
+            assert display is control_display
+            assert context == 7
+            self.calls.append("free_context")
+            return 1
+
+    class TeardownX11:
+        def __init__(self) -> None:
+            self.freed = []
+            self.closed = []
+
+        def XFree(self, value) -> int:
+            self.freed.append(value)
+            return 1
+
+        def XCloseDisplay(self, value) -> int:
+            self.closed.append(value)
+            return 0
+
+    class TeardownXkb:
+        def __init__(self) -> None:
+            self.released = []
+
+        def xkb_compose_state_unref(self, value) -> None:
+            self.released.append(("state", value))
+
+        def xkb_compose_table_unref(self, value) -> None:
+            self.released.append(("table", value))
+
+        def xkb_context_unref(self, value) -> None:
+            self.released.append(("context", value))
+
+    xtst = TeardownXtst()
+    x11 = TeardownX11()
+    xkb = TeardownXkb()
+    observer._xtst = xtst
+    observer._x11 = x11
+    observer._xkbcommon = xkb
+
+    observer._teardown()
+
+    assert xtst.calls == ["disable", "process", "free_context"]
+    assert xtst.free_data_count == 1
+    assert x11.freed == [record_range]
+    assert x11.closed == [data_display, control_display]
+    assert xkb.released == [
+        ("state", compose_state),
+        ("table", compose_table),
+        ("context", compose_context),
+    ]
+    assert observer._record_context == 0
+    assert observer._data_display is None
+    assert observer._control_display is None
+
+
+def test_setup_failure_without_enabled_context_skips_shutdown_drain() -> None:
+    observer = make_observer()
+    observer._record_enabled = False
+    observer._record_context = 7
+    observer._control_display = object()
+    observer._data_display = object()
+
+    class SetupFailureXtst:
+        def __init__(self) -> None:
+            self.process_count = 0
+            self.free_context_count = 0
+
+        def XRecordProcessReplies(self, _display) -> None:
+            self.process_count += 1
+
+        def XRecordFreeContext(self, _display, _context) -> int:
+            self.free_context_count += 1
+            return 1
+
+    class SetupFailureX11:
+        def XCloseDisplay(self, _display) -> int:
+            return 0
+
+    xtst = SetupFailureXtst()
+    observer._xtst = xtst
+    observer._x11 = SetupFailureX11()
+    observer._xkbcommon = None
+
+    observer._teardown()
+
+    assert xtst.process_count == 0
+    assert xtst.free_context_count == 1

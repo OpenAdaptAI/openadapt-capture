@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from openadapt_capture.x11_threads import ensure_xlib_thread_support
+
 from .base import (
     InputObserverError,
     InputObserverPermissionError,
@@ -33,6 +35,7 @@ from .base import (
     ObservedMouseMove,
     ObservedMouseScroll,
     ThreadedInputObserver,
+    add_exception_note,
 )
 
 _KEY_PRESS = 2
@@ -352,6 +355,7 @@ class LinuxXInputObserver(ThreadedInputObserver):
         self._record_context = 0
         self._record_enabled = False
         self._record_started = False
+        self._record_ended = False
         self._accepting_events = False
         self._waiting_baseline_marker = False
         self._baseline_marker_seen = False
@@ -387,6 +391,12 @@ class LinuxXInputObserver(ThreadedInputObserver):
             raise InputObserverUnavailableError(
                 "X RECORD requires an X11 desktop and DISPLAY is not set"
             )
+
+        # The factory normally performs this process-wide initialization, but
+        # the observer is also a public class and may be constructed directly.
+        # XInitThreads must precede every other Xlib call or library-backed
+        # capture may be unsafe once screen and input threads run concurrently.
+        ensure_xlib_thread_support()
 
         x11_name = ctypes.util.find_library("X11")
         xtst_name = ctypes.util.find_library("Xtst")
@@ -682,6 +692,12 @@ class LinuxXInputObserver(ThreadedInputObserver):
                 self._record_started = True
                 return
             if recorded.category == _XRECORD_END_OF_DATA:
+                self._record_ended = True
+                return
+            if self._record_callback_failure is not None:
+                # After coverage has failed, drain only to the terminal marker.
+                # Emitting later records would make a failed recording appear
+                # partially usable.
                 return
             if recorded.category != _XRECORD_FROM_SERVER:
                 return
@@ -1047,22 +1063,80 @@ class LinuxXInputObserver(ThreadedInputObserver):
             self._finalize_expired_pending()
             self._stop_requested.wait(_LOOP_INTERVAL_SECONDS)
         self._raise_callback_failure()
+
+    def _drain_record_tail(self) -> None:
+        """Drain DisableContext's complete tail through EndOfData, or refuse."""
+        cleanup_reserve = min(
+            0.5,
+            max(
+                2 * _LOOP_INTERVAL_SECONDS,
+                self.shutdown_timeout * 0.1,
+            ),
+        )
+        drain_budget = max(0.0, self.shutdown_timeout - cleanup_reserve)
+        deadline = time.monotonic() + drain_budget
+        while not self._record_ended:
+            self._xtst.XRecordProcessReplies(self._data_display)
+            if self._record_ended:
+                break
+            if time.monotonic() >= deadline:
+                timeout = InputObserverError(
+                    "X RECORD did not deliver EndOfData within the bounded "
+                    f"{drain_budget:.3f}s shutdown drain"
+                )
+                if self._record_callback_failure is not None:
+                    add_exception_note(
+                        self._record_callback_failure,
+                        str(timeout),
+                    )
+                    raise self._record_callback_failure
+                raise timeout
+            time.sleep(
+                min(
+                    _LOOP_INTERVAL_SECONDS,
+                    max(0.0, deadline - time.monotonic()),
+                )
+            )
+        self._raise_callback_failure()
+        # RECORD guarantees DisableContext flushes all complete protocol
+        # elements before EndOfData.  Only now is the last device event known
+        # to have received every possible delivered copy.
         self._finalize_pending()
 
     def _teardown(self) -> None:
-        cleanup_failure: InputObserverError | None = None
+        cleanup_failures: list[BaseException] = []
+
+        def attempt(label: str, operation):
+            try:
+                return operation()
+            except BaseException as exc:
+                add_exception_note(exc, label)
+                cleanup_failures.append(exc)
+                return None
+
         if (
             self._record_enabled
             and self._record_context
             and self._control_display
             and self._xtst is not None
         ):
-            if not self._xtst.XRecordDisableContext(
-                self._control_display,
-                self._record_context,
-            ):
-                cleanup_failure = InputObserverError(
-                    "X RECORD context could not be disabled cleanly"
+            disabled = attempt(
+                "while disabling the X RECORD context",
+                lambda: self._xtst.XRecordDisableContext(
+                    self._control_display,
+                    self._record_context,
+                ),
+            )
+            if disabled:
+                attempt(
+                    "while draining the X RECORD shutdown tail",
+                    self._drain_record_tail,
+                )
+            elif disabled is not None:
+                cleanup_failures.append(
+                    InputObserverError(
+                        "X RECORD context could not be disabled cleanly"
+                    )
                 )
         self._record_enabled = False
         if (
@@ -1070,36 +1144,67 @@ class LinuxXInputObserver(ThreadedInputObserver):
             and self._control_display
             and self._xtst is not None
         ):
-            if not self._xtst.XRecordFreeContext(
-                self._control_display,
-                self._record_context,
-            ) and cleanup_failure is None:
-                cleanup_failure = InputObserverError(
-                    "X RECORD context could not be freed cleanly"
+            freed_context = attempt(
+                "while freeing the X RECORD context",
+                lambda: self._xtst.XRecordFreeContext(
+                    self._control_display,
+                    self._record_context,
+                ),
+            )
+            if freed_context is not None and not freed_context:
+                cleanup_failures.append(
+                    InputObserverError(
+                        "X RECORD context could not be freed cleanly"
+                    )
                 )
         self._record_context = 0
         if self._record_range is not None and self._x11 is not None:
-            self._x11.XFree(self._record_range)
+            attempt(
+                "while freeing the X RECORD range",
+                lambda: self._x11.XFree(self._record_range),
+            )
         self._record_range = None
         if self._data_display and self._x11 is not None:
-            self._x11.XCloseDisplay(self._data_display)
+            attempt(
+                "while closing the X RECORD data display",
+                lambda: self._x11.XCloseDisplay(self._data_display),
+            )
         if self._control_display and self._x11 is not None:
-            self._x11.XCloseDisplay(self._control_display)
+            attempt(
+                "while closing the X RECORD control display",
+                lambda: self._x11.XCloseDisplay(self._control_display),
+            )
         self._data_display = None
         self._control_display = None
         if self._xkbcommon is not None:
             if self._compose_state:
-                self._xkbcommon.xkb_compose_state_unref(self._compose_state)
+                attempt(
+                    "while releasing the XKB compose state",
+                    lambda: self._xkbcommon.xkb_compose_state_unref(
+                        self._compose_state
+                    ),
+                )
             if self._compose_table:
-                self._xkbcommon.xkb_compose_table_unref(self._compose_table)
+                attempt(
+                    "while releasing the XKB compose table",
+                    lambda: self._xkbcommon.xkb_compose_table_unref(
+                        self._compose_table
+                    ),
+                )
             if self._compose_context:
-                self._xkbcommon.xkb_context_unref(self._compose_context)
+                attempt(
+                    "while releasing the XKB context",
+                    lambda: self._xkbcommon.xkb_context_unref(
+                        self._compose_context
+                    ),
+                )
         self._compose_state = None
         self._compose_table = None
         self._compose_context = None
         self._record_callback = None
         self._record_callback_failure = None
         self._record_started = False
+        self._record_ended = False
         self._accepting_events = False
         self._waiting_baseline_marker = False
         self._baseline_marker_seen = False
@@ -1112,8 +1217,14 @@ class LinuxXInputObserver(ThreadedInputObserver):
         self._composition_mode = None
         self._composition_remaining = 0
         self._unverifiable_keycodes.clear()
-        if cleanup_failure is not None:
-            raise cleanup_failure
+        if cleanup_failures:
+            primary = cleanup_failures[0]
+            for secondary in cleanup_failures[1:]:
+                add_exception_note(
+                    primary,
+                    f"additional teardown failure: {secondary}",
+                )
+            raise primary
 
 
 __all__ = [
