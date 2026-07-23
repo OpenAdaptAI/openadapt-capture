@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import queue
 import sys
 import threading
 import time
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from openadapt_capture import input as input_module
 from openadapt_capture import recorder as recorder_module
 from openadapt_capture.capture import _convert_action_event
 from openadapt_capture.events import MouseClickEvent, MouseDownEvent, MouseUpEvent
@@ -242,6 +244,154 @@ def test_repeated_stop_retries_lingering_delivery_cleanup() -> None:
     with pytest.raises(InputObserverError, match="delivery thread did not stop"):
         observer.stop()
     assert observer._delivery_thread is None
+
+
+def test_async_delivery_preserves_native_receipt_timestamp_and_order() -> None:
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    public_events = []
+
+    def consume(event) -> None:
+        if not public_events:
+            callback_entered.set()
+            assert release_callback.wait(timeout=1)
+        public_events.append(input_module._to_public_event(event))
+
+    observer = _ReadyObserver(consume)
+    observer.start()
+    observer._emit(
+        ObservedKey(
+            pressed=True,
+            key_char="a",
+            canonical_key_char="a",
+            timestamp=10.25,
+        )
+    )
+    assert callback_entered.wait(timeout=1)
+    observer._emit(
+        ObservedKey(
+            pressed=False,
+            key_char="a",
+            canonical_key_char="a",
+            timestamp=10.5,
+        )
+    )
+    release_callback.set()
+    observer.stop()
+
+    assert [event.timestamp for event in public_events] == [10.25, 10.5]
+
+
+def test_stop_sequence_callback_can_stop_listener_from_delivery_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observers: list[_ReadyObserver] = []
+
+    def create(callback, **_kwargs):
+        observer = _ReadyObserver(callback)
+        observers.append(observer)
+        return observer
+
+    monkeypatch.setattr(input_module, "create_input_observer", create)
+    listener: input_module.KeyboardListener
+    listener = input_module.KeyboardListener(
+        lambda _event: None,
+        stop_sequences=["q"],
+        on_stop_sequence=lambda: listener.stop(),
+    )
+    listener.start()
+    observer = observers[0]
+    observer._emit(
+        ObservedKey(
+            pressed=True,
+            key_char="q",
+            canonical_key_char="q",
+            timestamp=20.0,
+        )
+    )
+
+    deadline = time.monotonic() + 1
+    while observer._delivery_thread is not None and observer._delivery_thread.is_alive():
+        if time.monotonic() >= deadline:
+            pytest.fail("listener delivery thread did not exit after callback stop")
+        time.sleep(0.001)
+
+    assert not listener._running
+    assert observer._failure is None
+
+
+def test_recorder_uses_one_observer_and_preserves_cross_device_receipt_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminate = threading.Event()
+    started = threading.Event()
+    event_q: queue.Queue = queue.Queue()
+    observed = [
+        ObservedMouseButton(
+            x=1,
+            y=2,
+            button="left",
+            pressed=True,
+            timestamp=100.1,
+        ),
+        ObservedKey(
+            pressed=True,
+            key_char="a",
+            canonical_key_char="a",
+            timestamp=100.2,
+        ),
+        ObservedMouseButton(
+            x=1,
+            y=2,
+            button="left",
+            pressed=False,
+            timestamp=100.3,
+        ),
+    ]
+    factory_calls = []
+
+    class FakeObserver:
+        def __init__(self, callback) -> None:
+            self.callback = callback
+
+        def start(self) -> None:
+            for event in observed:
+                self.callback(event)
+            terminate.set()
+
+        def check_health(self) -> None:
+            return
+
+        def stop(self) -> None:
+            return
+
+    def create(callback, **kwargs):
+        factory_calls.append(kwargs)
+        return FakeObserver(callback)
+
+    monkeypatch.setattr(recorder_module, "create_input_observer", create)
+    recorder_module.read_input_events(
+        event_q,
+        terminate,
+        SimpleNamespace(timestamp=100.0),
+        started,
+    )
+
+    persisted = [event_q.get_nowait() for _ in range(event_q.qsize())]
+    assert factory_calls == [
+        {
+            "observe_keyboard": True,
+            "observe_mouse": True,
+            "capture_mouse_moves": True,
+        }
+    ]
+    assert started.is_set()
+    assert [event.timestamp for event in persisted] == [100.1, 100.2, 100.3]
+    assert [event.data["name"] for event in persisted] == [
+        "click",
+        "press",
+        "click",
+    ]
 
 
 @pytest.mark.parametrize(

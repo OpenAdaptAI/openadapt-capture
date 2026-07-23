@@ -353,6 +353,23 @@ def test_move_filter_does_not_disable_buttons() -> None:
     assert quartz.kCGEventMouseMoved not in observer._observed_event_types()
 
 
+def test_event_callback_stamps_native_receipt_time_before_async_delivery() -> None:
+    quartz = FakeQuartz()
+    events = []
+    observer = make_observer(quartz, events.append)
+    event = FakeEvent()
+
+    observer.start()
+    before = time.time()
+    observer._event_callback(None, quartz.kCGEventMouseMoved, event, None)
+    after = time.time()
+    observer.stop()
+
+    assert len(events) == 1
+    assert events[0].timestamp is not None
+    assert before <= events[0].timestamp <= after
+
+
 def test_key_press_release_and_modifier_canonicalization() -> None:
     quartz = FakeQuartz()
     events = []
@@ -535,8 +552,8 @@ def test_callback_failure_becomes_health_failure() -> None:
 
     observer = make_observer(quartz, fail)
     event = FakeEvent()
-    observer._handle_event = lambda _type, _event: observer._emit(  # type: ignore[method-assign]
-        ObservedMouseMove(1, 2)
+    observer._handle_event = (  # type: ignore[method-assign]
+        lambda _type, _event, **_kwargs: observer._emit(ObservedMouseMove(1, 2))
     )
 
     observer.start()

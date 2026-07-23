@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from .base import (
@@ -311,7 +312,7 @@ class DarwinInputObserver(ThreadedInputObserver):
             return event
 
         try:
-            self._handle_event(event_type, event)
+            self._handle_event(event_type, event, timestamp=time.time())
         except BaseException as exc:
             failure = (
                 exc
@@ -321,17 +322,39 @@ class DarwinInputObserver(ThreadedInputObserver):
             self._fail(failure)
         return event
 
-    def _handle_event(self, event_type: int, event: Any) -> None:
+    def _handle_event(
+        self,
+        event_type: int,
+        event: Any,
+        *,
+        timestamp: float | None = None,
+    ) -> None:
         quartz = self._quartz
         injected = self._is_injected(event)
+        # Production callbacks always pass the receipt time. Keeping ``None``
+        # for direct normalization calls makes the pure helper independently
+        # testable without inventing a second observation moment.
+        observed_at = timestamp
 
         if event_type in self._mouse_move_event_types():
             if self.observe_mouse and self.capture_mouse_moves:
                 x, y = self._location(event)
-                self._emit(ObservedMouseMove(x=x, y=y, injected=injected))
+                self._emit(
+                    ObservedMouseMove(
+                        x=x,
+                        y=y,
+                        injected=injected,
+                        timestamp=observed_at,
+                    )
+                )
             return
 
-        button_event = self._mouse_button_event(event_type, event, injected)
+        button_event = self._mouse_button_event(
+            event_type,
+            event,
+            injected,
+            timestamp=observed_at,
+        )
         if button_event is not None:
             self._emit(button_event)
             return
@@ -355,6 +378,7 @@ class DarwinInputObserver(ThreadedInputObserver):
                         )
                     ),
                     injected=injected,
+                    timestamp=observed_at,
                 )
             )
             return
@@ -366,6 +390,7 @@ class DarwinInputObserver(ThreadedInputObserver):
                         event,
                         pressed=event_type == quartz.kCGEventKeyDown,
                         injected=injected,
+                        timestamp=observed_at,
                     )
                 )
             return
@@ -383,6 +408,7 @@ class DarwinInputObserver(ThreadedInputObserver):
                     pressed=pressed,
                     injected=injected,
                     include_character=False,
+                    timestamp=observed_at,
                 )
             )
 
@@ -431,6 +457,8 @@ class DarwinInputObserver(ThreadedInputObserver):
         event_type: int,
         event: Any,
         injected: bool,
+        *,
+        timestamp: float | None,
     ) -> ObservedMouseButton | None:
         if not self.observe_mouse:
             return None
@@ -462,6 +490,7 @@ class DarwinInputObserver(ThreadedInputObserver):
             button=button,
             pressed=pressed,
             injected=injected,
+            timestamp=timestamp,
         )
 
     def _key_event(
@@ -471,6 +500,7 @@ class DarwinInputObserver(ThreadedInputObserver):
         pressed: bool,
         injected: bool,
         include_character: bool = True,
+        timestamp: float | None,
     ) -> ObservedKey:
         keycode = self._keycode(event)
         key_name = _KEY_NAMES.get(keycode)
@@ -491,6 +521,7 @@ class DarwinInputObserver(ThreadedInputObserver):
             canonical_key_char=canonical_char,
             canonical_key_vk=vk,
             injected=injected,
+            timestamp=timestamp,
         )
 
     def _keyboard_character(self, event: Any) -> str | None:

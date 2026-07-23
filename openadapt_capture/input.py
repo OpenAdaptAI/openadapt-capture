@@ -32,7 +32,11 @@ def _get_timestamp() -> float:
 
 def _to_public_event(observed: ObservedInput):
     """Convert a native normalized event to the public Pydantic event model."""
-    timestamp = _get_timestamp()
+    timestamp = (
+        observed.timestamp
+        if observed.timestamp is not None
+        else _get_timestamp()
+    )
     if isinstance(observed, ObservedMouseMove):
         return MouseMoveEvent(timestamp=timestamp, x=observed.x, y=observed.y)
     if isinstance(observed, ObservedMouseButton):

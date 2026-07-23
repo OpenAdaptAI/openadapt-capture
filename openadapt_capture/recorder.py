@@ -811,6 +811,7 @@ def trigger_action_event(
     event_q: queue.Queue,
     action_event_args: dict[str, Any],
     window_scope: WindowCaptureScope | None = None,
+    timestamp: float | None = None,
 ) -> None:
     """Triggers an action event and adds it to the event queue.
 
@@ -821,6 +822,8 @@ def trigger_action_event(
             coordinates are translated into the target window's pixel space
             before being recorded, so recorded coordinates match the captured
             frames directly.
+        timestamp: Native event-receipt time. Defaults to the current recording
+            clock only for legacy/direct callers.
 
     Returns:
         None
@@ -844,7 +847,13 @@ def trigger_action_event(
                 return
             action_event_args["mouse_x"] = wx
             action_event_args["mouse_y"] = wy
-    event_q.put(Event(utils.get_timestamp(), "action", action_event_args))
+    event_q.put(
+        Event(
+            utils.get_timestamp() if timestamp is None else timestamp,
+            "action",
+            action_event_args,
+        )
+    )
 
 
 def on_move(
@@ -853,6 +862,7 @@ def on_move(
     x: float,
     y: float,
     injected: bool = False,
+    timestamp: float | None = None,
 ) -> None:
     """Handles the 'move' event.
 
@@ -872,6 +882,7 @@ def on_move(
             event_q,
             {"name": "move", "mouse_x": x, "mouse_y": y},
             window_scope,
+            timestamp,
         )
 
 
@@ -883,6 +894,7 @@ def on_click(
     button: str,
     pressed: bool,
     injected: bool = False,
+    timestamp: float | None = None,
 ) -> None:
     """Handles the 'click' event.
 
@@ -910,6 +922,7 @@ def on_click(
                 "mouse_pressed": pressed,
             },
             window_scope,
+            timestamp,
         )
 
 
@@ -921,6 +934,7 @@ def on_scroll(
     dx: float,
     dy: float,
     injected: bool = False,
+    timestamp: float | None = None,
 ) -> None:
     """Handles the 'scroll' event.
 
@@ -948,6 +962,7 @@ def on_scroll(
                 "mouse_dy": dy,
             },
             window_scope,
+            timestamp,
         )
 
 
@@ -975,6 +990,7 @@ def handle_key(
             "canonical_key_char": key.canonical_key_char,
             "canonical_key_vk": key.canonical_key_vk,
         },
+        timestamp=key.timestamp,
     )
 
 
@@ -1262,30 +1278,55 @@ def create_recording(
     return recording, db_path
 
 
-def read_keyboard_events(
+def read_input_events(
     event_q: queue.Queue,
     terminate_processing: multiprocessing.Event,
     recording: Recording,
     started_event: threading.Event,
+    window_scope: WindowCaptureScope | None = None,
 ) -> None:
-    """Reads keyboard events and adds them to the event queue.
-
-    Args:
-        event_q (queue.Queue): The event queue to add the keyboard events to.
-        terminate_processing (multiprocessing.Event): The event to signal termination
-          of event reading.
-        recording (Recording): The recording object.
-        started_event: Event to set once started.
-
-    Returns:
-        None
-    """
+    """Read globally ordered keyboard and mouse events from one native observer."""
     stop_sequences = [sequence for sequence in config.STOP_SEQUENCES if sequence]
     stop_sequence_indices = [0 for _ in stop_sequences]
 
     def on_observed(event: ObservedInput) -> None:
-        if not isinstance(event, ObservedKey) or event.injected:
+        if isinstance(event, ObservedMouseMove):
+            on_move(
+                event_q,
+                window_scope,
+                event.x,
+                event.y,
+                event.injected,
+                timestamp=event.timestamp,
+            )
             return
+        if isinstance(event, ObservedMouseButton):
+            on_click(
+                event_q,
+                window_scope,
+                event.x,
+                event.y,
+                event.button,
+                event.pressed,
+                event.injected,
+                timestamp=event.timestamp,
+            )
+            return
+        if isinstance(event, ObservedMouseScroll):
+            on_scroll(
+                event_q,
+                window_scope,
+                event.x,
+                event.y,
+                event.dx,
+                event.dy,
+                event.injected,
+                timestamp=event.timestamp,
+            )
+            return
+        if event.injected:
+            return
+
         logger.debug(f"{event=}")
         handle_key(event_q, event)
         if not event.pressed:
@@ -1315,79 +1356,6 @@ def read_keyboard_events(
     observer = create_input_observer(
         on_observed,
         observe_keyboard=True,
-        observe_mouse=False,
-        capture_mouse_moves=False,
-    )
-    started = False
-    try:
-        observer.start()
-        started = True
-        started_event.set()
-        while not terminate_processing.wait(0.1):
-            observer.check_health()
-    except BaseException:
-        terminate_processing.set()
-        raise
-    finally:
-        if started:
-            observer.stop()
-
-
-def read_mouse_events(
-    event_q: queue.Queue,
-    terminate_processing: multiprocessing.Event,
-    recording: Recording,
-    started_event: threading.Event,
-    window_scope: WindowCaptureScope | None = None,
-) -> None:
-    """Reads mouse events and adds them to the event queue.
-
-    Args:
-        event_q: The event queue to add the mouse events to.
-        terminate_processing: The event to signal termination of event reading.
-        recording: The recording object.
-        started_event: Event to set once started.
-        window_scope: Optional window scope; when set, mouse coordinates are
-            translated into the target window's pixel space.
-
-    Returns:
-        None
-    """
-    utils.set_start_time(recording.timestamp)
-
-    def on_observed(event: ObservedInput) -> None:
-        if isinstance(event, ObservedMouseMove):
-            on_move(
-                event_q,
-                window_scope,
-                event.x,
-                event.y,
-                event.injected,
-            )
-        elif isinstance(event, ObservedMouseButton):
-            on_click(
-                event_q,
-                window_scope,
-                event.x,
-                event.y,
-                event.button,
-                event.pressed,
-                event.injected,
-            )
-        elif isinstance(event, ObservedMouseScroll):
-            on_scroll(
-                event_q,
-                window_scope,
-                event.x,
-                event.y,
-                event.dx,
-                event.dy,
-                event.injected,
-            )
-
-    observer = create_input_observer(
-        on_observed,
-        observe_keyboard=False,
         observe_mouse=True,
         capture_mouse_moves=True,
     )
@@ -1759,46 +1727,26 @@ def record(
     screen_event_reader.start()
     task_by_name["screen_event_reader"] = screen_event_reader
 
-    keyboard_reader_args = (
+    input_reader_args = (
         event_q,
         terminate_processing,
         recording,
-        task_started_events.setdefault("keyboard_event_reader", threading.Event()),
-    )
-    keyboard_event_reader = threading.Thread(
-        target=_run_task_fail_loud,
-        daemon=True,
-        args=(
-            "keyboard_event_reader",
-            read_keyboard_events,
-            keyboard_reader_args,
-            terminate_processing,
-            task_errors,
-        ),
-    )
-    keyboard_event_reader.start()
-    task_by_name["keyboard_event_reader"] = keyboard_event_reader
-
-    mouse_reader_args = (
-        event_q,
-        terminate_processing,
-        recording,
-        task_started_events.setdefault("mouse_event_reader", threading.Event()),
+        task_started_events.setdefault("input_event_reader", threading.Event()),
         window_scope,
     )
-    mouse_event_reader = threading.Thread(
+    input_event_reader = threading.Thread(
         target=_run_task_fail_loud,
         daemon=True,
         args=(
-            "mouse_event_reader",
-            read_mouse_events,
-            mouse_reader_args,
+            "input_event_reader",
+            read_input_events,
+            input_reader_args,
             terminate_processing,
             task_errors,
         ),
     )
-    mouse_event_reader.start()
-    task_by_name["mouse_event_reader"] = mouse_event_reader
+    input_event_reader.start()
+    task_by_name["input_event_reader"] = input_event_reader
 
     if num_action_events is None:
         num_action_events = multiprocessing.Value("i", 0)
@@ -2039,8 +1987,7 @@ def record(
             "window_event_reader",
             "browser_event_reader",
             "screen_event_reader",
-            "keyboard_event_reader",
-            "mouse_event_reader",
+            "input_event_reader",
             "event_processor",
             "screen_event_writer",
             "browser_event_writer",
