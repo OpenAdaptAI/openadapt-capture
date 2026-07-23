@@ -397,6 +397,93 @@ def test_device_and_delivered_key_correlate_with_event_time_state(
     assert x11.lookup_states == [0x4282]
 
 
+def test_normative_device_then_duplicate_deliveries_then_next_device_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    observer = make_observer()
+    observer._emit = events.append  # type: ignore[method-assign]
+    x11 = FakeX11(keysym=0x61, keysym_name="a")
+    observer._x11 = x11
+    observer._control_display = object()
+    observer._xkbcommon = FakeXkbCommon({0x61: "a"})
+    wall_times = iter([100.0, 101.0])
+    monotonic_times = iter([200.0, 201.0])
+    monkeypatch.setattr(linux_module.time, "time", lambda: next(wall_times))
+    monkeypatch.setattr(
+        linux_module.time,
+        "monotonic",
+        lambda: next(monotonic_times),
+    )
+
+    press = _CoreWireEvent(
+        linux_module._KEY_PRESS,
+        38,
+        False,
+        900,
+        0,
+        0,
+        0,
+        50,
+        60,
+        0,
+        0,
+        0x0001,
+    )
+    observer._handle_device_event(press)
+    observer._handle_delivered_event(press, id_base=0x200000)
+    observer._handle_delivered_event(press, id_base=0x400000)
+    assert events == []
+
+    release = _CoreWireEvent(
+        linux_module._KEY_RELEASE,
+        38,
+        False,
+        901,
+        0,
+        0,
+        0,
+        50,
+        60,
+        0,
+        0,
+        0x0001,
+    )
+    observer._handle_device_event(release)
+    assert len(events) == 1
+    assert events[0] == ObservedKey(
+        pressed=True,
+        key_char="a",
+        key_vk="38",
+        canonical_key_char="a",
+        canonical_key_vk="38",
+        timestamp=100.0,
+    )
+
+    observer._handle_delivered_event(release, id_base=0x200000)
+    observer._finalize_pending()
+
+    assert events == [
+        ObservedKey(
+            pressed=True,
+            key_char="a",
+            key_vk="38",
+            canonical_key_char="a",
+            canonical_key_vk="38",
+            timestamp=100.0,
+        ),
+        ObservedKey(
+            pressed=False,
+            key_char="a",
+            key_vk="38",
+            canonical_key_char="a",
+            canonical_key_vk="38",
+            timestamp=101.0,
+        ),
+    ]
+    assert x11.lookup_states == [0x0001, 0x0001]
+
+
 def test_unmatched_key_keeps_physical_identity_and_suppresses_later_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

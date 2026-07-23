@@ -1,11 +1,13 @@
 """Fail-closed Linux global input observation through the X RECORD extension.
 
-The RECORD specification deliberately leaves most fields in an intercepted
-``device_event`` undefined: key/button events guarantee only ``time`` and
-``detail``; motion additionally guarantees root coordinates.  This observer
-therefore never samples current X state after an event.  It preserves the
-globally ordered device stream and enriches key/button events only from the
-matching delivered core event, whose wire record carries event-time state and
+The normative RECORD protocol guarantees exactly one selected ``device_event``
+for every generated device event, whether or not any client receives it, in
+device generation order.  Each delivered copy is a separate record after that
+device event.  Device key/button records deliberately guarantee only ``time``
+and ``detail``; device motion additionally guarantees root coordinates.  This
+observer therefore never samples current X state after an event.  It preserves
+the global device stream and enriches key/button events only from matching
+delivered core events, whose wire records carry event-time state and
 coordinates.  Missing enrichment degrades keyboard text to physical identity
 and makes pointer actions fail closed unless an exact earlier pointer position
 is known.
@@ -712,6 +714,10 @@ class LinuxXInputObserver(ThreadedInputObserver):
                 # before our recorded QueryPointer reply is discarded.
                 return
             if int(recorded.id_base) == 0:
+                # Normative RECORD semantics make this the one global record
+                # for every generated device event.  Zero does not mean the
+                # event was necessarily undelivered; any delivered copies
+                # follow separately with their target client's id-base.
                 if recorded.client_swapped:
                     raise InputObserverError(
                         "X RECORD marked a device event as byte-swapped; "
