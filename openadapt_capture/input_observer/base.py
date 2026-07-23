@@ -28,6 +28,7 @@ class ObservedMouseMove:
     x: float
     y: float
     injected: bool = False
+    timestamp: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +40,7 @@ class ObservedMouseButton:
     button: str
     pressed: bool
     injected: bool = False
+    timestamp: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +52,7 @@ class ObservedMouseScroll:
     dx: float
     dy: float
     injected: bool = False
+    timestamp: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +67,7 @@ class ObservedKey:
     canonical_key_char: str | None = None
     canonical_key_vk: str | None = None
     injected: bool = False
+    timestamp: float | None = None
 
 
 ObservedInput: TypeAlias = (
@@ -135,6 +139,7 @@ class ThreadedInputObserver(InputObserver):
             maxsize=delivery_queue_size
         )
         self._delivery_sentinel = object()
+        self._delivery_stop_requested = threading.Event()
         self._failure: BaseException | None = None
         self._failure_lock = threading.Lock()
         self._startup_failure: BaseException | None = None
@@ -186,7 +191,15 @@ class ThreadedInputObserver(InputObserver):
 
     def _delivery_main(self) -> None:
         while True:
-            item = self._delivery_queue.get()
+            if (
+                self._delivery_stop_requested.is_set()
+                and self._delivery_queue.empty()
+            ):
+                return
+            try:
+                item = self._delivery_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
             try:
                 if item is self._delivery_sentinel:
                     return
@@ -212,6 +225,7 @@ class ThreadedInputObserver(InputObserver):
                 "previous lifecycle; stop it or create a new observer"
             )
         self._delivery_queue = queue.Queue(maxsize=self.delivery_queue_size)
+        self._delivery_stop_requested.clear()
         thread = threading.Thread(
             target=self._delivery_main,
             name=f"{type(self).__name__}-delivery",
@@ -227,6 +241,13 @@ class ThreadedInputObserver(InputObserver):
     def _stop_delivery(self) -> None:
         thread = self._delivery_thread
         if thread is None:
+            return
+        self._delivery_stop_requested.set()
+        if thread is threading.current_thread():
+            # A consumer callback may intentionally stop its listener (for
+            # example after matching the configured stop sequence). Returning
+            # lets the callback unwind; the delivery loop then drains events
+            # already received before exiting without attempting a self-join.
             return
         if thread.is_alive():
             try:
