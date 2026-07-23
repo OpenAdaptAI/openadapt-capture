@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -71,6 +72,13 @@ ObservedInput: TypeAlias = (
 InputCallback: TypeAlias = Callable[[ObservedInput], None]
 
 
+def add_exception_note(error: BaseException, note: str) -> None:
+    """Attach cleanup context when supported without masking the primary error."""
+    add_note = getattr(error, "add_note", None)
+    if add_note is not None:
+        add_note(note)
+
+
 class InputObserver(ABC):
     """Lifecycle contract for a complete native input observer."""
 
@@ -106,6 +114,7 @@ class ThreadedInputObserver(InputObserver):
         capture_mouse_moves: bool,
         startup_timeout: float = 5.0,
         shutdown_timeout: float = 5.0,
+        delivery_queue_size: int = 4096,
     ) -> None:
         if not observe_keyboard and not observe_mouse:
             raise ValueError("at least one of observe_keyboard or observe_mouse is required")
@@ -115,10 +124,20 @@ class ThreadedInputObserver(InputObserver):
         self.capture_mouse_moves = capture_mouse_moves
         self.startup_timeout = startup_timeout
         self.shutdown_timeout = shutdown_timeout
+        if delivery_queue_size <= 0:
+            raise ValueError("delivery_queue_size must be positive")
+        self.delivery_queue_size = delivery_queue_size
         self._ready = threading.Event()
         self._stop_requested = threading.Event()
         self._thread: threading.Thread | None = None
+        self._delivery_thread: threading.Thread | None = None
+        self._delivery_queue: queue.Queue[ObservedInput | object] = queue.Queue(
+            maxsize=delivery_queue_size
+        )
+        self._delivery_sentinel = object()
         self._failure: BaseException | None = None
+        self._failure_lock = threading.Lock()
+        self._startup_failure: BaseException | None = None
 
     @abstractmethod
     def _setup(self) -> None:
@@ -136,7 +155,79 @@ class ThreadedInputObserver(InputObserver):
         """Wake a blocked event loop during shutdown, when needed."""
 
     def _emit(self, event: ObservedInput) -> None:
-        self.callback(event)
+        try:
+            self._delivery_queue.put_nowait(event)
+        except queue.Full:
+            failure = InputObserverError(
+                f"{type(self).__name__} input delivery queue overflowed; "
+                "recording coverage is incomplete"
+            )
+            self._fail(failure)
+            raise failure
+
+    def _fail(self, failure: BaseException) -> None:
+        with self._failure_lock:
+            if self._failure is None:
+                self._failure = failure
+        self._stop_requested.set()
+        self._wake()
+
+    def _delivery_main(self) -> None:
+        while True:
+            item = self._delivery_queue.get()
+            try:
+                if item is self._delivery_sentinel:
+                    return
+                self.callback(item)  # type: ignore[arg-type]
+            except BaseException as exc:
+                failure = (
+                    exc
+                    if isinstance(exc, InputObserverError)
+                    else InputObserverError(
+                        f"{type(self).__name__} input consumer failed: {exc}"
+                    )
+                )
+                self._fail(failure)
+                return
+            finally:
+                self._delivery_queue.task_done()
+
+    def _start_delivery(self) -> None:
+        self._delivery_queue = queue.Queue(maxsize=self.delivery_queue_size)
+        self._delivery_thread = threading.Thread(
+            target=self._delivery_main,
+            name=f"{type(self).__name__}-delivery",
+            daemon=True,
+        )
+        self._delivery_thread.start()
+
+    def _stop_delivery(self) -> None:
+        thread = self._delivery_thread
+        if thread is None:
+            return
+        if thread.is_alive():
+            try:
+                self._delivery_queue.put(
+                    self._delivery_sentinel,
+                    timeout=self.shutdown_timeout,
+                )
+            except queue.Full:
+                self._fail(
+                    InputObserverError(
+                        f"{type(self).__name__} delivery queue could not drain "
+                        "during shutdown"
+                    )
+                )
+            thread.join(self.shutdown_timeout)
+        if thread.is_alive():
+            self._fail(
+                InputObserverError(
+                    f"{type(self).__name__} delivery thread did not stop within "
+                    f"{self.shutdown_timeout:.1f}s"
+                )
+            )
+        else:
+            self._delivery_thread = None
 
     def _thread_main(self) -> None:
         try:
@@ -144,7 +235,9 @@ class ThreadedInputObserver(InputObserver):
             self._ready.set()
             self._run_loop()
         except BaseException as exc:
-            self._failure = exc
+            with self._failure_lock:
+                if self._failure is None:
+                    self._failure = exc
             self._ready.set()
         finally:
             try:
@@ -155,10 +248,17 @@ class ThreadedInputObserver(InputObserver):
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
+            if self._startup_failure is not None:
+                raise InputObserverError(
+                    f"{type(self).__name__} still has a live thread from a "
+                    "failed startup; create a new observer after fixing the cause"
+                ) from self._startup_failure
             return
         self._ready.clear()
         self._stop_requested.clear()
         self._failure = None
+        self._startup_failure = None
+        self._start_delivery()
         self._thread = threading.Thread(
             target=self._thread_main,
             name=f"{type(self).__name__}-event-loop",
@@ -166,23 +266,58 @@ class ThreadedInputObserver(InputObserver):
         )
         self._thread.start()
         if not self._ready.wait(self.startup_timeout):
-            self._stop_requested.set()
-            self._wake()
-            raise InputObserverError(
+            primary = InputObserverError(
                 f"{type(self).__name__} did not become ready within "
                 f"{self.startup_timeout:.1f}s"
             )
-        self.check_health()
+            self._abort_start(primary)
+        try:
+            self.check_health()
+        except BaseException as exc:
+            self._abort_start(exc)
+
+    def _abort_start(self, primary: BaseException) -> None:
+        """Make a failed ``start`` transactional before surfacing its cause."""
+        self._startup_failure = primary
+        thread = self._thread
+        if thread is None:
+            self._stop_delivery()
+            raise primary
+        self._stop_requested.set()
+        try:
+            self._wake()
+        except BaseException as cleanup_exc:
+            add_exception_note(
+                primary,
+                f"observer wake during failed startup also failed: {cleanup_exc}"
+            )
+        thread.join(self.shutdown_timeout)
+        if thread.is_alive():
+            add_exception_note(
+                primary,
+                f"{type(self).__name__} setup thread did not stop within "
+                f"{self.shutdown_timeout:.1f}s",
+            )
+        else:
+            self._thread = None
+        self._stop_delivery()
+        raise primary
 
     def check_health(self) -> None:
-        if self._failure is not None:
-            if isinstance(self._failure, InputObserverError):
-                raise self._failure
+        with self._failure_lock:
+            failure = self._failure
+        if failure is not None:
+            if isinstance(failure, InputObserverError):
+                raise failure
             raise InputObserverError(
-                f"{type(self).__name__} failed: {self._failure}"
-            ) from self._failure
+                f"{type(self).__name__} failed: {failure}"
+            ) from failure
         if self._thread is not None and not self._thread.is_alive():
             raise InputObserverError(f"{type(self).__name__} stopped unexpectedly")
+        if self._delivery_thread is not None and not self._delivery_thread.is_alive():
+            raise InputObserverError(
+                f"{type(self).__name__} delivery stopped unexpectedly"
+            )
 
     def stop(self) -> None:
         thread = self._thread
@@ -197,5 +332,5 @@ class ThreadedInputObserver(InputObserver):
                 f"{self.shutdown_timeout:.1f}s"
             )
         self._thread = None
+        self._stop_delivery()
         self.check_health()
-

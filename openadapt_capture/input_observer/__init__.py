@@ -12,6 +12,7 @@ from .base import (
     ObservedMouseMove,
     ObservedMouseScroll,
     ThreadedInputObserver,
+    add_exception_note,
 )
 from .factory import create_input_observer
 
@@ -27,5 +28,6 @@ __all__ = [
     "ObservedMouseMove",
     "ObservedMouseScroll",
     "ThreadedInputObserver",
+    "add_exception_note",
     "create_input_observer",
 ]
