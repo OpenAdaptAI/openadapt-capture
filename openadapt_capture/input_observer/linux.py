@@ -1,4 +1,15 @@
-"""Linux global input observation through XInput2 raw events."""
+"""Fail-closed Linux global input observation through the X RECORD extension.
+
+The RECORD specification deliberately leaves most fields in an intercepted
+``device_event`` undefined: key/button events guarantee only ``time`` and
+``detail``; motion additionally guarantees root coordinates.  This observer
+therefore never samples current X state after an event.  It preserves the
+globally ordered device stream and enriches key/button events only from the
+matching delivered core event, whose wire record carries event-time state and
+coordinates.  Missing enrichment degrades keyboard text to physical identity
+and makes pointer actions fail closed unless an exact earlier pointer position
+is known.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +18,7 @@ import ctypes.util
 import os
 import sys
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from .base import (
@@ -21,16 +33,29 @@ from .base import (
     ThreadedInputObserver,
 )
 
-_GENERIC_EVENT = 35
-_XI_ALL_MASTER_DEVICES = 1
-_XI_RAW_KEY_PRESS = 13
-_XI_RAW_KEY_RELEASE = 14
-_XI_RAW_BUTTON_PRESS = 15
-_XI_RAW_BUTTON_RELEASE = 16
-_XI_RAW_MOTION = 17
-_XKB_USE_CORE_KBD = 0x0100
-_XKB_GROUP_SHIFT = 13
-_MAX_PENDING_BATCH = 256
+_KEY_PRESS = 2
+_KEY_RELEASE = 3
+_BUTTON_PRESS = 4
+_BUTTON_RELEASE = 5
+_MOTION_NOTIFY = 6
+_CORE_DEVICE_EVENT_TYPES = {
+    _KEY_PRESS,
+    _KEY_RELEASE,
+    _BUTTON_PRESS,
+    _BUTTON_RELEASE,
+    _MOTION_NOTIFY,
+}
+
+_XRECORD_FROM_SERVER = 0
+_XRECORD_START_OF_DATA = 4
+_XRECORD_END_OF_DATA = 5
+_XRECORD_ALL_CLIENTS = 3
+_XRECORD_FROM_SERVER_TIME = 1 << 0
+_X_QUERY_POINTER = 38
+_CORE_EVENT_BYTES = 32
+_CORRELATION_TIMEOUT_SECONDS = 0.100
+_LOOP_INTERVAL_SECONDS = 0.010
+
 _XKB_COMPOSE_COMPOSING = 1
 _XKB_COMPOSE_COMPOSED = 2
 _XKB_COMPOSE_CANCELLED = 3
@@ -97,78 +122,134 @@ _KEYSYM_CHARACTERS = {
 }
 
 
-class _XIEventMask(ctypes.Structure):
+class _XRecordRange8(ctypes.Structure):
     _fields_ = [
-        ("deviceid", ctypes.c_int),
-        ("mask_len", ctypes.c_int),
-        ("mask", ctypes.POINTER(ctypes.c_ubyte)),
+        ("first", ctypes.c_ubyte),
+        ("last", ctypes.c_ubyte),
     ]
 
 
-class _XIValuatorState(ctypes.Structure):
+class _XRecordRange16(ctypes.Structure):
     _fields_ = [
-        ("mask_len", ctypes.c_int),
-        ("mask", ctypes.POINTER(ctypes.c_ubyte)),
-        ("values", ctypes.POINTER(ctypes.c_double)),
+        ("first", ctypes.c_ushort),
+        ("last", ctypes.c_ushort),
     ]
 
 
-class _XGenericEventCookie(ctypes.Structure):
+class _XRecordExtRange(ctypes.Structure):
     _fields_ = [
-        ("type", ctypes.c_int),
-        ("serial", ctypes.c_ulong),
-        ("send_event", ctypes.c_int),
-        ("display", ctypes.c_void_p),
-        ("extension", ctypes.c_int),
-        ("evtype", ctypes.c_int),
-        ("cookie", ctypes.c_uint),
-        ("data", ctypes.c_void_p),
+        ("ext_major", _XRecordRange8),
+        ("ext_minor", _XRecordRange16),
     ]
 
 
-class _XEvent(ctypes.Union):
+class _XRecordRange(ctypes.Structure):
+    """ABI mirror of ``X11/extensions/record.h::XRecordRange``."""
+
     _fields_ = [
-        ("type", ctypes.c_int),
-        ("xcookie", _XGenericEventCookie),
-        ("pad", ctypes.c_long * 24),
+        ("core_requests", _XRecordRange8),
+        ("core_replies", _XRecordRange8),
+        ("ext_requests", _XRecordExtRange),
+        ("ext_replies", _XRecordExtRange),
+        ("delivered_events", _XRecordRange8),
+        ("device_events", _XRecordRange8),
+        ("errors", _XRecordRange8),
+        ("client_started", ctypes.c_int),
+        ("client_died", ctypes.c_int),
     ]
 
 
-class _XIRawEvent(ctypes.Structure):
+class _XRecordInterceptData(ctypes.Structure):
+    """ABI mirror of ``XRecordInterceptData`` from ``record.h``."""
+
     _fields_ = [
-        ("type", ctypes.c_int),
-        ("serial", ctypes.c_ulong),
-        ("send_event", ctypes.c_int),
-        ("display", ctypes.c_void_p),
-        ("extension", ctypes.c_int),
-        ("evtype", ctypes.c_int),
-        ("time", ctypes.c_ulong),
-        ("deviceid", ctypes.c_int),
-        ("sourceid", ctypes.c_int),
-        ("detail", ctypes.c_int),
-        ("flags", ctypes.c_int),
-        ("valuators", _XIValuatorState),
-        ("raw_values", ctypes.POINTER(ctypes.c_double)),
+        ("id_base", ctypes.c_ulong),
+        ("server_time", ctypes.c_ulong),
+        ("client_seq", ctypes.c_ulong),
+        ("category", ctypes.c_int),
+        ("client_swapped", ctypes.c_int),
+        ("data", ctypes.POINTER(ctypes.c_ubyte)),
+        ("data_len", ctypes.c_ulong),
     ]
 
 
-class _XkbStateRec(ctypes.Structure):
-    _fields_ = [
-        ("group", ctypes.c_ubyte),
-        ("locked_group", ctypes.c_ubyte),
-        ("base_group", ctypes.c_ushort),
-        ("latched_group", ctypes.c_ushort),
-        ("mods", ctypes.c_ubyte),
-        ("base_mods", ctypes.c_ubyte),
-        ("latched_mods", ctypes.c_ubyte),
-        ("locked_mods", ctypes.c_ubyte),
-        ("compat_state", ctypes.c_ubyte),
-        ("grab_mods", ctypes.c_ubyte),
-        ("compat_grab_mods", ctypes.c_ubyte),
-        ("lookup_mods", ctypes.c_ubyte),
-        ("compat_lookup_mods", ctypes.c_ubyte),
-        ("ptr_buttons", ctypes.c_ushort),
-    ]
+_XRecordInterceptProc = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_void_p,
+    ctypes.POINTER(_XRecordInterceptData),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _CoreWireEvent:
+    event_type: int
+    detail: int
+    injected: bool
+    time: int
+    root: int
+    event: int
+    child: int
+    root_x: int
+    root_y: int
+    event_x: int
+    event_y: int
+    state: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DeliveredCandidate:
+    state: int
+    root_x: float
+    root_y: float
+    injected: bool
+    id_base: int
+
+
+@dataclass(slots=True)
+class _PendingDeviceEvent:
+    event_type: int
+    detail: int
+    server_time: int
+    injected: bool
+    receipt_timestamp: float
+    deadline: float
+    candidate: _DeliveredCandidate | None = None
+
+
+def _event_byteorder(*, client_swapped: bool) -> str:
+    native_little = sys.byteorder == "little"
+    event_little = native_little != client_swapped
+    return "little" if event_little else "big"
+
+
+def _decode_core_event(
+    data: bytes,
+    *,
+    client_swapped: bool,
+) -> _CoreWireEvent:
+    """Decode one 32-byte core xEvent in the recorded client's byte order."""
+    if len(data) != _CORE_EVENT_BYTES:
+        raise InputObserverError(
+            f"X RECORD core event was {len(data)} bytes, expected "
+            f"{_CORE_EVENT_BYTES}"
+        )
+    byteorder = _event_byteorder(client_swapped=client_swapped)
+    encoded_type = data[0]
+    event_type = encoded_type & 0x7F
+    return _CoreWireEvent(
+        event_type=event_type,
+        detail=data[1],
+        injected=bool(encoded_type & 0x80),
+        time=int.from_bytes(data[4:8], byteorder),
+        root=int.from_bytes(data[8:12], byteorder),
+        event=int.from_bytes(data[12:16], byteorder),
+        child=int.from_bytes(data[16:20], byteorder),
+        root_x=int.from_bytes(data[20:22], byteorder, signed=True),
+        root_y=int.from_bytes(data[22:24], byteorder, signed=True),
+        event_x=int.from_bytes(data[24:26], byteorder, signed=True),
+        event_y=int.from_bytes(data[26:28], byteorder, signed=True),
+        state=int.from_bytes(data[28:30], byteorder),
+    )
 
 
 def normalize_xinput_button_event(
@@ -180,7 +261,7 @@ def normalize_xinput_button_event(
     injected: bool = False,
     timestamp: float | None = None,
 ) -> ObservedInput | None:
-    """Map X11 button numbers to a click or normalized wheel event."""
+    """Map X11 core button numbers to a click or normalized wheel event."""
     if detail in {4, 5, 6, 7}:
         if not pressed:
             return None
@@ -231,7 +312,7 @@ def normalize_xinput_key_event(
     derive_character: bool = True,
     timestamp: float | None = None,
 ) -> ObservedKey:
-    """Normalize an XInput2 keycode and XKB keysym name."""
+    """Normalize an X11 keycode and XKB keysym name."""
     key_name = _SPECIAL_KEY_NAMES.get(keysym_name or "")
     if derive_character and keysym_name:
         if len(keysym_name) == 1 and keysym_name.isprintable():
@@ -255,18 +336,31 @@ def normalize_xinput_key_event(
 
 
 class LinuxXInputObserver(ThreadedInputObserver):
-    """Observe complete X11 desktop input with XInput2 raw events."""
+    """Observe complete X11 input without post-event state sampling."""
 
     def __init__(self, *args, environ: dict[str, str] | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._environ = environ if environ is not None else os.environ
         self._x11: Any = None
-        self._xi: Any = None
+        self._xtst: Any = None
         self._xkbcommon: Any = None
-        self._display: Any = None
+        self._control_display: Any = None
+        self._data_display: Any = None
+        self._record_range: Any = None
+        self._record_context = 0
+        self._record_enabled = False
+        self._record_started = False
+        self._accepting_events = False
+        self._waiting_baseline_marker = False
+        self._baseline_marker_seen = False
+        self._control_id_base = 0
         self._root = 0
-        self._xi_opcode = 0
-        self._event_mask_buffer: Any = None
+        self._record_callback: Any = None
+        self._record_callback_failure: BaseException | None = None
+        self._pending: _PendingDeviceEvent | None = None
+        self._delivered_correlation_uncertain = False
+        self._last_pointer: tuple[float, float] | None = None
+        self._text_state_uncertain = False
         self._composition_mode: str | None = None
         self._composition_remaining = 0
         self._unverifiable_keycodes: set[int] = set()
@@ -274,128 +368,173 @@ class LinuxXInputObserver(ThreadedInputObserver):
         self._compose_table: Any = None
         self._compose_state: Any = None
 
-    @staticmethod
-    def _set_mask(mask: ctypes.Array[ctypes.c_ubyte], event_type: int) -> None:
-        mask[event_type >> 3] |= 1 << (event_type & 7)
-
     def _setup(self) -> None:
         if not sys.platform.startswith("linux"):
             raise InputObserverUnavailableError(
-                "XInput2 input observation is available only on Linux"
+                "X RECORD input observation is available only on Linux"
             )
         session_type = self._environ.get("XDG_SESSION_TYPE", "").lower()
         if session_type == "wayland" or self._environ.get("WAYLAND_DISPLAY"):
             raise InputObserverUnavailableError(
-                "native Wayland does not expose complete global input to XInput2. "
+                "native Wayland does not expose complete global input to X RECORD. "
                 "Run an X11 session; OpenAdapt refuses XWayland-only capture because "
                 "it would silently omit input from native Wayland applications."
             )
         display_name = self._environ.get("DISPLAY")
         if not display_name:
             raise InputObserverUnavailableError(
-                "XInput2 requires an X11 desktop and DISPLAY is not set"
+                "X RECORD requires an X11 desktop and DISPLAY is not set"
             )
 
         x11_name = ctypes.util.find_library("X11")
-        xi_name = ctypes.util.find_library("Xi")
+        xtst_name = ctypes.util.find_library("Xtst")
         xkbcommon_name = ctypes.util.find_library("xkbcommon")
-        if not x11_name or not xi_name or not xkbcommon_name:
+        if not x11_name or not xtst_name or not xkbcommon_name:
             raise InputObserverUnavailableError(
-                "Linux input observation requires the system libX11, libXi, "
-                "and permissively licensed libxkbcommon runtime libraries"
+                "Linux input observation requires the system libX11, libXtst "
+                "(X RECORD), and permissively licensed libxkbcommon runtime libraries"
             )
         try:
             self._x11 = ctypes.CDLL(x11_name)
-            self._xi = ctypes.CDLL(xi_name)
+            self._xtst = ctypes.CDLL(xtst_name)
             self._xkbcommon = ctypes.CDLL(xkbcommon_name)
         except OSError as exc:
             raise InputObserverUnavailableError(
                 f"could not load X11 input libraries: {exc}"
             ) from exc
+
         self._configure_api()
         self._initialize_compose()
-        self._display = self._x11.XOpenDisplay(display_name.encode())
-        if not self._display:
+        encoded_display = display_name.encode()
+        self._control_display = self._x11.XOpenDisplay(encoded_display)
+        if not self._control_display:
             raise InputObserverPermissionError(
                 f"could not open X11 display {display_name!r}; authorize the "
                 "recording user with the display server and retry"
             )
-        self._root = int(self._x11.XDefaultRootWindow(self._display))
+        self._data_display = self._x11.XOpenDisplay(encoded_display)
+        if not self._data_display:
+            raise InputObserverPermissionError(
+                f"could not open the X RECORD data connection to {display_name!r}"
+            )
+        self._root = int(self._x11.XDefaultRootWindow(self._control_display))
+        probe_resource = int(
+            self._x11.XCreatePixmap(
+                self._control_display,
+                self._root,
+                1,
+                1,
+                1,
+            )
+        )
+        if not probe_resource:
+            raise InputObserverError(
+                "X11 could not allocate a resource ID for the recording boundary"
+            )
+        id_base_mask = int(self._xtst.XRecordIdBaseMask(self._control_display))
+        self._control_id_base = probe_resource & id_base_mask
+        self._x11.XFreePixmap(self._control_display, probe_resource)
 
-        opcode = ctypes.c_int()
-        first_event = ctypes.c_int()
-        first_error = ctypes.c_int()
-        if not self._x11.XQueryExtension(
-            self._display,
-            b"XInputExtension",
-            ctypes.byref(opcode),
-            ctypes.byref(first_event),
-            ctypes.byref(first_error),
+        major = ctypes.c_int()
+        minor = ctypes.c_int()
+        if not self._xtst.XRecordQueryVersion(
+            self._control_display,
+            ctypes.byref(major),
+            ctypes.byref(minor),
         ):
             raise InputObserverUnavailableError(
-                "the X11 server does not expose the XInput extension"
-            )
-        self._xi_opcode = opcode.value
-        major = ctypes.c_int(2)
-        minor = ctypes.c_int(0)
-        status = self._xi.XIQueryVersion(
-            self._display, ctypes.byref(major), ctypes.byref(minor)
-        )
-        if status != 0 or major.value < 2:
-            raise InputObserverUnavailableError(
-                f"XInput2 is required; server negotiation returned "
-                f"{major.value}.{minor.value} with status {status}"
+                "the X11 server does not expose the X RECORD extension"
             )
 
-        mask = (ctypes.c_ubyte * 4)()
-        if self.observe_keyboard:
-            self._set_mask(mask, _XI_RAW_KEY_PRESS)
-            self._set_mask(mask, _XI_RAW_KEY_RELEASE)
-        if self.observe_mouse:
-            self._set_mask(mask, _XI_RAW_BUTTON_PRESS)
-            self._set_mask(mask, _XI_RAW_BUTTON_RELEASE)
-            if self.capture_mouse_moves:
-                self._set_mask(mask, _XI_RAW_MOTION)
-        event_mask = _XIEventMask(
-            deviceid=_XI_ALL_MASTER_DEVICES,
-            mask_len=len(mask),
-            mask=ctypes.cast(mask, ctypes.POINTER(ctypes.c_ubyte)),
-        )
-        self._event_mask_buffer = mask
-        if self._xi.XISelectEvents(
-            self._display, self._root, ctypes.byref(event_mask), 1
-        ) != 0:
-            raise InputObserverPermissionError(
-                "the X11 server refused XInput2 raw-event selection"
+        record_range = self._xtst.XRecordAllocRange()
+        if not record_range:
+            raise InputObserverUnavailableError(
+                "libXtst could not allocate an X RECORD event range"
             )
-        self._x11.XFlush(self._display)
+        self._record_range = record_range
+        # QueryPointer replies serve only as an ordered setup marker.  Input
+        # acceptance begins inside the callback that observes our control
+        # connection's reply, after the exact baseline position is stored.
+        record_range.contents.core_replies = _XRecordRange8(
+            _X_QUERY_POINTER,
+            _X_QUERY_POINTER,
+        )
+        record_range.contents.delivered_events = _XRecordRange8(
+            _KEY_PRESS,
+            _MOTION_NOTIFY,
+        )
+        record_range.contents.device_events = _XRecordRange8(
+            _KEY_PRESS,
+            _MOTION_NOTIFY,
+        )
+        client_specs = (ctypes.c_ulong * 1)(_XRECORD_ALL_CLIENTS)
+        ranges = (ctypes.POINTER(_XRecordRange) * 1)(record_range)
+        context = self._xtst.XRecordCreateContext(
+            self._control_display,
+            _XRECORD_FROM_SERVER_TIME,
+            client_specs,
+            1,
+            ranges,
+            1,
+        )
+        if not context:
+            raise InputObserverPermissionError(
+                "the X11 server refused creation of a global X RECORD context"
+            )
+        self._record_context = int(context)
+        self._record_callback = _XRecordInterceptProc(self._record_intercept)
+        if not self._xtst.XRecordEnableContextAsync(
+            self._data_display,
+            self._record_context,
+            self._record_callback,
+            None,
+        ):
+            raise InputObserverPermissionError(
+                "the X11 server refused to enable the global X RECORD context"
+            )
+        self._record_enabled = True
+        self._raise_callback_failure()
+        if not self._record_started:
+            raise InputObserverError(
+                "XRecordEnableContextAsync returned before StartOfData; "
+                "the event stream cannot be trusted"
+            )
+        self._waiting_baseline_marker = True
+        self._query_pointer_baseline()
+        marker_deadline = time.monotonic() + self.startup_timeout
+        while not self._baseline_marker_seen:
+            self._xtst.XRecordProcessReplies(self._data_display)
+            self._raise_callback_failure()
+            if time.monotonic() >= marker_deadline:
+                raise InputObserverError(
+                    "X RECORD did not deliver the ordered pointer-baseline marker "
+                    f"within {self.startup_timeout:.1f}s"
+                )
+            self._stop_requested.wait(0.001)
+        if not self._accepting_events:
+            raise InputObserverError(
+                "X RECORD observed the pointer-baseline marker without arming input"
+            )
 
     def _configure_api(self) -> None:
         self._x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
         self._x11.XOpenDisplay.restype = ctypes.c_void_p
         self._x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self._x11.XCloseDisplay.restype = ctypes.c_int
         self._x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
         self._x11.XDefaultRootWindow.restype = ctypes.c_ulong
-        self._x11.XQueryExtension.argtypes = [
+        self._x11.XCreatePixmap.argtypes = [
             ctypes.c_void_p,
-            ctypes.c_char_p,
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_ulong,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_uint,
         ]
-        self._x11.XPending.argtypes = [ctypes.c_void_p]
-        self._x11.XPending.restype = ctypes.c_int
-        self._x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(_XEvent)]
-        self._x11.XGetEventData.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(_XGenericEventCookie),
-        ]
-        self._x11.XGetEventData.restype = ctypes.c_int
-        self._x11.XFreeEventData.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(_XGenericEventCookie),
-        ]
-        self._x11.XFlush.argtypes = [ctypes.c_void_p]
+        self._x11.XCreatePixmap.restype = ctypes.c_ulong
+        self._x11.XFreePixmap.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        self._x11.XFreePixmap.restype = ctypes.c_int
+        self._x11.XFree.argtypes = [ctypes.c_void_p]
+        self._x11.XFree.restype = ctypes.c_int
         self._x11.XQueryPointer.argtypes = [
             ctypes.c_void_p,
             ctypes.c_ulong,
@@ -408,12 +547,6 @@ class LinuxXInputObserver(ThreadedInputObserver):
             ctypes.POINTER(ctypes.c_uint),
         ]
         self._x11.XQueryPointer.restype = ctypes.c_int
-        self._x11.XkbGetState.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint,
-            ctypes.POINTER(_XkbStateRec),
-        ]
-        self._x11.XkbGetState.restype = ctypes.c_int
         self._x11.XkbLookupKeySym.argtypes = [
             ctypes.c_void_p,
             ctypes.c_ubyte,
@@ -425,19 +558,49 @@ class LinuxXInputObserver(ThreadedInputObserver):
         self._x11.XKeysymToString.argtypes = [ctypes.c_ulong]
         self._x11.XKeysymToString.restype = ctypes.c_char_p
 
-        self._xi.XIQueryVersion.argtypes = [
+        self._xtst.XRecordQueryVersion.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_int),
             ctypes.POINTER(ctypes.c_int),
         ]
-        self._xi.XIQueryVersion.restype = ctypes.c_int
-        self._xi.XISelectEvents.argtypes = [
+        self._xtst.XRecordQueryVersion.restype = ctypes.c_int
+        self._xtst.XRecordIdBaseMask.argtypes = [ctypes.c_void_p]
+        self._xtst.XRecordIdBaseMask.restype = ctypes.c_ulong
+        self._xtst.XRecordAllocRange.argtypes = []
+        self._xtst.XRecordAllocRange.restype = ctypes.POINTER(_XRecordRange)
+        self._xtst.XRecordCreateContext.argtypes = [
             ctypes.c_void_p,
-            ctypes.c_ulong,
-            ctypes.POINTER(_XIEventMask),
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.POINTER(_XRecordRange)),
             ctypes.c_int,
         ]
-        self._xi.XISelectEvents.restype = ctypes.c_int
+        self._xtst.XRecordCreateContext.restype = ctypes.c_ulong
+        self._xtst.XRecordEnableContextAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            _XRecordInterceptProc,
+            ctypes.c_void_p,
+        ]
+        self._xtst.XRecordEnableContextAsync.restype = ctypes.c_int
+        self._xtst.XRecordProcessReplies.argtypes = [ctypes.c_void_p]
+        self._xtst.XRecordProcessReplies.restype = None
+        self._xtst.XRecordFreeData.argtypes = [
+            ctypes.POINTER(_XRecordInterceptData)
+        ]
+        self._xtst.XRecordFreeData.restype = None
+        self._xtst.XRecordDisableContext.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        self._xtst.XRecordDisableContext.restype = ctypes.c_int
+        self._xtst.XRecordFreeContext.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        self._xtst.XRecordFreeContext.restype = ctypes.c_int
+
         self._xkbcommon.xkb_keysym_to_utf8.argtypes = [
             ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_char),
@@ -505,6 +668,270 @@ class LinuxXInputObserver(ThreadedInputObserver):
                 "libxkbcommon could not create compose state"
             )
 
+    def _record_intercept(
+        self,
+        _closure: ctypes.c_void_p,
+        recorded_data_pointer: ctypes.POINTER(_XRecordInterceptData),
+    ) -> None:
+        """Copy and process one RECORD datum without leaking across the callback."""
+        try:
+            recorded = recorded_data_pointer.contents
+            if recorded.category == _XRECORD_START_OF_DATA:
+                self._record_started = True
+                return
+            if recorded.category == _XRECORD_END_OF_DATA:
+                return
+            if recorded.category != _XRECORD_FROM_SERVER:
+                return
+            byte_length = int(recorded.data_len) * 4
+            if byte_length != _CORE_EVENT_BYTES or not recorded.data:
+                raise InputObserverError(
+                    "X RECORD returned a malformed core input event: "
+                    f"{byte_length} bytes"
+                )
+            payload = ctypes.string_at(recorded.data, byte_length)
+            if (
+                self._waiting_baseline_marker
+                and int(recorded.id_base) == self._control_id_base
+                and payload[0] == 1
+            ):
+                self._waiting_baseline_marker = False
+                self._baseline_marker_seen = True
+                self._accepting_events = True
+                return
+            event = _decode_core_event(
+                payload,
+                client_swapped=bool(recorded.client_swapped),
+            )
+            if event.event_type not in _CORE_DEVICE_EVENT_TYPES:
+                # QueryPointer replies from other clients are included by the
+                # marker range but cannot arm this observer.
+                return
+            if not self._accepting_events:
+                # Establishing the baseline is a deliberate cut: every event
+                # before our recorded QueryPointer reply is discarded.
+                return
+            if int(recorded.id_base) == 0:
+                if recorded.client_swapped:
+                    raise InputObserverError(
+                        "X RECORD marked a device event as byte-swapped; "
+                        "device-event byte order must match the recording client"
+                    )
+                self._handle_device_event(event)
+            else:
+                self._handle_delivered_event(event, id_base=int(recorded.id_base))
+        except BaseException as exc:
+            if self._record_callback_failure is None:
+                self._record_callback_failure = exc
+            self._stop_requested.set()
+        finally:
+            self._xtst.XRecordFreeData(recorded_data_pointer)
+
+    def _query_pointer_baseline(self) -> None:
+        """Sample the pointer once, before the recorded acceptance boundary."""
+        root_return = ctypes.c_ulong()
+        child_return = ctypes.c_ulong()
+        root_x = ctypes.c_int()
+        root_y = ctypes.c_int()
+        window_x = ctypes.c_int()
+        window_y = ctypes.c_int()
+        mask = ctypes.c_uint()
+        if not self._x11.XQueryPointer(
+            self._control_display,
+            self._root,
+            ctypes.byref(root_return),
+            ctypes.byref(child_return),
+            ctypes.byref(root_x),
+            ctypes.byref(root_y),
+            ctypes.byref(window_x),
+            ctypes.byref(window_y),
+            ctypes.byref(mask),
+        ):
+            raise InputObserverError(
+                "X11 could not establish the exact pointer position at the "
+                "recording boundary"
+            )
+        self._last_pointer = (float(root_x.value), float(root_y.value))
+
+    def _handle_device_event(self, event: _CoreWireEvent) -> None:
+        """Accept the next event in the global device stream."""
+        self._finalize_pending()
+        observed_at = time.time()
+        if event.event_type == _MOTION_NOTIFY:
+            if not self.observe_mouse:
+                return
+            position = (float(event.root_x), float(event.root_y))
+            self._last_pointer = position
+            if self.capture_mouse_moves:
+                self._emit(
+                    ObservedMouseMove(
+                        x=position[0],
+                        y=position[1],
+                        injected=event.injected,
+                        timestamp=observed_at,
+                    )
+                )
+            return
+        if event.event_type in {_KEY_PRESS, _KEY_RELEASE}:
+            if not self.observe_keyboard:
+                return
+        elif event.event_type in {_BUTTON_PRESS, _BUTTON_RELEASE}:
+            if not self.observe_mouse:
+                return
+        else:  # pragma: no cover - guarded by the callback range check
+            return
+        self._pending = _PendingDeviceEvent(
+            event_type=event.event_type,
+            detail=event.detail,
+            server_time=event.time,
+            injected=event.injected,
+            receipt_timestamp=observed_at,
+            deadline=time.monotonic() + _CORRELATION_TIMEOUT_SECONDS,
+        )
+
+    def _handle_delivered_event(
+        self,
+        event: _CoreWireEvent,
+        *,
+        id_base: int,
+    ) -> None:
+        """Attach exact delivered-event state to the matching device event."""
+        pending = self._pending
+        if pending is None or self._delivered_correlation_uncertain:
+            return
+        if (
+            event.event_type != pending.event_type
+            or event.time != pending.server_time
+            or event.detail != pending.detail
+        ):
+            return
+        candidate = _DeliveredCandidate(
+            state=event.state,
+            root_x=float(event.root_x),
+            root_y=float(event.root_y),
+            injected=event.injected,
+            id_base=id_base,
+        )
+        current = pending.candidate
+        if current is not None and (
+            current.state != candidate.state
+            or current.root_x != candidate.root_x
+            or current.root_y != candidate.root_y
+            or current.injected != candidate.injected
+        ):
+            raise InputObserverError(
+                "X RECORD delivered conflicting event-time state for the same "
+                f"device event from clients {current.id_base:#x} and {id_base:#x}"
+            )
+        if current is None:
+            pending.candidate = candidate
+
+    def _finalize_pending(self) -> None:
+        pending = self._pending
+        if pending is None:
+            return
+        self._pending = None
+        candidate = pending.candidate
+        if candidate is None:
+            # RECORD guarantees delivered copies precede the next device event
+            # only in the absence of grabs.  Once one copy is late or absent,
+            # a later identical (type, time, detail) tuple could be stale.
+            # Permanently stop correlating rather than risk attaching it to a
+            # newer physical event.
+            self._delivered_correlation_uncertain = True
+        injected = pending.injected or (
+            candidate.injected if candidate is not None else False
+        )
+        if pending.event_type in {_KEY_PRESS, _KEY_RELEASE}:
+            pressed = pending.event_type == _KEY_PRESS
+            if candidate is None:
+                self._text_state_uncertain = True
+                if self._compose_state is not None:
+                    self._xkbcommon.xkb_compose_state_reset(self._compose_state)
+                self._emit(
+                    normalize_xinput_key_event(
+                        keycode=pending.detail,
+                        pressed=pressed,
+                        keysym_name=None,
+                        injected=injected,
+                        character=None,
+                        derive_character=False,
+                        timestamp=pending.receipt_timestamp,
+                    )
+                )
+                return
+            keysym, keysym_name = self._lookup_keysym(
+                pending.detail,
+                candidate.state,
+            )
+            self._emit(
+                normalize_xinput_key_event(
+                    keycode=pending.detail,
+                    pressed=pressed,
+                    keysym_name=keysym_name,
+                    injected=injected,
+                    character=self._resolved_character(
+                        keycode=pending.detail,
+                        keysym=keysym,
+                        keysym_name=keysym_name,
+                        pressed=pressed,
+                    ),
+                    derive_character=False,
+                    timestamp=pending.receipt_timestamp,
+                )
+            )
+            return
+
+        if candidate is not None:
+            position = (candidate.root_x, candidate.root_y)
+            self._last_pointer = position
+        else:
+            position = self._last_pointer
+        if position is None:
+            raise InputObserverError(
+                "X RECORD delivered a button event without event-time coordinates "
+                "before any exact pointer position was observed"
+            )
+        event = normalize_xinput_button_event(
+            detail=pending.detail,
+            pressed=pending.event_type == _BUTTON_PRESS,
+            x=position[0],
+            y=position[1],
+            injected=injected,
+            timestamp=pending.receipt_timestamp,
+        )
+        if event is not None:
+            self._emit(event)
+
+    def _finalize_expired_pending(self) -> None:
+        pending = self._pending
+        if pending is not None and time.monotonic() >= pending.deadline:
+            self._finalize_pending()
+
+    def _lookup_keysym(
+        self,
+        keycode: int,
+        event_state: int,
+    ) -> tuple[int, str | None]:
+        """Resolve a key using the state carried by its delivered wire event."""
+        consumed_modifiers = ctypes.c_uint()
+        keysym = ctypes.c_ulong()
+        if not self._x11.XkbLookupKeySym(
+            self._control_display,
+            keycode,
+            event_state,
+            ctypes.byref(consumed_modifiers),
+            ctypes.byref(keysym),
+        ):
+            raise InputObserverError(
+                f"XKB could not resolve keycode {keycode} from its event-time state"
+            )
+        name_pointer = (
+            self._x11.XKeysymToString(keysym.value) if keysym.value else None
+        )
+        name = name_pointer.decode(errors="replace") if name_pointer else None
+        return int(keysym.value), name
+
     def _compose_character(self, keysym: int) -> tuple[bool, str | None]:
         """Return whether compose consumed this press and any committed text."""
         self._xkbcommon.xkb_compose_state_feed(self._compose_state, keysym)
@@ -531,59 +958,6 @@ class LinuxXInputObserver(ThreadedInputObserver):
             return True, None
         return False, None
 
-    def _query_pointer(self) -> tuple[float, float]:
-        root_return = ctypes.c_ulong()
-        child_return = ctypes.c_ulong()
-        root_x = ctypes.c_int()
-        root_y = ctypes.c_int()
-        window_x = ctypes.c_int()
-        window_y = ctypes.c_int()
-        mask = ctypes.c_uint()
-        if not self._x11.XQueryPointer(
-            self._display,
-            self._root,
-            ctypes.byref(root_return),
-            ctypes.byref(child_return),
-            ctypes.byref(root_x),
-            ctypes.byref(root_y),
-            ctypes.byref(window_x),
-            ctypes.byref(window_y),
-            ctypes.byref(mask),
-        ):
-            raise InputObserverError(
-                "XInput2 delivered mouse input but XQueryPointer could not establish "
-                "its global coordinates"
-            )
-        return float(root_x.value), float(root_y.value)
-
-    def _lookup_keysym(self, keycode: int) -> tuple[int, str | None]:
-        state = _XkbStateRec()
-        if self._x11.XkbGetState(
-            self._display,
-            _XKB_USE_CORE_KBD,
-            ctypes.byref(state),
-        ) != 0:
-            raise InputObserverError(
-                "XKB could not read the active keyboard group and modifier state"
-            )
-        core_state = int(state.lookup_mods) | (int(state.group) << _XKB_GROUP_SHIFT)
-        consumed_modifiers = ctypes.c_uint()
-        keysym = ctypes.c_ulong()
-        if not self._x11.XkbLookupKeySym(
-            self._display,
-            keycode,
-            core_state,
-            ctypes.byref(consumed_modifiers),
-            ctypes.byref(keysym),
-        ):
-            raise InputObserverError(
-                f"XKB could not resolve keycode {keycode} in active group "
-                f"{int(state.group)}"
-            )
-        name_ptr = self._x11.XKeysymToString(keysym.value) if keysym.value else None
-        name = name_ptr.decode(errors="replace") if name_ptr else None
-        return int(keysym.value), name
-
     def _keysym_character(self, keysym: int) -> str | None:
         buffer = ctypes.create_string_buffer(64)
         length = int(
@@ -605,6 +979,8 @@ class LinuxXInputObserver(ThreadedInputObserver):
         keysym_name: str | None,
         pressed: bool,
     ) -> str | None:
+        if self._text_state_uncertain:
+            return None
         if not pressed and keycode in self._unverifiable_keycodes:
             self._unverifiable_keycodes.discard(keycode)
             return None
@@ -646,9 +1022,6 @@ class LinuxXInputObserver(ThreadedInputObserver):
                 self._unverifiable_keycodes.add(keycode)
                 self._composition_remaining -= 1
                 if self._composition_remaining <= 0:
-                    # This fallback is only reachable without initialized
-                    # production compose state. It never guesses sequence
-                    # text and bounds how long later unrelated text is hidden.
                     self._composition_mode = None
                     self._composition_remaining = 0
             return None
@@ -656,94 +1029,58 @@ class LinuxXInputObserver(ThreadedInputObserver):
             return None
         return self._keysym_character(keysym)
 
-    def _handle_raw_event(self, raw: _XIRawEvent) -> None:
-        injected = bool(raw.send_event)
-        observed_at = time.time()
-        if raw.evtype == _XI_RAW_MOTION:
-            if self.observe_mouse and self.capture_mouse_moves:
-                x, y = self._query_pointer()
-                self._emit(
-                    ObservedMouseMove(
-                        x=x,
-                        y=y,
-                        injected=injected,
-                        timestamp=observed_at,
-                    )
-                )
-            return
-        if raw.evtype in {_XI_RAW_BUTTON_PRESS, _XI_RAW_BUTTON_RELEASE}:
-            if self.observe_mouse:
-                x, y = self._query_pointer()
-                event = normalize_xinput_button_event(
-                    detail=raw.detail,
-                    pressed=raw.evtype == _XI_RAW_BUTTON_PRESS,
-                    x=x,
-                    y=y,
-                    injected=injected,
-                    timestamp=observed_at,
-                )
-                if event is not None:
-                    self._emit(event)
-            return
-        if raw.evtype in {_XI_RAW_KEY_PRESS, _XI_RAW_KEY_RELEASE}:
-            if self.observe_keyboard:
-                pressed = raw.evtype == _XI_RAW_KEY_PRESS
-                keysym, keysym_name = self._lookup_keysym(raw.detail)
-                self._emit(
-                    normalize_xinput_key_event(
-                        keycode=raw.detail,
-                        pressed=pressed,
-                        keysym_name=keysym_name,
-                        injected=injected,
-                        character=self._resolved_character(
-                            keycode=raw.detail,
-                            keysym=keysym,
-                            keysym_name=keysym_name,
-                            pressed=pressed,
-                        ),
-                        derive_character=False,
-                        timestamp=observed_at,
-                    )
-                )
+    def _raise_callback_failure(self) -> None:
+        failure = self._record_callback_failure
+        if failure is not None:
+            raise failure
 
     def _run_loop(self) -> None:
         while not self._stop_requested.is_set():
-            processed = 0
-            while (
-                not self._stop_requested.is_set()
-                and processed < _MAX_PENDING_BATCH
-                and self._x11.XPending(self._display)
-            ):
-                processed += 1
-                event = _XEvent()
-                self._x11.XNextEvent(self._display, ctypes.byref(event))
-                cookie = event.xcookie
-                if (
-                    event.type != _GENERIC_EVENT
-                    or cookie.extension != self._xi_opcode
-                ):
-                    continue
-                if not self._x11.XGetEventData(
-                    self._display, ctypes.byref(event.xcookie)
-                ):
-                    raise InputObserverError(
-                        "XInput2 event cookie had no accessible event data"
-                    )
-                try:
-                    if event.xcookie.data:
-                        raw = ctypes.cast(
-                            event.xcookie.data, ctypes.POINTER(_XIRawEvent)
-                        ).contents
-                        self._handle_raw_event(raw)
-                finally:
-                    self._x11.XFreeEventData(
-                        self._display, ctypes.byref(event.xcookie)
-                    )
-            self._stop_requested.wait(0.01)
+            self._xtst.XRecordProcessReplies(self._data_display)
+            self._raise_callback_failure()
+            self._finalize_expired_pending()
+            self._stop_requested.wait(_LOOP_INTERVAL_SECONDS)
+        self._raise_callback_failure()
+        self._finalize_pending()
 
     def _teardown(self) -> None:
-        if self._display and self._x11 is not None:
-            self._x11.XCloseDisplay(self._display)
+        cleanup_failure: InputObserverError | None = None
+        if (
+            self._record_enabled
+            and self._record_context
+            and self._control_display
+            and self._xtst is not None
+        ):
+            if not self._xtst.XRecordDisableContext(
+                self._control_display,
+                self._record_context,
+            ):
+                cleanup_failure = InputObserverError(
+                    "X RECORD context could not be disabled cleanly"
+                )
+        self._record_enabled = False
+        if (
+            self._record_context
+            and self._control_display
+            and self._xtst is not None
+        ):
+            if not self._xtst.XRecordFreeContext(
+                self._control_display,
+                self._record_context,
+            ) and cleanup_failure is None:
+                cleanup_failure = InputObserverError(
+                    "X RECORD context could not be freed cleanly"
+                )
+        self._record_context = 0
+        if self._record_range is not None and self._x11 is not None:
+            self._x11.XFree(self._record_range)
+        self._record_range = None
+        if self._data_display and self._x11 is not None:
+            self._x11.XCloseDisplay(self._data_display)
+        if self._control_display and self._x11 is not None:
+            self._x11.XCloseDisplay(self._control_display)
+        self._data_display = None
+        self._control_display = None
         if self._xkbcommon is not None:
             if self._compose_state:
                 self._xkbcommon.xkb_compose_state_unref(self._compose_state)
@@ -754,11 +1091,23 @@ class LinuxXInputObserver(ThreadedInputObserver):
         self._compose_state = None
         self._compose_table = None
         self._compose_context = None
-        self._display = None
-        self._event_mask_buffer = None
+        self._record_callback = None
+        self._record_callback_failure = None
+        self._record_started = False
+        self._accepting_events = False
+        self._waiting_baseline_marker = False
+        self._baseline_marker_seen = False
+        self._control_id_base = 0
+        self._root = 0
+        self._pending = None
+        self._delivered_correlation_uncertain = False
+        self._last_pointer = None
+        self._text_state_uncertain = False
         self._composition_mode = None
         self._composition_remaining = 0
         self._unverifiable_keycodes.clear()
+        if cleanup_failure is not None:
+            raise cleanup_failure
 
 
 __all__ = [
