@@ -8,9 +8,9 @@ battle-tested implementation.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 
 
 class EventType(str, Enum):
@@ -47,6 +47,20 @@ class MouseButton(str, Enum):
     LEFT = "left"
     RIGHT = "right"
     MIDDLE = "middle"
+
+
+def _normalize_mouse_button(value: MouseButton | str) -> MouseButton | str:
+    """Preserve the established enum while allowing native auxiliary buttons."""
+    try:
+        return MouseButton(value)
+    except ValueError:
+        return value
+
+
+MouseButtonValue = Annotated[
+    MouseButton | str,
+    AfterValidator(_normalize_mouse_button),
+]
 
 
 class BaseEvent(BaseModel):
@@ -87,7 +101,7 @@ class MouseDownEvent(BaseEvent):
     type: Literal[EventType.MOUSE_DOWN] = EventType.MOUSE_DOWN
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
-    button: str = Field(description="Native mouse button name")
+    button: MouseButtonValue = Field(description="Mouse button name")
 
 
 class MouseUpEvent(BaseEvent):
@@ -99,7 +113,7 @@ class MouseUpEvent(BaseEvent):
     type: Literal[EventType.MOUSE_UP] = EventType.MOUSE_UP
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
-    button: str = Field(description="Native mouse button name")
+    button: MouseButtonValue = Field(description="Mouse button name")
 
 
 class MouseScrollEvent(BaseEvent):
@@ -202,7 +216,7 @@ class MouseClickEvent(BaseEvent):
     type: Literal[EventType.MOUSE_SINGLECLICK] = EventType.MOUSE_SINGLECLICK
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
-    button: str = Field(description="Native mouse button name")
+    button: MouseButtonValue = Field(description="Mouse button name")
     children: list[MouseDownEvent | MouseUpEvent] = Field(
         default_factory=list, description="Child events that were merged"
     )
@@ -218,7 +232,7 @@ class MouseDoubleClickEvent(BaseEvent):
     type: Literal[EventType.MOUSE_DOUBLECLICK] = EventType.MOUSE_DOUBLECLICK
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
-    button: str = Field(description="Native mouse button name")
+    button: MouseButtonValue = Field(description="Mouse button name")
     children: list[MouseDownEvent | MouseUpEvent] = Field(
         default_factory=list, description="Child events that were merged"
     )
@@ -236,7 +250,7 @@ class MouseDragEvent(BaseEvent):
     y: float = Field(description="Starting Y position in pixels")
     dx: float = Field(description="Horizontal displacement (end_x - start_x)")
     dy: float = Field(description="Vertical displacement (end_y - start_y)")
-    button: str = Field(description="Native mouse button name")
+    button: MouseButtonValue = Field(description="Mouse button name")
     children: list[MouseDownEvent | MouseMoveEvent | MouseUpEvent] = Field(
         default_factory=list, description="Child events that were merged"
     )

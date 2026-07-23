@@ -32,6 +32,10 @@ def create_input_observer(
 
         return WindowsInputObserver(**kwargs)
     if selected.startswith("linux"):
+        if sys.platform.startswith("linux"):
+            from openadapt_capture.x11_threads import ensure_xlib_thread_support
+
+            ensure_xlib_thread_support()
         from .linux import LinuxXInputObserver
 
         return LinuxXInputObserver(**kwargs)

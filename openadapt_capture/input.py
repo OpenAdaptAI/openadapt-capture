@@ -23,6 +23,7 @@ from openadapt_capture.input_observer import (
     ObservedMouseScroll,
     create_input_observer,
 )
+from openadapt_capture.x11_threads import ensure_xlib_thread_support
 
 
 def _get_timestamp() -> float:
@@ -418,6 +419,7 @@ class ScreenCapturer:
         if self._running:
             return
 
+        ensure_xlib_thread_support()
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
