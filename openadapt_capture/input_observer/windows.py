@@ -276,7 +276,7 @@ def _signed_high_word(value: int) -> int:
 
 
 def _key_identity(vk_code: int, character: str | None) -> dict[str, str | None]:
-    """Normalize physical and canonical key identity like pynput's listener."""
+    """Normalize physical and canonical key identity for the public event model."""
 
     key_name = _PHYSICAL_KEY_NAMES.get(vk_code)
     canonical_name = key_name
