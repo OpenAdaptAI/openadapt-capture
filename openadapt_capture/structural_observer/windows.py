@@ -321,7 +321,9 @@ def _candidate_cardinality(
     search_kwargs: dict[str, str] = {}
     matched_fields: list[str] = []
     if automation_id:
-        search_kwargs["auto_id"] = automation_id
+        # pywinauto 0.6.9's UIA descendants() cannot filter by auto_id.
+        # Narrow with its supported control-type condition, then compare the
+        # stable AutomationId exactly below.
         matched_fields.append("automation_id")
         if control_type:
             search_kwargs["control_type"] = control_type

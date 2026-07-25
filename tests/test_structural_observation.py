@@ -53,6 +53,7 @@ class _Wrapper:
         self._top = top
         self._descendants = descendants or []
         self._title = title
+        self.descendant_queries: list[dict[str, object]] = []
         for pattern in patterns:
             setattr(self, f"iface_{pattern}", object())
 
@@ -65,7 +66,8 @@ class _Wrapper:
     def top_level_parent(self) -> "_Wrapper":
         return self._top or self
 
-    def descendants(self, **_kwargs) -> list["_Wrapper"]:
+    def descendants(self, **kwargs) -> list["_Wrapper"]:
+        self.descendant_queries.append(kwargs)
         return self._descendants
 
     def window_text(self) -> str | None:
@@ -186,6 +188,7 @@ def test_windows_uia_observer_returns_exact_available_evidence() -> None:
         "automation_id",
         "control_type",
     ]
+    assert window.descendant_queries == [{"control_type": "Button"}]
     assert "framework_id" not in observed.element.model_dump(exclude_none=True)
 
 
