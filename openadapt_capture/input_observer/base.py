@@ -13,6 +13,10 @@ class InputObserverError(RuntimeError):
     """Base error for fail-loud input observation."""
 
 
+class _InputObserverStartupCancelledError(InputObserverError):
+    """Internal marker for setup failures caused by the parent's startup abort."""
+
+
 class InputObserverUnavailableError(InputObserverError):
     """The current platform/session cannot provide complete input observation."""
 
@@ -489,7 +493,13 @@ class ThreadedInputObserver(InputObserver):
             # timeout above.
             with self._failure_lock:
                 observer_failure = self._failure
-            if observer_failure is not None:
+            if (
+                observer_failure is not None
+                and not isinstance(
+                    observer_failure,
+                    _InputObserverStartupCancelledError,
+                )
+            ):
                 if isinstance(observer_failure, InputObserverError):
                     primary = observer_failure
                 else:
