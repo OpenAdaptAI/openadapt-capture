@@ -856,9 +856,13 @@ def trigger_action_event(
     x = action_event_args.get("mouse_x")
     y = action_event_args.get("mouse_y")
     if x is not None and y is not None:
-        if config.RECORD_READ_ACTIVE_ELEMENT_STATE:
+        if (
+            config.RECORD_READ_ACTIVE_ELEMENT_STATE
+            and action_event_args.get("name") == "click"
+            and action_event_args.get("mouse_pressed") is True
+        ):
             # element lookup needs GLOBAL coordinates: translate afterwards.
-            element_state = window.get_active_element_state(x, y)
+            element_state = window.get_active_element_observation(x, y)
         else:
             element_state = {}
         action_event_args["element_state"] = element_state
@@ -2176,6 +2180,7 @@ class Recorder:
         capture_audio: bool | None = None,
         capture_images: bool | None = None,
         capture_window_data: bool | None = None,
+        capture_structural_observations: bool | None = None,
         capture_browser_events: bool | None = None,
         capture_full_video: bool | None = None,
         video_encoding: str | None = None,
@@ -2209,6 +2214,7 @@ class Recorder:
             capture_audio=capture_audio,
             capture_images=capture_images,
             capture_window_data=capture_window_data,
+            capture_structural_observations=capture_structural_observations,
             capture_browser_events=capture_browser_events,
             capture_full_video=capture_full_video,
             video_encoding=video_encoding,

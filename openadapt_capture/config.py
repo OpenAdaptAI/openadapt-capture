@@ -99,6 +99,7 @@ _FIELD_TO_CONFIG_ATTR = {
     "capture_audio": "RECORD_AUDIO",
     "capture_images": "RECORD_IMAGES",
     "capture_window_data": "RECORD_WINDOW_DATA",
+    "capture_structural_observations": "RECORD_READ_ACTIVE_ELEMENT_STATE",
     "capture_browser_events": "RECORD_BROWSER_EVENTS",
     "window_owner": "RECORD_WINDOW_OWNER",
     "window_title": "RECORD_WINDOW_TITLE",
@@ -124,6 +125,7 @@ class RecordingConfig:
     capture_audio: bool | None = None
     capture_images: bool | None = None
     capture_window_data: bool | None = None
+    capture_structural_observations: bool | None = None
     capture_browser_events: bool | None = None
     # Window-scoped capture selectors (see window_capture.WindowTarget).
     window_owner: str | None = None

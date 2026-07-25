@@ -163,6 +163,15 @@ with Recorder(
     input("Perform the task, then press Enter...")
 ```
 
+For native Windows applications, pass
+`capture_structural_observations=True`. Each mouse-down action then carries a
+versioned, JSON-safe UI Automation fingerprint through
+`Action.structural_observation` (role, name, AutomationId, window, ancestry,
+bounds, process, and supported native patterns). This evidence is stored in the
+existing `recording.db`; it does not create another recorder or upload path.
+Do not enable it for RDP or Citrix client windows: those sessions are observed
+externally through pixels and OCR.
+
 `owner` matches the application (macOS: window owner name; Windows: process
 executable name) and `title` optionally disambiguates among its windows; both
 are case-insensitive substrings, mirroring how `openadapt-flow`'s

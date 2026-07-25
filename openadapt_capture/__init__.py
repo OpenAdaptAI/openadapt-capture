@@ -56,6 +56,9 @@ from openadapt_capture.events import (
     MouseUpEvent,
     ScreenEvent,
     ScreenFrameEvent,
+    StructuralBounds,
+    StructuralNode,
+    StructuralObservationV1,
 )
 
 # Event processing
@@ -155,6 +158,9 @@ __all__ = [
     "MouseClickEvent",
     "MouseDoubleClickEvent",
     "MouseDragEvent",
+    "StructuralBounds",
+    "StructuralNode",
+    "StructuralObservationV1",
     # Keyboard events
     "KeyDownEvent",
     "KeyUpEvent",

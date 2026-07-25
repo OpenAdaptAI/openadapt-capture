@@ -93,3 +93,18 @@ def get_active_element_state(x: int, y: int) -> dict | None:
     except Exception as exc:
         logger.warning(f"{exc=}")
         return None
+
+
+def get_active_element_observation(x: int, y: int) -> dict | None:
+    """Return versioned structural evidence for the element at a point.
+
+    Platforms without a versioned observer deliberately return ``None``;
+    legacy element-state dictionaries are not promoted to structural evidence.
+    """
+    if impl is None or not hasattr(impl, "get_active_element_observation"):
+        return None
+    try:
+        return impl.get_active_element_observation(x, y)
+    except Exception as exc:
+        logger.warning(f"{exc=}")
+        return None

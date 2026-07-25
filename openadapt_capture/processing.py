@@ -373,6 +373,7 @@ def merge_consecutive_mouse_click_events(
                             x=down.x,
                             y=down.y,
                             button=down.button,
+                            structural_observation=down.structural_observation,
                             children=[down, up, next_down, next_up],
                         )
                         result.append(double_click)
@@ -387,6 +388,7 @@ def merge_consecutive_mouse_click_events(
                     x=down.x,
                     y=down.y,
                     button=down.button,
+                    structural_observation=down.structural_observation,
                     children=[down, up],
                 )
                 result.append(single_click)
@@ -451,6 +453,7 @@ def detect_drag_events(
                         dx=event.x - down_event.x,
                         dy=event.y - down_event.y,
                         button=down_event.button,
+                        structural_observation=down_event.structural_observation,
                         children=[down_event] + moves + [event],
                     )
                     result.append(drag)

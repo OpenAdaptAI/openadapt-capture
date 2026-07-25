@@ -34,6 +34,7 @@ from openadapt_capture.events import (
     MouseMoveEvent,
     MouseScrollEvent,
     MouseUpEvent,
+    StructuralObservationV1,
 )
 from openadapt_capture.processing import process_events
 
@@ -41,6 +42,22 @@ if TYPE_CHECKING:
     from PIL import Image
 
     from openadapt_capture.browser_events import BrowserEvent
+
+
+def _parse_structural_observation(raw: object) -> StructuralObservationV1 | None:
+    """Parse only the versioned native-observation contract.
+
+    Historical ``element_state`` JSON remains readable but is not silently
+    promoted to trusted structural evidence.
+    """
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("schema_version") != 1 or raw.get("observer") != "windows_uia":
+        return None
+    try:
+        return StructuralObservationV1.model_validate(raw)
+    except Exception:
+        return None
 
 
 def _convert_action_event(db_event) -> PydanticActionEvent | None:
@@ -69,6 +86,9 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
                 x=db_event.mouse_x or 0,
                 y=db_event.mouse_y or 0,
                 button=button,
+                structural_observation=_parse_structural_observation(
+                    getattr(db_event, "element_state", None)
+                ),
             )
         elif db_event.mouse_pressed is False:
             return MouseUpEvent(
@@ -368,6 +388,11 @@ class Action:
             btn = self.event.button
             return btn.value if hasattr(btn, "value") else str(btn)
         return None
+
+    @property
+    def structural_observation(self) -> StructuralObservationV1 | None:
+        """Native accessibility evidence captured at action time, if present."""
+        return getattr(self.event, "structural_observation", None)
 
     @property
     def screenshot(self) -> "Image" | None:

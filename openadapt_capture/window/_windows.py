@@ -95,6 +95,115 @@ def get_active_element_state(x: int, y: int) -> dict:
     return properties
 
 
+def _safe_text(value: object) -> str:
+    """Return a stable textual property without leaking object reprs."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _element_info_value(element: object, name: str) -> object | None:
+    info = getattr(element, "element_info", None)
+    if info is None:
+        return None
+    try:
+        return getattr(info, name, None)
+    except Exception:
+        return None
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _supported_patterns(element: object) -> list[str]:
+    patterns = (
+        ("invoke", "iface_invoke"),
+        ("value", "iface_value"),
+        ("selection_item", "iface_selection_item"),
+        ("toggle", "iface_toggle"),
+        ("expand_collapse", "iface_expand_collapse"),
+    )
+    supported = []
+    for label, attribute in patterns:
+        try:
+            if getattr(element, attribute, None) is not None:
+                supported.append(label)
+        except Exception:
+            continue
+    return supported
+
+
+def _structural_node(element: object) -> dict:
+    try:
+        properties = element.get_properties()
+    except Exception:
+        try:
+            properties = get_properties(element)
+        except Exception:
+            properties = {}
+
+    rectangle = properties.get("rectangle")
+    bounds = dictify_rect(rectangle) if rectangle is not None else None
+    texts = properties.get("texts") or []
+    name = properties.get("name") or (texts[0] if texts else "")
+    role = properties.get("control_type") or _element_info_value(
+        element, "control_type"
+    )
+    return {
+        "role": _safe_text(role),
+        "name": _safe_text(name),
+        "automation_id": _safe_text(
+            properties.get("automation_id")
+            or _element_info_value(element, "automation_id")
+        ),
+        "class_name": _safe_text(
+            properties.get("class_name")
+            or _element_info_value(element, "class_name")
+        ),
+        "bounds": bounds,
+        "supported_patterns": _supported_patterns(element),
+    }
+
+
+def get_active_element_observation(x: int, y: int) -> dict:
+    """Capture a versioned, JSON-safe UIA fingerprint at action time."""
+    active_window = get_active_window()
+    target = active_window.from_point(x, y)
+
+    ancestors = []
+    current = target
+    for _ in range(5):
+        try:
+            current = current.parent()
+        except Exception:
+            break
+        if current is None:
+            break
+        ancestors.append(_structural_node(current))
+        if current == active_window:
+            break
+
+    window_node = _structural_node(active_window)
+    process_id = _element_info_value(target, "process_id")
+    if process_id is None:
+        process_id = _element_info_value(active_window, "process_id")
+
+    return {
+        "schema_version": 1,
+        "observer": "windows_uia",
+        "target": _structural_node(target),
+        "ancestors": ancestors,
+        "window_name": window_node["name"],
+        "process_id": _safe_int(process_id),
+    }
+
+
 def get_active_window() -> "pywinauto.application.WindowSpecification":
     """Get the active window object.
 

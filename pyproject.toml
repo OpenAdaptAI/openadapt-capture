@@ -44,6 +44,8 @@ dependencies = [
     "matplotlib>=3.10.8",
     # Native macOS window/accessibility observation via permissive PyObjC.
     "pyobjc-framework-ApplicationServices>=12.2.1; sys_platform == 'darwin'",
+    # Native Windows window resolution and UI Automation observation.
+    "pywinauto>=0.6.8; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

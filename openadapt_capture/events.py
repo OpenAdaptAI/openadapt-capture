@@ -62,6 +62,37 @@ class BaseEvent(BaseModel):
     model_config = {"use_enum_values": True}
 
 
+class StructuralBounds(BaseModel):
+    """Element bounds in the native screen coordinate space."""
+
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+
+class StructuralNode(BaseModel):
+    """Stable, JSON-safe subset of a native accessibility node."""
+
+    role: str = ""
+    name: str = ""
+    automation_id: str = ""
+    class_name: str = ""
+    bounds: StructuralBounds | None = None
+    supported_patterns: list[str] = Field(default_factory=list)
+
+
+class StructuralObservationV1(BaseModel):
+    """Versioned Windows UI Automation evidence captured with an action."""
+
+    schema_version: Literal[1] = 1
+    observer: Literal["windows_uia"] = "windows_uia"
+    target: StructuralNode
+    ancestors: list[StructuralNode] = Field(default_factory=list)
+    window_name: str = ""
+    process_id: int | None = None
+
+
 # =============================================================================
 # Mouse Events
 # =============================================================================
@@ -88,6 +119,7 @@ class MouseDownEvent(BaseEvent):
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
     button: str = Field(description="Native mouse button name")
+    structural_observation: StructuralObservationV1 | None = None
 
 
 class MouseUpEvent(BaseEvent):
@@ -203,6 +235,7 @@ class MouseClickEvent(BaseEvent):
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
     button: str = Field(description="Native mouse button name")
+    structural_observation: StructuralObservationV1 | None = None
     children: list[MouseDownEvent | MouseUpEvent] = Field(
         default_factory=list, description="Child events that were merged"
     )
@@ -219,6 +252,7 @@ class MouseDoubleClickEvent(BaseEvent):
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
     button: str = Field(description="Native mouse button name")
+    structural_observation: StructuralObservationV1 | None = None
     children: list[MouseDownEvent | MouseUpEvent] = Field(
         default_factory=list, description="Child events that were merged"
     )
@@ -237,6 +271,7 @@ class MouseDragEvent(BaseEvent):
     dx: float = Field(description="Horizontal displacement (end_x - start_x)")
     dy: float = Field(description="Vertical displacement (end_y - start_y)")
     button: str = Field(description="Native mouse button name")
+    structural_observation: StructuralObservationV1 | None = None
     children: list[MouseDownEvent | MouseMoveEvent | MouseUpEvent] = Field(
         default_factory=list, description="Child events that were merged"
     )
