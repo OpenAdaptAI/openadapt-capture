@@ -1410,6 +1410,14 @@ def read_input_events(
                 logger.info("Stop sequence entered! Stopping recording now.")
                 stop_sequence_detected = True
 
+    if structural_observer is not None:
+        start_hook = getattr(structural_observer, "open_current_thread", None)
+        stop_hook = getattr(structural_observer, "close_current_thread", None)
+        if callable(start_hook):
+            setattr(on_observed, "_openadapt_delivery_thread_start", start_hook)
+        if callable(stop_hook):
+            setattr(on_observed, "_openadapt_delivery_thread_stop", stop_hook)
+
     utils.set_start_time(recording.timestamp)
     observer = create_input_observer(
         on_observed,

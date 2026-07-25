@@ -156,7 +156,7 @@ def create_structural_observer(
         )
 
         return WindowsUIAStructuralObserver()
-    except ImportError as exc:
+    except Exception as exc:
         _logger.warning("Windows UIA structural observation is unavailable: %s", exc)
         return None
 
