@@ -301,6 +301,14 @@ for the evidence behind current maturity labels.
 | `share` | Explicit Magic Wormhole transfer |
 | `all` | All optional dependencies |
 
+Both transcription extras are installed by the user into their own
+environment; neither is vendored into this MIT wheel. Note that
+`transcribe-fast` pulls `av` (PyAV), whose published wheels bundle GPL-licensed
+`libx264`/`libx265` binaries. That is acceptable for a user-side `pip install`,
+but such an artifact must not be frozen into a first-party installer, sidecar,
+or image. Packaging work that bundles a transcription backend should prefer an
+MIT backend with a clean dependency tree and must inspect the built archive.
+
 ## Development
 
 ```bash
