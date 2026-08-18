@@ -698,13 +698,27 @@ def _process_instance_live(pid: int, process_started_at: float) -> bool:
     if pid <= 0:
         return False
     try:
-        actual = psutil.Process(pid).create_time()
-    except psutil.NoSuchProcess:
+        process = psutil.Process(pid)
+        actual = process.create_time()
+        if abs(actual - process_started_at) > _PROCESS_START_TOLERANCE_SECONDS:
+            return False
+        if not process.is_running():
+            return False
+        if process.status() in {psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE}:
+            return False
+        try:
+            # On Windows, an exited process can remain inspectable while another
+            # process retains a handle to its kernel object. A zero-time wait
+            # distinguishes that object from the exact running instance.
+            process.wait(timeout=0)
+        except psutil.TimeoutExpired:
+            return True
+        return False
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return False
     except (psutil.AccessDenied, OSError):
         # An uninspectable process is not proof of a stale endpoint.
         return True
-    return abs(actual - process_started_at) <= _PROCESS_START_TOLERANCE_SECONDS
 
 
 def _mark_crashed_if_bound(descriptor: _ControlDescriptor) -> None:

@@ -487,6 +487,54 @@ def test_pid_reuse_descriptor_is_marked_crashed_and_removed(tmp_path: Path) -> N
     assert recovered["complete"] is False
 
 
+def test_exited_but_inspectable_process_is_not_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows can retain an exited process object while a handle stays open."""
+    started_at = 1234.5
+
+    class ExitedProcess:
+        def create_time(self) -> float:
+            return started_at
+
+        def is_running(self) -> bool:
+            return True
+
+        def status(self) -> str:
+            return psutil.STATUS_RUNNING
+
+        def wait(self, timeout: float) -> int:
+            assert timeout == 0
+            return 1
+
+    monkeypatch.setattr(control.psutil, "Process", lambda _pid: ExitedProcess())
+
+    assert control._process_instance_live(123, started_at) is False
+
+
+def test_exact_running_process_instance_is_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started_at = 1234.5
+
+    class RunningProcess:
+        def create_time(self) -> float:
+            return started_at
+
+        def is_running(self) -> bool:
+            return True
+
+        def status(self) -> str:
+            return psutil.STATUS_RUNNING
+
+        def wait(self, timeout: float) -> None:
+            raise psutil.TimeoutExpired(timeout, pid=123)
+
+    monkeypatch.setattr(control.psutil, "Process", lambda _pid: RunningProcess())
+
+    assert control._process_instance_live(123, started_at) is True
+
+
 def test_recorder_failure_keeps_incomplete_state_and_removes_endpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
