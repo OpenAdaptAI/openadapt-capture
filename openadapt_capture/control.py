@@ -1141,7 +1141,13 @@ class RecorderControlServer:
                 raise CaptureControlAuthenticationError("unsupported_command")
             complete = status.get("complete") is True
             verified = status.get("integrity_verified") is True
-            if command == "stop" and not (complete and verified):
+            clean_completion = (
+                complete
+                and verified
+                and status.get("phase") == "complete"
+                and status.get("error_code") is None
+            )
+            if command == "stop" and not clean_completion:
                 response = self._response(
                     request_id,
                     ok=False,

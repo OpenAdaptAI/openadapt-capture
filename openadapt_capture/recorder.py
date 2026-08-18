@@ -2620,6 +2620,9 @@ class Recorder:
                 self._set_worker_error(exc)
             return {
                 **self._control_payload(),
+                "phase": "finalizing",
+                "complete": False,
+                "integrity_verified": False,
                 "error_code": "finalization_timeout",
             }
         return self._control_payload()

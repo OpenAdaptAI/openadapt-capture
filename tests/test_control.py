@@ -586,6 +586,47 @@ def test_delayed_finalizing_message_cannot_erase_timeout(
     assert persisted[-1]["error_code"] == "finalization_timeout"
 
 
+def test_completion_race_after_stop_timeout_cannot_return_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = recorder_module.Recorder(
+        str(tmp_path / "capture"),
+        capture_video=False,
+        capture_images=True,
+    )
+    monkeypatch.setattr(
+        control,
+        "write_terminal_state",
+        lambda _capture_dir, _payload: tmp_path / "capture" / "capture-state.json",
+    )
+
+    class CompletionRaceEvent:
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, timeout: float) -> bool:
+            del timeout
+            recorder._transition_control(
+                "complete",
+                complete=True,
+                integrity_verified=True,
+                finalized=True,
+            )
+            return False
+
+    recorder._finalized_event = CompletionRaceEvent()  # type: ignore[assignment]
+
+    returned = recorder._control_stop(0.01)
+
+    assert returned["phase"] == "finalizing"
+    assert returned["complete"] is False
+    assert returned["integrity_verified"] is False
+    assert returned["error_code"] == "finalization_timeout"
+    assert recorder._control_payload()["phase"] == "complete"
+    assert recorder._control_payload()["integrity_verified"] is True
+
+
 def test_integrity_verification_rejects_missing_committed_events(tmp_path: Path) -> None:
     capture_dir = tmp_path / "capture"
     _create_minimal_recording(capture_dir)
