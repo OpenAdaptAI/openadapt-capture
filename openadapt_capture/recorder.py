@@ -25,10 +25,12 @@ import multiprocessing
 import os
 import queue
 import signal
+import sqlite3
 import sys
 import threading
 import time
 import tracemalloc
+import uuid
 from collections import namedtuple
 from functools import partial
 from typing import Any, Callable
@@ -2319,6 +2321,8 @@ class Recorder:
         send_profile: bool = False,
         window: dict | None = None,
         structural_observer: StructuralObserver | None = None,
+        control_enabled: bool = True,
+        control_runtime_dir: str | None = None,
     ) -> None:
         from pathlib import Path
 
@@ -2328,6 +2332,8 @@ class Recorder:
         self.capture_dir = str(Path(capture_dir).resolve())
         self.task_description = task_description
         self._send_profile = send_profile
+        self._control_enabled = control_enabled
+        self._control_runtime_dir = control_runtime_dir
 
         # Validate the window spec up front (loud, before any thread starts).
         window_target = WindowTarget.from_spec(window)
@@ -2369,6 +2375,7 @@ class Recorder:
         self._ready_event = threading.Event()
         self._stopped_event = threading.Event()
         self._ready_or_stopped_event = threading.Event()
+        self._finalized_event = threading.Event()
 
         # Internal
         self._record_thread: threading.Thread | None = None
@@ -2377,6 +2384,161 @@ class Recorder:
         self._worker_error: BaseException | None = None
         self._worker_error_lock = threading.Lock()
         self._structural_observer = structural_observer
+        self._control_server = None
+        self._control_state_lock = threading.Lock()
+        self._control_stop_lock = threading.Lock()
+        self._control_session_id = str(uuid.uuid4())
+        self._process_started_at = psutil.Process(os.getpid()).create_time()
+        self._control_phase = "starting"
+        self._control_complete = False
+        self._control_integrity_verified = False
+        self._control_error_code: str | None = None
+        self._control_started_at = time.time()
+        self._control_finalized_at: float | None = None
+
+    def _control_payload(self) -> dict[str, Any]:
+        """Return the secret-free state shared with the client and state file."""
+        with self._control_state_lock:
+            return {
+                "schema_version": "openadapt.capture-terminal.v1",
+                "session_id": self._control_session_id,
+                "pid": os.getpid(),
+                "process_started_at": self._process_started_at,
+                "capture_dir": self.capture_dir,
+                "phase": self._control_phase,
+                "ready": self._ready_event.is_set(),
+                "complete": self._control_complete,
+                "integrity_verified": self._control_integrity_verified,
+                "error_code": self._control_error_code,
+                "started_at": self._control_started_at,
+                "finalized_at": self._control_finalized_at,
+                "event_counts": {
+                    "action": self._num_action_events.value,
+                    "screen": self._num_screen_events.value,
+                    "window": self._num_window_events.value,
+                    "browser": self._num_browser_events.value,
+                    "video": self._num_video_events.value,
+                },
+            }
+
+    def _persist_control_state(self) -> None:
+        if not self._control_enabled:
+            return
+        from openadapt_capture.control import write_terminal_state
+
+        terminal = self._control_payload()
+        # The file location already binds the capture. Do not retain an
+        # absolute local path (which can disclose a user/profile name) in an
+        # artifact that may later enter sanitization and review.
+        terminal.pop("capture_dir", None)
+        write_terminal_state(self.capture_dir, terminal)
+
+    def _transition_control(
+        self,
+        phase: str,
+        *,
+        complete: bool = False,
+        integrity_verified: bool = False,
+        error_code: str | None = None,
+        finalized: bool = False,
+    ) -> None:
+        with self._control_state_lock:
+            if self._control_phase in {"complete", "failed", "crashed"}:
+                return
+            self._control_phase = phase
+            self._control_complete = complete
+            self._control_integrity_verified = integrity_verified
+            self._control_error_code = error_code
+            if finalized:
+                self._control_finalized_at = time.time()
+        self._persist_control_state()
+
+    def _set_worker_error(self, exc: BaseException) -> None:
+        with self._worker_error_lock:
+            if self._worker_error is None:
+                self._worker_error = exc
+
+    def _verify_completed_capture(self) -> None:
+        """Verify the finalized database before control reports completion."""
+        from pathlib import Path
+
+        from openadapt_capture.capture import CaptureSession
+
+        db_path = Path(self.capture_dir) / "recording.db"
+        details = db_path.lstat()
+        if not db_path.is_file() or db_path.is_symlink():
+            raise RuntimeError("The finalized Capture database is not a regular file.")
+        if details.st_size <= 0:
+            raise RuntimeError("The finalized Capture database is empty.")
+        database = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        try:
+            quick_check = database.execute("PRAGMA quick_check").fetchall()
+            if quick_check != [("ok",)]:
+                raise RuntimeError("The finalized Capture database failed integrity check.")
+            recording_count = database.execute(
+                "SELECT COUNT(*) FROM recording"
+            ).fetchone()
+            if recording_count != (1,):
+                raise RuntimeError(
+                    "The finalized Capture database does not contain one session."
+                )
+        finally:
+            database.close()
+        capture = CaptureSession.load(self.capture_dir)
+        try:
+            # Conversion rejects malformed replay-relevant events.  Browser
+            # conversion is also forced so a lazy reader cannot hide damage.
+            capture.raw_events()
+            capture.browser_events()
+        finally:
+            capture.close()
+
+    def _start_control_server(self) -> None:
+        from pathlib import Path
+
+        from openadapt_capture.control import RecorderControlServer
+
+        Path(self.capture_dir).mkdir(parents=True, exist_ok=True)
+        self._persist_control_state()
+        server = RecorderControlServer(
+            capture_dir=self.capture_dir,
+            snapshot=self._control_payload,
+            stop=self._control_stop,
+            session_id=self._control_session_id,
+            runtime_dir=self._control_runtime_dir,
+        )
+        self._control_server = server.start()
+
+    def _control_stop(self, timeout: float) -> dict[str, Any]:
+        """Idempotently request stop and wait for the one finalization result."""
+        with self._control_stop_lock:
+            if (
+                not self._finalized_event.is_set()
+                and not self._terminate_processing.is_set()
+            ):
+                try:
+                    self._transition_control("stopping")
+                except BaseException as exc:
+                    self._set_worker_error(exc)
+                    self._terminate_processing.set()
+                    return {
+                        **self._control_payload(),
+                        "error_code": "terminal_metadata_failed",
+                    }
+                self._terminate_processing.set()
+        if not self._finalized_event.wait(timeout=timeout):
+            try:
+                self._transition_control(
+                    "finalizing",
+                    error_code="finalization_timeout",
+                )
+            except BaseException as exc:
+                self._set_worker_error(exc)
+            return {
+                **self._control_payload(),
+                "error_code": "finalization_timeout",
+            }
+        return self._control_payload()
 
     def _drain_status_pipe(self) -> None:
         """Background thread that reads status messages from record()."""
@@ -2388,11 +2550,18 @@ class Recorder:
                         if msg.get("type") == "record.started":
                             self._ready_event.set()
                             self._ready_or_stopped_event.set()
+                            self._transition_control("recording")
+                        elif msg.get("type") == "record.stopping":
+                            self._transition_control("finalizing")
                         elif msg.get("type") == "record.stopped":
                             self._stopped_event.set()
                             self._ready_or_stopped_event.set()
         except (EOFError, OSError):
             pass
+        except BaseException as exc:
+            self._set_worker_error(exc)
+            self._terminate_processing.set()
+            self._ready_or_stopped_event.set()
 
     def _run_record(self) -> None:
         """Thread target: apply config overrides, then call record()."""
@@ -2414,38 +2583,105 @@ class Recorder:
                     send_profile=self._send_profile,
                     structural_observer=self._structural_observer,
                 )
+            self.check_health()
+            if self._ready_event.is_set():
+                self._verify_completed_capture()
+                self._transition_control(
+                    "complete",
+                    complete=True,
+                    integrity_verified=True,
+                    finalized=True,
+                )
+            else:
+                self._transition_control(
+                    "failed",
+                    error_code="startup_incomplete",
+                    finalized=True,
+                )
         except BaseException as exc:
             # A setup exception must wake wait_for_ready() and let context-manager
             # teardown finish instead of leaving callers blocked for its timeout.
-            with self._worker_error_lock:
-                if self._worker_error is None:
-                    self._worker_error = exc
+            self._set_worker_error(exc)
             self._terminate_processing.set()
+            try:
+                self._transition_control(
+                    "failed",
+                    error_code="recording_or_finalization_failed",
+                    finalized=True,
+                )
+            except BaseException as state_exc:
+                add_exception_note(
+                    exc,
+                    f"terminal state persistence also failed: {state_exc!r}",
+                )
             try:
                 self._status_send.send({"type": "record.stopped"})
             except (BrokenPipeError, EOFError, OSError):
                 self._stopped_event.set()
                 self._ready_or_stopped_event.set()
+        finally:
+            self._stopped_event.set()
+            self._ready_or_stopped_event.set()
+            self._finalized_event.set()
 
     def __enter__(self) -> "Recorder":
+        if self._control_enabled:
+            try:
+                self._start_control_server()
+            except BaseException:
+                try:
+                    self._transition_control(
+                        "failed",
+                        error_code="control_channel_failed",
+                        finalized=True,
+                    )
+                except BaseException:
+                    pass
+                raise
+
         # Start status drain thread
         self._status_thread = threading.Thread(
             target=self._drain_status_pipe, daemon=True,
         )
-        self._status_thread.start()
-
-        # Start recording thread
         self._record_thread = threading.Thread(target=self._run_record)
-        self._record_thread.start()
+        try:
+            self._status_thread.start()
+            self._record_thread.start()
+        except BaseException as exc:
+            self._terminate_processing.set()
+            self._stopped_event.set()
+            self._ready_or_stopped_event.set()
+            self._finalized_event.set()
+            try:
+                self._transition_control(
+                    "failed",
+                    error_code="recorder_thread_start_failed",
+                    finalized=True,
+                )
+            except BaseException as state_exc:
+                add_exception_note(
+                    exc,
+                    f"terminal state persistence also failed: {state_exc!r}",
+                )
+            if self._control_server is not None:
+                self._control_server.close()
+            raise
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if not self._finalized_event.is_set():
+            try:
+                self._transition_control("stopping")
+            except BaseException as exc:
+                self._set_worker_error(exc)
         self._terminate_processing.set()
         if self._record_thread is not None:
             self._record_thread.join()
         self._stopped_event.set()  # ensure status thread exits
         if self._status_thread is not None:
             self._status_thread.join(timeout=5)
+        if self._control_server is not None:
+            self._control_server.close()
         if self._worker_error is not None:
             if exc_val is not None:
                 add_exception_note(
@@ -2457,10 +2693,19 @@ class Recorder:
 
     def stop(self) -> None:
         """Stop, join, and surface any recording-worker failure."""
+        if not self._finalized_event.is_set():
+            try:
+                self._transition_control("stopping")
+            except BaseException as exc:
+                self._set_worker_error(exc)
         self._terminate_processing.set()
         if self._record_thread is not None:
             self._record_thread.join()
-        self.check_health()
+        try:
+            self.check_health()
+        finally:
+            if self._control_server is not None:
+                self._control_server.close()
 
     def check_health(self) -> None:
         """Raise the first recording-worker error observed by the owner thread."""
@@ -2513,6 +2758,11 @@ class Recorder:
             "video_frames": self._num_video_events.value,
             "is_recording": self.is_recording,
         }
+
+    @property
+    def control_session_id(self) -> str:
+        """Stable identifier used by authenticated cross-process clients."""
+        return self._control_session_id
 
     @property
     def capture(self):
