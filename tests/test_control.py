@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
+import queue
 import socket
 import stat
 import subprocess
@@ -12,12 +14,14 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import psutil
 import pytest
 
 from openadapt_capture import control
 from openadapt_capture import recorder as recorder_module
+from openadapt_capture.config import RecordingConfig, config_override
 from openadapt_capture.control import (
     CaptureControlError,
     CaptureControlUnavailable,
@@ -26,6 +30,7 @@ from openadapt_capture.control import (
     status_recording,
     stop_recording,
 )
+from openadapt_capture.db import create_db, crud
 
 
 def _terminal_payload(capture_dir: Path, session_id: str) -> dict:
@@ -50,6 +55,40 @@ def _terminal_payload(capture_dir: Path, session_id: str) -> dict:
             "video": 0,
         },
     }
+
+
+def _create_minimal_recording(
+    capture_dir: Path,
+    *,
+    browser_messages: list[object] | None = None,
+) -> None:
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    engine, session_factory = create_db(str(capture_dir / "recording.db"))
+    session = session_factory()
+    try:
+        recording = crud.insert_recording(
+            session,
+            {
+                "timestamp": time.time(),
+                "monitor_width": 1280,
+                "monitor_height": 720,
+                "pixel_ratio": 1.0,
+                "double_click_interval_seconds": 0.5,
+                "double_click_distance_pixels": 5.0,
+                "platform": sys.platform,
+                "task_description": "control verification test",
+            },
+        )
+        for offset, message in enumerate(browser_messages or []):
+            crud.insert_browser_event(
+                session,
+                recording,
+                time.time() + offset,
+                {"message": message},
+            )
+    finally:
+        session.close()
+        engine.dispose()
 
 
 def _wait_for_session(runtime_dir: Path, timeout: float = 15.0) -> str:
@@ -264,6 +303,54 @@ def test_wrong_token_and_replaced_instance_fail_closed(tmp_path: Path) -> None:
         server.close()
 
 
+def test_control_thread_start_failure_removes_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _terminal_payload(tmp_path / "capture", str(uuid.uuid4()))
+
+    def fail_start(_thread: threading.Thread) -> None:
+        raise RuntimeError("synthetic thread start failure")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    server = RecorderControlServer(
+        capture_dir=state["capture_dir"],
+        snapshot=lambda: dict(state),
+        stop=lambda _timeout: dict(state),
+        session_id=state["session_id"],
+        runtime_dir=tmp_path / "runtime",
+    )
+    with pytest.raises(RuntimeError, match="thread start failure"):
+        server.start()
+    assert list((tmp_path / "runtime").glob("*.json")) == []
+
+
+def test_unauthenticated_connections_have_a_hard_thread_limit(tmp_path: Path) -> None:
+    state = _terminal_payload(tmp_path / "capture", str(uuid.uuid4()))
+    server = RecorderControlServer(
+        capture_dir=state["capture_dir"],
+        snapshot=lambda: dict(state),
+        stop=lambda _timeout: dict(state),
+        session_id=state["session_id"],
+        runtime_dir=tmp_path / "runtime",
+    ).start()
+    peers: list[socket.socket] = []
+    try:
+        descriptor = control._parse_descriptor(server.descriptor_path)  # type: ignore[arg-type]
+        for _ in range(control._MAX_CONTROL_REQUEST_THREADS):
+            peers.append(socket.create_connection((descriptor.host, descriptor.port), timeout=2))
+        overflow = socket.create_connection((descriptor.host, descriptor.port), timeout=2)
+        try:
+            overflow.settimeout(2)
+            assert overflow.recv(1) == b""
+        finally:
+            overflow.close()
+    finally:
+        for peer in peers:
+            peer.close()
+        server.close()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode assertion")
 def test_runtime_secret_is_owner_only_and_wrong_owner_is_rejected(
     tmp_path: Path,
@@ -291,6 +378,43 @@ def test_runtime_secret_is_owner_only_and_wrong_owner_is_rejected(
             control._parse_descriptor(server.descriptor_path)
     finally:
         server.close()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS extended ACL contract")
+def test_macos_extended_acl_is_removed(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir(mode=0o700)
+    subprocess.run(
+        ["chmod", "+a", "everyone allow read", str(runtime_dir)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    descriptor = os.open(runtime_dir, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        assert control._macos_extended_acl_present(descriptor, runtime_dir)
+    finally:
+        os.close(descriptor)
+
+    control._protect_path(runtime_dir, directory=True)
+    descriptor = os.open(runtime_dir, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        assert not control._macos_extended_acl_present(descriptor, runtime_dir)
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows owner and DACL contract")
+def test_windows_owner_check_rejects_a_foreign_sid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_dir = control._secure_runtime_dir(tmp_path / "runtime")
+    control._set_and_verify_windows_owner_acl(runtime_dir, _apply=False)
+
+    monkeypatch.setattr(control, "_windows_current_user_sid", lambda: "S-1-5-18")
+    with pytest.raises(PermissionError, match="current user does not own"):
+        control._set_and_verify_windows_owner_acl(runtime_dir, _apply=False)
 
 
 def test_multiple_sessions_require_exact_selection(tmp_path: Path) -> None:
@@ -393,3 +517,131 @@ def test_recorder_failure_keeps_incomplete_state_and_removes_endpoint(
     assert terminal["complete"] is False
     assert terminal["integrity_verified"] is False
     assert terminal["error_code"] == "recording_or_finalization_failed"
+
+
+def test_complete_state_write_failure_cannot_return_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = recorder_module.Recorder(
+        str(tmp_path / "capture"),
+        capture_video=False,
+        capture_images=True,
+    )
+    persisted: list[dict] = []
+
+    def fail_complete_write(_capture_dir: str, payload: dict) -> Path:
+        if payload.get("complete") is True:
+            raise OSError("synthetic terminal metadata failure")
+        persisted.append(dict(payload))
+        return tmp_path / "capture" / control.TERMINAL_STATE_FILENAME
+
+    monkeypatch.setattr(control, "write_terminal_state", fail_complete_write)
+    with pytest.raises(OSError, match="terminal metadata failure"):
+        recorder._transition_control(
+            "complete",
+            complete=True,
+            integrity_verified=True,
+            finalized=True,
+        )
+
+    rolled_back = recorder._control_payload()
+    assert rolled_back["phase"] == "starting"
+    assert rolled_back["complete"] is False
+    assert rolled_back["integrity_verified"] is False
+
+    recorder._transition_control(
+        "failed",
+        error_code="recording_or_finalization_failed",
+        finalized=True,
+    )
+    recorder._finalized_event.set()
+    returned = recorder._control_stop(0.1)
+    assert returned["phase"] == "failed"
+    assert returned["complete"] is False
+    assert returned["integrity_verified"] is False
+    assert persisted[-1]["phase"] == "failed"
+
+
+def test_delayed_finalizing_message_cannot_erase_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = recorder_module.Recorder(
+        str(tmp_path / "capture"),
+        capture_video=False,
+        capture_images=True,
+    )
+    persisted: list[dict] = []
+
+    def retain_state(_capture_dir: str, payload: dict) -> Path:
+        persisted.append(dict(payload))
+        return tmp_path / "capture" / control.TERMINAL_STATE_FILENAME
+
+    monkeypatch.setattr(control, "write_terminal_state", retain_state)
+    recorder._transition_control("finalizing", error_code="finalization_timeout")
+    recorder._transition_control("finalizing")
+
+    assert recorder._control_payload()["error_code"] == "finalization_timeout"
+    assert persisted[-1]["error_code"] == "finalization_timeout"
+
+
+def test_integrity_verification_rejects_missing_committed_events(tmp_path: Path) -> None:
+    capture_dir = tmp_path / "capture"
+    _create_minimal_recording(capture_dir)
+    recorder = recorder_module.Recorder(
+        str(capture_dir),
+        capture_video=False,
+        capture_images=True,
+    )
+    recorder._num_action_events.value = 1
+
+    with pytest.raises(RuntimeError, match="lost action_event events"):
+        recorder._verify_completed_capture()
+
+
+def test_integrity_verification_rejects_malformed_browser_event(tmp_path: Path) -> None:
+    capture_dir = tmp_path / "capture"
+    _create_minimal_recording(capture_dir, browser_messages=["not-an-object"])
+    recorder = recorder_module.Recorder(
+        str(capture_dir),
+        capture_video=False,
+        capture_images=True,
+    )
+    recorder._num_browser_events.value = 1
+
+    with pytest.raises(RuntimeError, match="invalid browser event"):
+        recorder._verify_completed_capture()
+
+
+def test_browser_events_increment_the_persisted_count() -> None:
+    event_q: queue.Queue = queue.Queue()
+    event_q.put(
+        recorder_module.Event(
+            timestamp=time.time(),
+            type="browser",
+            data={"message": {"eventType": "navigate", "url": "https://example.test"}},
+        )
+    )
+    queues = [queue.Queue() for _ in range(6)]
+    counters = [multiprocessing.Value("i", 0) for _ in range(5)]
+    terminate = multiprocessing.Event()
+    terminate.set()
+
+    with config_override(RecordingConfig(capture_browser_events=True)):
+        recorder_module.process_events(
+            event_q,
+            queues[0],
+            queues[1],
+            queues[2],
+            queues[3],
+            queues[4],
+            queues[5],
+            SimpleNamespace(timestamp=time.time()),
+            terminate,
+            threading.Event(),
+            *counters,
+        )
+
+    assert counters[3].value == 1
+    assert queues[3].qsize() == 1

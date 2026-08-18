@@ -14,6 +14,7 @@ database or private recorder state.
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import hmac
 import json
@@ -41,6 +42,7 @@ _REQUEST_CLOCK_SKEW_SECONDS = 60.0
 _PROCESS_START_TOLERANCE_SECONDS = 0.01
 _DEFAULT_TIMEOUT_SECONDS = 60.0
 _MAX_TIMEOUT_SECONDS = 15 * 60.0
+_MAX_CONTROL_REQUEST_THREADS = 16
 
 
 class CaptureControlError(RuntimeError):
@@ -267,7 +269,7 @@ def _windows_current_user_sid() -> str:
         kernel32.CloseHandle(token)
 
 
-def _set_and_verify_windows_owner_acl(path: Path) -> None:
+def _set_and_verify_windows_owner_acl(path: Path, *, _apply: bool = True) -> None:
     """Apply and verify a protected DACL containing only the current user.
 
     A best-effort ``chmod`` is not an authentication boundary on Windows.  This
@@ -368,27 +370,28 @@ def _set_and_verify_windows_owner_acl(path: Path) -> None:
     owner_security_information = 0x00000001
     dacl_security_information = 0x00000004
     protected_dacl_security_information = 0x80000000
-    security_descriptor = ctypes.c_void_p()
-    descriptor_size = wintypes.ULONG()
-    sddl = f"O:{sid}D:P(A;;GA;;;{sid})"
-    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        sddl,
-        sddl_revision_1,
-        ctypes.byref(security_descriptor),
-        ctypes.byref(descriptor_size),
-    ):
-        raise OSError(ctypes.get_last_error(), "Cannot build the owner-only DACL")
-    try:
-        if not advapi32.SetFileSecurityW(
-            str(path),
-            owner_security_information
-            | dacl_security_information
-            | protected_dacl_security_information,
-            security_descriptor,
+    if _apply:
+        security_descriptor = ctypes.c_void_p()
+        descriptor_size = wintypes.ULONG()
+        sddl = f"O:{sid}D:P(A;;GA;;;{sid})"
+        if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl,
+            sddl_revision_1,
+            ctypes.byref(security_descriptor),
+            ctypes.byref(descriptor_size),
         ):
-            raise OSError(ctypes.get_last_error(), f"Cannot protect {path}")
-    finally:
-        kernel32.LocalFree(security_descriptor)
+            raise OSError(ctypes.get_last_error(), "Cannot build the owner-only DACL")
+        try:
+            if not advapi32.SetFileSecurityW(
+                str(path),
+                owner_security_information
+                | dacl_security_information
+                | protected_dacl_security_information,
+                security_descriptor,
+            ):
+                raise OSError(ctypes.get_last_error(), f"Cannot protect {path}")
+        finally:
+            kernel32.LocalFree(security_descriptor)
 
     current_sid = ctypes.c_void_p()
     if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(current_sid)):
@@ -474,6 +477,69 @@ def _set_and_verify_windows_owner_acl(path: Path) -> None:
         kernel32.LocalFree(current_sid)
 
 
+def _macos_extended_acl_present(descriptor: int, path: Path) -> bool:
+    """Return whether a file descriptor has a valid non-empty macOS ACL."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    libc.acl_get_fd_np.restype = ctypes.c_void_p
+    libc.acl_get_entry.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    libc.acl_get_entry.restype = ctypes.c_int
+    libc.acl_valid.argtypes = [ctypes.c_void_p]
+    libc.acl_valid.restype = ctypes.c_int
+    libc.acl_free.argtypes = [ctypes.c_void_p]
+    libc.acl_free.restype = ctypes.c_int
+
+    ctypes.set_errno(0)
+    acl = libc.acl_get_fd_np(descriptor, 0x00000100)  # ACL_TYPE_EXTENDED
+    if not acl:
+        error = ctypes.get_errno()
+        if error == errno.ENOENT:
+            return False
+        raise OSError(error, f"Cannot inspect the extended ACL for {path}")
+    try:
+        if libc.acl_valid(acl) != 0:
+            raise OSError(ctypes.get_errno(), f"The extended ACL for {path} is invalid")
+        entry = ctypes.c_void_p()
+        ctypes.set_errno(0)
+        result = libc.acl_get_entry(acl, 0, ctypes.byref(entry))  # ACL_FIRST_ENTRY
+        if result == 0:
+            return True
+        error = ctypes.get_errno()
+        if result == -1 and error == errno.EINVAL:
+            return False
+        raise OSError(error, f"Cannot inspect extended ACL entries for {path}")
+    finally:
+        libc.acl_free(acl)
+
+
+def _clear_and_verify_macos_acl(descriptor: int, path: Path) -> None:
+    """Remove all macOS extended ACL entries and verify their absence."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.acl_init.argtypes = [ctypes.c_int]
+    libc.acl_init.restype = ctypes.c_void_p
+    libc.acl_set_fd_np.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    libc.acl_set_fd_np.restype = ctypes.c_int
+    libc.acl_free.argtypes = [ctypes.c_void_p]
+    libc.acl_free.restype = ctypes.c_int
+
+    empty_acl = libc.acl_init(0)
+    if not empty_acl:
+        raise OSError(ctypes.get_errno(), f"Cannot allocate an empty ACL for {path}")
+    try:
+        if libc.acl_set_fd_np(descriptor, empty_acl, 0x00000100) != 0:
+            raise OSError(ctypes.get_errno(), f"Cannot clear the extended ACL for {path}")
+    finally:
+        libc.acl_free(empty_acl)
+    if _macos_extended_acl_present(descriptor, path):
+        raise PermissionError(f"The extended ACL for {path} still grants access")
+
+
 def _protect_path(path: Path, *, directory: bool) -> None:
     if sys.platform == "win32":
         if _is_windows_reparse_point(path):
@@ -482,17 +548,31 @@ def _protect_path(path: Path, *, directory: bool) -> None:
         return
 
     mode = 0o700 if directory else 0o600
-    os.chmod(path, mode, follow_symlinks=False)
-    details = path.lstat()
-    if stat.S_ISLNK(details.st_mode):
-        raise PermissionError(f"Refusing a symbolic-link control path: {path}")
-    expected_kind = stat.S_ISDIR if directory else stat.S_ISREG
-    if not expected_kind(details.st_mode):
-        raise PermissionError(f"The control path has the wrong file type: {path}")
-    if details.st_uid != os.getuid():
-        raise PermissionError(f"The current user does not own {path}")
-    if stat.S_IMODE(details.st_mode) != mode:
-        raise PermissionError(f"Owner-only permissions could not be established for {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if directory and hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        details = os.fstat(descriptor)
+        expected_kind = stat.S_ISDIR if directory else stat.S_ISREG
+        if not expected_kind(details.st_mode):
+            raise PermissionError(f"The control path has the wrong file type: {path}")
+        if details.st_uid != os.getuid():
+            raise PermissionError(f"The current user does not own {path}")
+        os.fchmod(descriptor, mode)
+        if sys.platform == "darwin":
+            _clear_and_verify_macos_acl(descriptor, path)
+        protected = os.fstat(descriptor)
+        if stat.S_IMODE(protected.st_mode) != mode:
+            raise PermissionError(
+                f"Owner-only permissions could not be established for {path}"
+            )
+    finally:
+        os.close(descriptor)
 
 
 def _secure_runtime_dir(runtime_dir: str | os.PathLike[str] | None = None) -> Path:
@@ -516,7 +596,9 @@ def _write_json_atomic(path: Path, payload: dict[str, Any], *, owner_only: bool)
     descriptor = os.open(temporary, flags, 0o600)
     try:
         encoded = _canonical_json(payload) + b"\n"
-        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+        stream = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with stream:
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
@@ -526,10 +608,11 @@ def _write_json_atomic(path: Path, payload: dict[str, Any], *, owner_only: bool)
         if owner_only:
             _protect_path(path, directory=False)
     finally:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             temporary.unlink()
         except FileNotFoundError:
@@ -861,8 +944,32 @@ class _LoopbackServer(socketserver.ThreadingTCPServer):
     daemon_threads = False
     block_on_close = True
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._request_slots = threading.BoundedSemaphore(_MAX_CONTROL_REQUEST_THREADS)
+        super().__init__(*args, **kwargs)
+
     def verify_request(self, request: socket.socket, client_address: tuple[str, int]) -> bool:
         return client_address[0] == "127.0.0.1"
+
+    def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            request.close()
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(
+        self,
+        request: socket.socket,
+        client_address: tuple[str, int],
+    ) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
 
 class _ControlRequestHandler(socketserver.BaseRequestHandler):
@@ -931,7 +1038,17 @@ class RecorderControlServer:
             name=f"capture-control-{self.session_id[:8]}",
             daemon=True,
         )
-        self._thread.start()
+        try:
+            self._thread.start()
+        except BaseException:
+            _remove_descriptor_if_exact(descriptor)
+            server.server_close()
+            self._server = None
+            self._descriptor = None
+            self._thread = None
+            self._closed = True
+            self._token = ""
+            raise
         return self
 
     def _authenticate_request(self, request: dict[str, Any]) -> tuple[str, float]:

@@ -453,6 +453,7 @@ def process_events(
                     recording,
                     perf_q,
                 )
+                num_browser_events.value += 1
         elif event.type == "action":
             if prev_screen_event is None:
                 logger.warning("Discarding action that came before screen")
@@ -1826,6 +1827,7 @@ def record(
     window_write_q = sq.SynchronizedQueue()
     browser_write_q = sq.SynchronizedQueue()
     video_write_q = sq.SynchronizedQueue()
+    terminate_writers = multiprocessing.Event()
     # TODO: save write times to DB; display performance plot in visualize.py
     perf_q = sq.SynchronizedQueue()
     if terminate_processing is None:
@@ -1924,25 +1926,32 @@ def record(
     if num_video_events is None:
         num_video_events = multiprocessing.Value("i", 0)
 
+    event_processor_args = (
+        event_q,
+        screen_write_q,
+        action_write_q,
+        window_write_q,
+        browser_write_q,
+        video_write_q,
+        perf_q,
+        recording,
+        terminate_processing,
+        task_started_events.setdefault("event_processor", threading.Event()),
+        num_screen_events,
+        num_action_events,
+        num_window_events,
+        num_browser_events,
+        num_video_events,
+    )
     event_processor = threading.Thread(
-        target=process_events,
+        target=_run_task_fail_loud,
         daemon=True,
         args=(
-            event_q,
-            screen_write_q,
-            action_write_q,
-            window_write_q,
-            browser_write_q,
-            video_write_q,
-            perf_q,
-            recording,
+            "event_processor",
+            process_events,
+            event_processor_args,
             terminate_processing,
-            task_started_events.setdefault("event_processor", threading.Event()),
-            num_screen_events,
-            num_action_events,
-            num_window_events,
-            num_browser_events,
-            num_video_events,
+            task_errors,
         ),
     )
     event_processor.start()
@@ -1958,7 +1967,7 @@ def record(
             perf_q,
             recording,
             db_path,
-            terminate_processing,
+            terminate_writers,
             task_started_events.setdefault(
                 "screen_event_writer", multiprocessing.Event()
             ),
@@ -1978,7 +1987,7 @@ def record(
                 perf_q,
                 recording,
                 db_path,
-                terminate_processing,
+                terminate_writers,
                 task_started_events.setdefault(
                     "browser_event_writer", multiprocessing.Event()
                 ),
@@ -1997,7 +2006,7 @@ def record(
             perf_q,
             recording,
             db_path,
-            terminate_processing,
+            terminate_writers,
             task_started_events.setdefault(
                 "action_event_writer", multiprocessing.Event()
             ),
@@ -2017,7 +2026,7 @@ def record(
                 perf_q,
                 recording,
                 db_path,
-                terminate_processing,
+                terminate_writers,
                 task_started_events.setdefault(
                     "window_event_writer", multiprocessing.Event()
                 ),
@@ -2037,7 +2046,7 @@ def record(
                 perf_q,
                 recording,
                 db_path,
-                terminate_processing,
+                terminate_writers,
                 task_started_events.setdefault("video_writer", multiprocessing.Event()),
                 partial(
                     video_pre_callback,
@@ -2156,12 +2165,22 @@ def record(
             "screen_event_reader",
             "input_event_reader",
             "event_processor",
+            "audio_recorder",
+        ],
+        timeout=pre_ready_timeout,
+    )
+
+    # No writer can stop while the event processor can still enqueue work.
+    # Signal writer completion only after all producers have exited.
+    terminate_writers.set()
+    _join_tasks(
+        task_by_name,
+        [
             "screen_event_writer",
             "browser_event_writer",
             "action_event_writer",
             "window_event_writer",
             "video_writer",
-            "audio_recorder",
         ],
         timeout=pre_ready_timeout,
     )
@@ -2385,7 +2404,7 @@ class Recorder:
         self._worker_error_lock = threading.Lock()
         self._structural_observer = structural_observer
         self._control_server = None
-        self._control_state_lock = threading.Lock()
+        self._control_state_lock = threading.RLock()
         self._control_stop_lock = threading.Lock()
         self._control_session_id = str(uuid.uuid4())
         self._process_started_at = psutil.Process(os.getpid()).create_time()
@@ -2445,13 +2464,36 @@ class Recorder:
         with self._control_state_lock:
             if self._control_phase in {"complete", "failed", "crashed"}:
                 return
+            previous = (
+                self._control_phase,
+                self._control_complete,
+                self._control_integrity_verified,
+                self._control_error_code,
+                self._control_finalized_at,
+            )
+            if (
+                self._control_error_code == "finalization_timeout"
+                and error_code is None
+                and phase not in {"complete", "failed", "crashed"}
+            ):
+                error_code = self._control_error_code
             self._control_phase = phase
             self._control_complete = complete
             self._control_integrity_verified = integrity_verified
             self._control_error_code = error_code
             if finalized:
                 self._control_finalized_at = time.time()
-        self._persist_control_state()
+            try:
+                self._persist_control_state()
+            except BaseException:
+                (
+                    self._control_phase,
+                    self._control_complete,
+                    self._control_integrity_verified,
+                    self._control_error_code,
+                    self._control_finalized_at,
+                ) = previous
+                raise
 
     def _set_worker_error(self, exc: BaseException) -> None:
         with self._worker_error_lock:
@@ -2462,7 +2504,11 @@ class Recorder:
         """Verify the finalized database before control reports completion."""
         from pathlib import Path
 
-        from openadapt_capture.capture import CaptureSession
+        from openadapt_capture.capture import (
+            CaptureSession,
+            _convert_action_event,
+            _convert_browser_event,
+        )
 
         db_path = Path(self.capture_dir) / "recording.db"
         details = db_path.lstat()
@@ -2475,21 +2521,59 @@ class Recorder:
             quick_check = database.execute("PRAGMA quick_check").fetchall()
             if quick_check != [("ok",)]:
                 raise RuntimeError("The finalized Capture database failed integrity check.")
-            recording_count = database.execute(
-                "SELECT COUNT(*) FROM recording"
-            ).fetchone()
-            if recording_count != (1,):
+            foreign_key_errors = database.execute("PRAGMA foreign_key_check").fetchall()
+            if foreign_key_errors:
+                raise RuntimeError("The finalized Capture database has broken relationships.")
+            recordings = database.execute("SELECT id FROM recording").fetchall()
+            if len(recordings) != 1:
                 raise RuntimeError(
                     "The finalized Capture database does not contain one session."
+                )
+            recording_id = recordings[0][0]
+            expected_counts = {
+                "action_event": self._num_action_events.value,
+                "screenshot": self._num_screen_events.value,
+                "window_event": self._num_window_events.value,
+                "browser_event": self._num_browser_events.value,
+            }
+            for table, expected in expected_counts.items():
+                committed = database.execute(
+                    f"SELECT COUNT(*) FROM {table}",
+                ).fetchone()[0]
+                if committed != expected:
+                    raise RuntimeError(
+                        f"The finalized Capture database lost {table} events "
+                        f"(expected {expected}, committed {committed})."
+                    )
+                wrong_recording = database.execute(
+                    f"SELECT COUNT(*) FROM {table} "
+                    "WHERE recording_id IS NULL OR recording_id != ?",
+                    (recording_id,),
+                ).fetchone()[0]
+                if wrong_recording:
+                    raise RuntimeError(
+                        f"The finalized Capture database has unbound {table} events."
+                    )
+            actions_without_screenshots = database.execute(
+                "SELECT COUNT(*) FROM action_event "
+                "WHERE recording_id = ? AND screenshot_id IS NULL",
+                (recording_id,),
+            ).fetchone()[0]
+            if actions_without_screenshots:
+                raise RuntimeError(
+                    "The finalized Capture database has actions without screenshots."
                 )
         finally:
             database.close()
         capture = CaptureSession.load(self.capture_dir)
         try:
-            # Conversion rejects malformed replay-relevant events.  Browser
-            # conversion is also forced so a lazy reader cannot hide damage.
-            capture.raw_events()
-            capture.browser_events()
+            for event in capture._recording.action_events:
+                _convert_action_event(event)
+            for event in capture._recording.browser_events:
+                if _convert_browser_event(event) is None:
+                    raise RuntimeError(
+                        "The finalized Capture database has an invalid browser event."
+                    )
         finally:
             capture.close()
 
