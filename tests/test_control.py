@@ -521,7 +521,10 @@ def test_exited_but_inspectable_process_is_not_live(
         def status(self) -> str:
             raise AssertionError("Windows must use the kernel process signal")
 
-    monkeypatch.setattr(control.psutil, "Process", lambda _pid: ExitedProcess())
+    def fail_psutil(_pid: int) -> ExitedProcess:
+        raise AssertionError("a signaled Windows process must bypass psutil")
+
+    monkeypatch.setattr(control.psutil, "Process", fail_psutil)
     monkeypatch.setattr(control.sys, "platform", "win32")
     monkeypatch.setattr(control, "_windows_process_live", lambda _pid: False)
 
@@ -556,7 +559,7 @@ def test_windows_signaled_process_object_is_terminal_and_handle_is_closed() -> N
 
         @staticmethod
         def OpenProcess(access: int, inherit: bool, pid: int) -> int:
-            assert access == 0x00101000
+            assert access == 0x00100000
             assert inherit is False
             assert pid == 123
             return 456

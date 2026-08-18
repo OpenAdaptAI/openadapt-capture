@@ -709,13 +709,12 @@ def _windows_process_live(pid: int, *, _kernel32: Any | None = None) -> bool | N
         kernel32.CloseHandle.restype = wintypes.BOOL
 
     synchronize = 0x00100000
-    process_query_limited_information = 0x1000
     wait_object_0 = 0x00000000
     wait_timeout = 0x00000102
     error_invalid_parameter = 87
 
     handle = kernel32.OpenProcess(
-        synchronize | process_query_limited_information,
+        synchronize,
         False,
         pid,
     )
@@ -736,15 +735,26 @@ def _windows_process_live(pid: int, *, _kernel32: Any | None = None) -> bool | N
 def _process_instance_live(pid: int, process_started_at: float) -> bool:
     if pid <= 0:
         return False
+    windows_live: bool | None = None
+    if sys.platform == "win32":
+        try:
+            windows_live = _windows_process_live(pid)
+        except OSError:
+            windows_live = None
+        if windows_live is False:
+            # A signaled process object proves that no recorder is live at PID.
+            # This check must precede psutil because Windows can retain the dead
+            # object while denying later metadata queries for it.
+            return False
     try:
         process = psutil.Process(pid)
         actual = process.create_time()
         if actual != process_started_at:
             return False
         if sys.platform == "win32":
-            windows_live = _windows_process_live(pid)
-            # Failure to open or query the object is not proof that it is stale.
-            return True if windows_live is None else windows_live
+            # A live or unknown kernel result plus the exact creation identity is
+            # conservatively live. Only a signaled object authorizes cleanup.
+            return True
         if not process.is_running():
             return False
         if process.status() in {psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE}:
