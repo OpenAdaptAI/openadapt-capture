@@ -370,7 +370,7 @@ def _set_and_verify_windows_owner_acl(path: Path) -> None:
     protected_dacl_security_information = 0x80000000
     security_descriptor = ctypes.c_void_p()
     descriptor_size = wintypes.ULONG()
-    sddl = f"D:P(A;;GA;;;{sid})"
+    sddl = f"O:{sid}D:P(A;;GA;;;{sid})"
     if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
         sddl,
         sddl_revision_1,
@@ -381,7 +381,9 @@ def _set_and_verify_windows_owner_acl(path: Path) -> None:
     try:
         if not advapi32.SetFileSecurityW(
             str(path),
-            dacl_security_information | protected_dacl_security_information,
+            owner_security_information
+            | dacl_security_information
+            | protected_dacl_security_information,
             security_descriptor,
         ):
             raise OSError(ctypes.get_last_error(), f"Cannot protect {path}")
