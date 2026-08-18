@@ -741,14 +741,14 @@ def _process_instance_live(pid: int, process_started_at: float) -> bool:
         actual = process.create_time()
         if actual != process_started_at:
             return False
-        if not process.is_running():
-            return False
-        if process.status() in {psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE}:
-            return False
         if sys.platform == "win32":
             windows_live = _windows_process_live(pid)
             # Failure to open or query the object is not proof that it is stale.
             return True if windows_live is None else windows_live
+        if not process.is_running():
+            return False
+        if process.status() in {psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE}:
+            return False
         try:
             process.wait(timeout=0)
         except psutil.TimeoutExpired:

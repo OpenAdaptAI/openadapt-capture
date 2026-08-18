@@ -498,10 +498,10 @@ def test_exited_but_inspectable_process_is_not_live(
             return started_at
 
         def is_running(self) -> bool:
-            return True
+            raise AssertionError("Windows must use the kernel process signal")
 
         def status(self) -> str:
-            return psutil.STATUS_RUNNING
+            raise AssertionError("Windows must use the kernel process signal")
 
     monkeypatch.setattr(control.psutil, "Process", lambda _pid: ExitedProcess())
     monkeypatch.setattr(control.sys, "platform", "win32")
@@ -520,10 +520,10 @@ def test_exact_running_process_instance_is_live(
             return started_at
 
         def is_running(self) -> bool:
-            return True
+            raise AssertionError("Windows must use the kernel process signal")
 
         def status(self) -> str:
-            return psutil.STATUS_RUNNING
+            raise AssertionError("Windows must use the kernel process signal")
 
     monkeypatch.setattr(control.psutil, "Process", lambda _pid: RunningProcess())
     monkeypatch.setattr(control.sys, "platform", "win32")
