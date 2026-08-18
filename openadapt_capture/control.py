@@ -277,6 +277,27 @@ def _set_and_verify_windows_owner_acl(path: Path) -> None:
 
     from ctypes import wintypes
 
+    class _AclSizeInformation(ctypes.Structure):
+        _fields_ = [
+            ("ace_count", wintypes.DWORD),
+            ("acl_bytes_in_use", wintypes.DWORD),
+            ("acl_bytes_free", wintypes.DWORD),
+        ]
+
+    class _AceHeader(ctypes.Structure):
+        _fields_ = [
+            ("ace_type", wintypes.BYTE),
+            ("ace_flags", wintypes.BYTE),
+            ("ace_size", wintypes.WORD),
+        ]
+
+    class _AccessAllowedAce(ctypes.Structure):
+        _fields_ = [
+            ("header", _AceHeader),
+            ("mask", wintypes.DWORD),
+            ("sid_start", wintypes.DWORD),
+        ]
+
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
@@ -300,19 +321,51 @@ def _set_and_verify_windows_owner_acl(path: Path) -> None:
         ctypes.POINTER(wintypes.DWORD),
     ]
     advapi32.GetFileSecurityW.restype = wintypes.BOOL
-    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+    advapi32.ConvertStringSidToSidW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi32.GetSecurityDescriptorOwner.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    advapi32.GetSecurityDescriptorOwner.restype = wintypes.BOOL
+    advapi32.GetSecurityDescriptorDacl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+    advapi32.GetSecurityDescriptorControl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ushort),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+    advapi32.GetAclInformation.argtypes = [
+        ctypes.c_void_p,
         ctypes.c_void_p,
         wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.LPWSTR),
-        ctypes.POINTER(wintypes.ULONG),
+        ctypes.c_int,
     ]
-    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.GetAclInformation.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetAce.restype = wintypes.BOOL
+    advapi32.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    advapi32.EqualSid.restype = wintypes.BOOL
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     kernel32.LocalFree.restype = ctypes.c_void_p
 
     sid = _windows_current_user_sid()
     sddl_revision_1 = 1
+    owner_security_information = 0x00000001
     dacl_security_information = 0x00000004
     protected_dacl_security_information = 0x80000000
     security_descriptor = ctypes.c_void_p()
@@ -335,45 +388,88 @@ def _set_and_verify_windows_owner_acl(path: Path) -> None:
     finally:
         kernel32.LocalFree(security_descriptor)
 
-    needed = wintypes.DWORD()
-    advapi32.GetFileSecurityW(
-        str(path),
-        dacl_security_information,
-        None,
-        0,
-        ctypes.byref(needed),
-    )
-    if not needed.value:
-        raise OSError(ctypes.get_last_error(), f"Cannot inspect the DACL for {path}")
-    current = ctypes.create_string_buffer(needed.value)
-    if not advapi32.GetFileSecurityW(
-        str(path),
-        dacl_security_information,
-        current,
-        needed,
-        ctypes.byref(needed),
-    ):
-        raise OSError(ctypes.get_last_error(), f"Cannot inspect the DACL for {path}")
-    rendered = wintypes.LPWSTR()
-    rendered_length = wintypes.ULONG()
-    if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
-        current,
-        sddl_revision_1,
-        dacl_security_information,
-        ctypes.byref(rendered),
-        ctypes.byref(rendered_length),
-    ):
-        raise OSError(ctypes.get_last_error(), f"Cannot verify the DACL for {path}")
+    current_sid = ctypes.c_void_p()
+    if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(current_sid)):
+        raise OSError(ctypes.get_last_error(), "Cannot parse the current-user SID")
     try:
-        normalized = (rendered.value or "").upper()
-        expected = {
-            f"D:P(A;;GA;;;{sid})".upper(),
-            f"D:P(A;;FA;;;{sid})".upper(),
-        }
-        if normalized not in expected:
+        security_information = owner_security_information | dacl_security_information
+        needed = wintypes.DWORD()
+        advapi32.GetFileSecurityW(
+            str(path),
+            security_information,
+            None,
+            0,
+            ctypes.byref(needed),
+        )
+        if not needed.value:
+            raise OSError(ctypes.get_last_error(), f"Cannot inspect the DACL for {path}")
+        current = ctypes.create_string_buffer(needed.value)
+        if not advapi32.GetFileSecurityW(
+            str(path),
+            security_information,
+            current,
+            needed,
+            ctypes.byref(needed),
+        ):
+            raise OSError(ctypes.get_last_error(), f"Cannot inspect the DACL for {path}")
+
+        owner_sid = ctypes.c_void_p()
+        owner_defaulted = wintypes.BOOL()
+        if not advapi32.GetSecurityDescriptorOwner(
+            current,
+            ctypes.byref(owner_sid),
+            ctypes.byref(owner_defaulted),
+        ) or not owner_sid.value or not advapi32.EqualSid(owner_sid, current_sid):
+            raise PermissionError(f"The current user does not own {path}")
+
+        dacl_present = wintypes.BOOL()
+        dacl_defaulted = wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        if not advapi32.GetSecurityDescriptorDacl(
+            current,
+            ctypes.byref(dacl_present),
+            ctypes.byref(dacl),
+            ctypes.byref(dacl_defaulted),
+        ):
+            raise OSError(ctypes.get_last_error(), f"Cannot read the DACL for {path}")
+        if not dacl_present.value or not dacl.value:
+            raise PermissionError(f"The DACL for {path} is absent or unrestricted")
+
+        control = ctypes.c_ushort()
+        revision = wintypes.DWORD()
+        if not advapi32.GetSecurityDescriptorControl(
+            current,
+            ctypes.byref(control),
+            ctypes.byref(revision),
+        ):
+            raise OSError(ctypes.get_last_error(), f"Cannot inspect DACL control for {path}")
+        if not control.value & 0x1000:  # SE_DACL_PROTECTED
+            raise PermissionError(f"The DACL for {path} permits inherited access")
+
+        acl_size = _AclSizeInformation()
+        if not advapi32.GetAclInformation(
+            dacl,
+            ctypes.byref(acl_size),
+            ctypes.sizeof(acl_size),
+            2,  # AclSizeInformation
+        ):
+            raise OSError(ctypes.get_last_error(), f"Cannot inspect DACL entries for {path}")
+        if acl_size.ace_count != 1:
             raise PermissionError(f"The DACL for {path} is not current-user-only")
+
+        ace_pointer = ctypes.c_void_p()
+        if not advapi32.GetAce(dacl, 0, ctypes.byref(ace_pointer)):
+            raise OSError(ctypes.get_last_error(), f"Cannot inspect the DACL entry for {path}")
+        ace = ctypes.cast(ace_pointer, ctypes.POINTER(_AccessAllowedAce)).contents
+        if ace.header.ace_type != 0 or ace.header.ace_flags != 0:  # ACCESS_ALLOWED_ACE_TYPE
+            raise PermissionError(f"The DACL for {path} has an invalid access entry")
+        if ace.mask not in {0x10000000, 0x001F01FF}:  # GENERIC_ALL or FILE_ALL_ACCESS
+            raise PermissionError(f"The DACL for {path} does not grant exact full access")
+        ace_sid = ctypes.c_void_p(ace_pointer.value + _AccessAllowedAce.sid_start.offset)
+        if not advapi32.EqualSid(ace_sid, current_sid):
+            raise PermissionError(f"The DACL for {path} grants access to another identity")
     finally:
-        kernel32.LocalFree(ctypes.cast(rendered, ctypes.c_void_p))
+        kernel32.LocalFree(current_sid)
 
 
 def _protect_path(path: Path, *, directory: bool) -> None:
