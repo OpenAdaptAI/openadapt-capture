@@ -8,11 +8,9 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-try:
-    from scripts.check_changelog import validate_documents
-except ModuleNotFoundError as exc:  # Direct execution: python scripts/verify_distribution.py
-    if exc.name != "scripts":
-        raise
+if __package__:
+    from .check_changelog import validate_documents
+else:  # Direct execution: python scripts/verify_distribution.py
     from check_changelog import validate_documents
 
 FORBIDDEN_DEPENDENCIES = ("oa-atomacos", "pynput")
