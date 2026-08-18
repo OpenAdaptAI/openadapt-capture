@@ -22,8 +22,8 @@ Key responsibilities:
 # Install the package
 uv add openadapt-capture
 
-# Install with audio support (large download)
-uv add "openadapt-capture[audio]"
+# Install with on-device transcription support (large download)
+uv add "openadapt-capture[transcribe-fast]"
 
 # Run tests (exclude browser bridge tests which need websockets fixtures)
 uv run pytest tests/ -v --ignore=tests/test_browser_bridge.py
