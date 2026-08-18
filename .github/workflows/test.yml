@@ -30,6 +30,17 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          if command -v ffmpeg >/dev/null 2>&1 \
+            && ldconfig -p | grep -Fq 'libportaudio.so.2'; then
+            echo 'Using the runner-provided FFmpeg and PortAudio libraries.'
+            exit 0
+          fi
+
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i \
+              's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+              /etc/apt/apt-mirrors.txt
+          fi
           sudo apt-get \
             -o Acquire::Retries=3 \
             -o Acquire::http::Timeout=30 \
