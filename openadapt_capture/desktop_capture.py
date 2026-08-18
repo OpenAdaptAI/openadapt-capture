@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from numbers import Integral
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
 class DesktopCaptureError(RuntimeError):
@@ -40,10 +43,28 @@ class DesktopCaptureScope:
     width: int
     height: int
     monitors: tuple[dict[str, int], ...]
+    _topology_reader: Callable[[], Iterable[Mapping[str, Any]]] | None = dataclass_field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    _topology_lock: threading.Lock = dataclass_field(
+        default_factory=threading.Lock,
+        compare=False,
+        repr=False,
+    )
+    _last_topology_check: list[float] = dataclass_field(
+        default_factory=lambda: [0.0],
+        compare=False,
+        repr=False,
+    )
 
     @classmethod
     def from_monitors(
-        cls, monitors: Iterable[Mapping[str, Any]]
+        cls,
+        monitors: Iterable[Mapping[str, Any]],
+        *,
+        topology_reader: Callable[[], Iterable[Mapping[str, Any]]] | None = None,
     ) -> "DesktopCaptureScope":
         values = list(monitors)
         if len(values) < 2:
@@ -76,29 +97,51 @@ class DesktopCaptureScope:
             combined_right,
             combined_bottom,
         ):
-            raise DesktopCaptureError(
-                "physical monitors do not span the combined virtual desktop"
-            )
+            raise DesktopCaptureError("physical monitors do not span the combined virtual desktop")
         return cls(
             left=combined["left"],
             top=combined["top"],
             width=combined["width"],
             height=combined["height"],
             monitors=physical,
+            _topology_reader=topology_reader,
         )
 
     @classmethod
     def current(cls) -> "DesktopCaptureScope":
-        """Read the current combined desktop without retaining an MSS handle."""
+        """Read and retain a live-check contract for the combined desktop."""
 
-        import mss
+        return cls.from_monitors(
+            _read_current_monitors(),
+            topology_reader=_read_current_monitors,
+        )
 
-        with mss.mss() as capture:
-            return cls.from_monitors(capture.monitors)
+    def assert_current(self, *, force: bool = False) -> None:
+        """Reject any display topology change after recording starts.
+
+        A topology can change its origin or monitor layout without changing the
+        combined frame size. A size-only video check cannot detect that case,
+        and stale translation would bind input to the wrong pixels.
+        """
+
+        if self._topology_reader is None:
+            return
+        with self._topology_lock:
+            now = time.monotonic()
+            if not force and now - self._last_topology_check[0] < 0.05:
+                return
+            current = type(self).from_monitors(self._topology_reader())
+            if current != self:
+                raise DesktopCaptureError(
+                    "virtual desktop topology changed during recording; "
+                    f"expected {self.snapshot()}, got {current.snapshot()}"
+                )
+            self._last_topology_check[0] = now
 
     def translate(self, x: float, y: float) -> tuple[float, float]:
         """Translate global input to combined-frame pixels."""
 
+        self.assert_current()
         return (x - self.left, y - self.top)
 
     def snapshot(self) -> dict[str, Any]:
@@ -119,3 +162,15 @@ class DesktopCaptureScope:
                 for monitor in self.monitors
             ],
         }
+
+
+def _read_current_monitors() -> list[Mapping[str, Any]]:
+    """Read fresh MSS topology without reusing its cached monitor inventory."""
+
+    # Lazy import preserves the headless-import contract. MSS caches its
+    # ``monitors`` property for the lifetime of an instance, so a process-local
+    # screenshot handle cannot detect a hot-plug or same-size rearrangement.
+    import mss
+
+    with mss.mss() as capture:
+        return list(capture.monitors)

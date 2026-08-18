@@ -20,7 +20,6 @@ Usage:
 """
 
 import io
-import json
 import multiprocessing
 import os
 import queue
@@ -62,7 +61,6 @@ from openadapt_capture.structural import (
     observe_structural_action,
 )
 from openadapt_capture.window_capture import (
-    WindowCaptureError,
     WindowCaptureScope,
     build_window_scope,
 )
@@ -71,21 +69,8 @@ CoordinateScope = WindowCaptureScope | DesktopCaptureScope
 
 try:
     import soundfile
-    import websockets.sync.server
 except ImportError:
     soundfile = None
-    websockets = None
-
-def set_browser_mode(
-    mode: str, websocket: "websockets.sync.server.ServerConnection"
-) -> None:
-    """Send a message to the browser extension to set the mode."""
-    logger.info(f"{type(websocket)=}")
-    VALID_MODES = ("idle", "record", "replay")
-    assert mode in VALID_MODES, f"{mode=} not in {VALID_MODES=}"
-    message = json.dumps({"type": "SET_MODE", "mode": mode})
-    logger.info(f"sending {message=}")
-    websocket.send(message)
 
 
 def _send_profiling_via_wormhole(profile_path: str, timeout: int = 60) -> None:
@@ -122,6 +107,11 @@ Event = namedtuple("Event", ("timestamp", "type", "data"))
 
 EVENT_TYPES = ("screen", "action", "window", "browser")
 LOG_LEVEL = "INFO"
+BROWSER_RECORDING_GUIDANCE = (
+    "The Chrome-extension WebSocket prototype is not part of the supported "
+    "openadapt-capture runtime. Use openadapt-flow Playwright launch or attach "
+    "recording instead."
+)
 
 
 class _ScreenTimingStats:
@@ -173,7 +163,6 @@ STARTUP_WAIT_POLL_SECONDS = 0.1
 PRE_READY_TASK_JOIN_TIMEOUT_SECONDS = 2.0
 
 stop_sequence_detected = False
-ws_server_instance = None
 
 
 def _run_task_fail_loud(
@@ -210,11 +199,7 @@ def _wait_for_tasks_started(
             logger.info("Recording startup cancelled before all tasks were ready")
             return False
 
-        waiting_for = [
-            name
-            for name, event in task_started_events.items()
-            if not event.is_set()
-        ]
+        waiting_for = [name for name, event in task_started_events.items() if not event.is_set()]
         if not waiting_for:
             return True
 
@@ -224,17 +209,12 @@ def _wait_for_tasks_started(
             if name in task_by_name and not task_by_name[name].is_alive()
         ]
         if stopped_before_ready:
-            logger.error(
-                "Recording tasks exited before readiness: "
-                f"{stopped_before_ready}"
-            )
+            logger.error(f"Recording tasks exited before readiness: {stopped_before_ready}")
             terminate_processing.set()
             return False
 
         logger.info(f"Waiting for tasks to start: {waiting_for}")
-        logger.info(
-            f"Started tasks: {expected_starts - len(waiting_for)}/{expected_starts}"
-        )
+        logger.info(f"Started tasks: {expected_starts - len(waiting_for)}/{expected_starts}")
         terminate_processing.wait(STARTUP_WAIT_POLL_SECONDS)
 
 
@@ -266,9 +246,7 @@ def _join_tasks(
         # Python cannot forcibly stop threads; recorder-owned threads are daemons
         # and all receive terminate_processing before this helper is called.
         if isinstance(task, multiprocessing.process.BaseProcess):
-            logger.warning(
-                f"terminating {task_name!r} after pre-ready shutdown timeout"
-            )
+            logger.warning(f"terminating {task_name!r} after pre-ready shutdown timeout")
             task.terminate()
             task.join(timeout=0.5)
 
@@ -285,13 +263,11 @@ def _raise_for_failed_processes(task_by_name: dict[str, Any]) -> None:
     failures = {
         name: task.exitcode
         for name, task in task_by_name.items()
-        if isinstance(task, multiprocessing.process.BaseProcess)
-        and task.exitcode not in (None, 0)
+        if isinstance(task, multiprocessing.process.BaseProcess) and task.exitcode not in (None, 0)
     }
     if failures:
         detail = ", ".join(
-            f"{name} (exit code {exitcode})"
-            for name, exitcode in sorted(failures.items())
+            f"{name} (exit code {exitcode})" for name, exitcode in sorted(failures.items())
         )
         raise RuntimeError(f"Recording child process failed: {detail}")
 
@@ -719,14 +695,12 @@ def video_pre_callback(
     else:
         # TODO XXX replace with utils.get_monitor_dims() once fixed
         monitor_width, monitor_height = utils.take_screenshot().size
-    video_container, video_stream, video_start_timestamp = (
-        video.initialize_video_writer(
-            video_file_path,
-            monitor_width,
-            monitor_height,
-            timeout_seconds=timeout_seconds,
-            preflight_provision=provision,
-        )
+    video_container, video_stream, video_start_timestamp = video.initialize_video_writer(
+        video_file_path,
+        monitor_width,
+        monitor_height,
+        timeout_seconds=timeout_seconds,
+        preflight_provision=provision,
     )
     crud.update_video_start_time(db, recording, video_start_timestamp)
     return {
@@ -799,8 +773,7 @@ def write_video_event(
         # contract. Stop instead of emitting a complete-looking video with a
         # silent evidence gap.
         raise ValueError(
-            f"video frame {screenshot_image.size} differs from fixed stream "
-            f"{stream_size}"
+            f"video frame {screenshot_image.size} differs from fixed stream {stream_size}"
         )
     force_key_frame = last_pts == 0
     # ensure that the first frame is available (otherwise occasionally it is not)
@@ -880,13 +853,10 @@ def trigger_action_event(
             element_state = {}
         action_event_args["element_state"] = element_state
         if coordinate_scope is not None:
-            try:
-                wx, wy = coordinate_scope.translate(x, y)
-            except WindowCaptureError as exc:
-                # No frame captured yet: recording a global coordinate in a
-                # window-scoped session would silently mix coordinate spaces.
-                logger.warning(f"Discarding input before first window frame: {exc}")
-                return
+            # The recorder captures and validates its first scoped frame before
+            # starting input. A translation failure after that boundary means
+            # evidence is incomplete and must terminate the session.
+            wx, wy = coordinate_scope.translate(x, y)
             action_event_args["mouse_x"] = wx
             action_event_args["mouse_y"] = wy
     event_q.put(
@@ -1049,6 +1019,7 @@ def read_screen_events(
     started_event: threading.Event,
     _screen_timing: _ScreenTimingStats | None = None,
     window_scope: WindowCaptureScope | None = None,
+    desktop_scope: DesktopCaptureScope | None = None,
 ) -> None:
     """Read screen events and add them to the event queue.
 
@@ -1068,7 +1039,11 @@ def read_screen_events(
         started_event: Event to set once started.
         _screen_timing: If provided, record (screenshot_dur, total_dur) per iteration.
         window_scope: Optional window scope for window-pixel-space capture.
+        desktop_scope: Full-screen virtual-desktop contract. It verifies the
+            monitor topology before and after each captured frame.
     """
+    if window_scope is not None and desktop_scope is not None:
+        raise ValueError("screen reader cannot use both window and desktop scopes")
     utils.set_start_time(recording.timestamp)
 
     fps = config.SCREEN_CAPTURE_FPS
@@ -1080,15 +1055,10 @@ def read_screen_events(
     while not terminate_processing.is_set():
         t_start = time.perf_counter()
         if window_scope is not None:
-            try:
-                screenshot, window_changed = window_scope.capture_frame()
-            except WindowCaptureError as exc:
-                # Loud + recoverable: the window may be mid-move/minimized.
-                # No frame is queued (never fall back to full-screen pixels
-                # in a window-scoped recording), and we retry.
-                logger.warning(f"Window capture failed (retrying): {exc}")
-                time.sleep(0.5)
-                continue
+            # Any failed capture terminates the session. Retrying would omit a
+            # frame while input continues and could produce complete-looking
+            # evidence with a missing interval.
+            screenshot, window_changed = window_scope.capture_frame()
             if window_changed or not announced_window:
                 event_q.put(
                     Event(
@@ -1098,6 +1068,13 @@ def read_screen_events(
                     )
                 )
                 announced_window = True
+        elif desktop_scope is not None:
+            # A monitor can move or change scale while the combined frame keeps
+            # the same dimensions. Check both sides of the grab so neither the
+            # frame nor later input uses stale origin or monitor geometry.
+            desktop_scope.assert_current(force=True)
+            screenshot = utils.take_screenshot()
+            desktop_scope.assert_current(force=True)
         else:
             screenshot = utils.take_screenshot()
         t_screenshot = time.perf_counter()
@@ -1307,9 +1284,7 @@ def create_recording(
         tuple of (Recording object, db_path).
     """
     if window_capture_info is not None and desktop_capture_info is not None:
-        raise ValueError(
-            "a recording cannot declare both window and desktop capture scopes"
-        )
+        raise ValueError("a recording cannot declare both window and desktop capture scopes")
     os.makedirs(capture_dir, exist_ok=True)
     db_path = os.path.join(capture_dir, "recording.db")
 
@@ -1420,9 +1395,7 @@ def read_input_events(
             if candidate == expected:
                 stop_sequence_indices[index] += 1
             else:
-                stop_sequence_indices[index] = (
-                    1 if candidate == sequence[0].lower() else 0
-                )
+                stop_sequence_indices[index] = 1 if candidate == sequence[0].lower() else 0
             if stop_sequence_indices[index] == len(sequence):
                 stop_sequence_indices[index] = 0
                 logger.info("Stop sequence entered! Stopping recording now.")
@@ -1512,9 +1485,7 @@ def record_audio(
         audio_frames.append(indata.copy())
 
     # open InputStream and start recording while ActionEvents are recorded
-    audio_stream = sounddevice.InputStream(
-        callback=audio_callback, samplerate=16000, channels=1
-    )
+    audio_stream = sounddevice.InputStream(callback=audio_callback, samplerate=16000, channels=1)
     logger.info("Audio recording started.")
     start_timestamp = utils.get_timestamp()
     audio_stream.start()
@@ -1538,9 +1509,7 @@ def record_audio(
             "or permission may have been denied. Storing an empty transcript."
         )
         session = get_session_for_path(db_path)
-        crud.insert_audio_info(
-            session, b"", "", recording, start_timestamp, sample_rate, []
-        )
+        crud.insert_audio_info(session, b"", "", recording, start_timestamp, sample_rate, [])
         return
 
     # Concatenate into one Numpy array
@@ -1554,9 +1523,9 @@ def record_audio(
     # NOTE: the transcript is deliberately NOT logged. Narration can contain
     # names, dates of birth, and diagnoses; logging it would copy that into
     # terminal scrollback and any configured log sink.
-    logger.info("Transcription complete ({} characters).".format(
-        len(result_info.get("text") or "")
-    ))
+    logger.info(
+        "Transcription complete ({} characters).".format(len(result_info.get("text") or ""))
+    )
 
     # empty word_list if the user didn't say anything
     word_list = []
@@ -1619,105 +1588,6 @@ def _transcribe_on_device(audio: "np.ndarray", backend: str) -> dict:
     return recorder._transcribe_openai_whisper(audio, "base", True)
 
 
-@logger.catch
-@utils.trace(logger)
-def read_browser_events(
-    websocket: "websockets.sync.server.ServerConnection",
-    event_q: queue.Queue,
-    terminate_processing: Event,
-    recording: Recording,
-) -> None:
-    """Read browser events and add them to the event queue.
-
-    Params:
-        websocket: The websocket object.
-        event_q: A queue for adding browser events.
-        terminate_processing: An event to signal the termination of the process.
-        recording: The recording object.
-
-    Returns:
-        None
-    """
-    utils.set_start_time(recording.timestamp)
-
-    # set the browser mode
-    set_browser_mode("record", websocket)
-
-    logger.info("Starting Reading Browser Events ...")
-
-    while not terminate_processing.is_set():
-        try:
-            message = websocket.recv(0.01)
-        except TimeoutError:
-            continue
-        timestamp = utils.get_timestamp()
-        data = json.loads(message)
-        event_q.put(
-            Event(
-                timestamp,
-                "browser",
-                {"message": data},
-            )
-        )
-
-    set_browser_mode("idle", websocket)
-
-
-@logger.catch
-@utils.trace(logger)
-def run_browser_event_server(
-    event_q: queue.Queue,
-    terminate_processing: Event,
-    recording: Recording,
-    started_event: threading.Event,
-) -> None:
-    """Run the browser event server.
-
-    Params:
-        event_q: A queue for adding browser events.
-        terminate_processing: An event to signal the termination of the process.
-        recording: The recording object.
-        started_event: Event to set once started.
-
-    Returns:
-        None
-    """
-    global ws_server_instance
-
-    # Function to run the server in a separate thread
-    def run_server() -> None:
-        global ws_server_instance
-        with websockets.sync.server.serve(
-            lambda ws: read_browser_events(
-                ws,
-                event_q,
-                terminate_processing,
-                recording,
-            ),
-            config.BROWSER_WEBSOCKET_SERVER_IP,
-            config.BROWSER_WEBSOCKET_PORT,
-            max_size=config.BROWSER_WEBSOCKET_MAX_SIZE,
-        ) as server:
-            ws_server_instance = server
-            logger.info("WebSocket server started")
-            started_event.set()
-            server.serve_forever()
-
-    # Start the server in a separate thread
-    server_thread = threading.Thread(target=run_server)
-    server_thread.start()
-
-    # Wait for a termination signal
-    terminate_processing.wait()
-    logger.info("Termination signal received, shutting down server")
-
-    if ws_server_instance:
-        ws_server_instance.shutdown()
-
-    # Ensure the server thread is terminated cleanly
-    server_thread.join()
-
-
 @logger.catch(reraise=True)
 @utils.trace(logger)
 def record(
@@ -1743,7 +1613,7 @@ def record(
     window_title: str | None = None,
     structural_observer: StructuralObserver | None = None,
 ) -> None:
-    """Record Screenshots/ActionEvents/WindowEvents/BrowserEvents.
+    """Record native screenshots, action events, and window events.
 
     Args:
         task_description: A text description of the task to be recorded.
@@ -1761,6 +1631,12 @@ def record(
             omitted, the platform factory follows
             ``RECORD_STRUCTURAL_OBSERVATIONS``.
     """
+    if config.RECORD_BROWSER_EVENTS:
+        # Fail before encoder checks, display access, database creation, or any
+        # listener bind. The source-only extension bridge has no governed
+        # replay, authentication, or source-time secret exclusion contract.
+        raise RuntimeError(BROWSER_RECORDING_GUIDANCE)
+
     assert config.RECORD_VIDEO or config.RECORD_IMAGES, (
         config.RECORD_VIDEO,
         config.RECORD_IMAGES,
@@ -1825,12 +1701,8 @@ def record(
     recording, db_path = create_recording(
         task_description,
         capture_dir,
-        window_capture_info=(
-            window_scope.snapshot() if window_scope is not None else None
-        ),
-        desktop_capture_info=(
-            desktop_scope.snapshot() if desktop_scope is not None else None
-        ),
+        window_capture_info=(window_scope.snapshot() if window_scope is not None else None),
+        desktop_capture_info=(desktop_scope.snapshot() if desktop_scope is not None else None),
     )
     recording_timestamp = recording.timestamp
 
@@ -1863,9 +1735,7 @@ def record(
                     event_q,
                     terminate_processing,
                     recording,
-                    task_started_events.setdefault(
-                        "window_event_reader", threading.Event()
-                    ),
+                    task_started_events.setdefault("window_event_reader", threading.Event()),
                 ),
                 terminate_processing,
                 task_errors,
@@ -1874,32 +1744,23 @@ def record(
         window_event_reader.start()
         task_by_name["window_event_reader"] = window_event_reader
 
-    if config.RECORD_BROWSER_EVENTS:
-        browser_event_reader = threading.Thread(
-            target=run_browser_event_server,
-            daemon=True,
-            args=(
+    screen_event_reader = threading.Thread(
+        target=_run_task_fail_loud,
+        daemon=True,
+        args=(
+            "screen_event_reader",
+            read_screen_events,
+            (
                 event_q,
                 terminate_processing,
                 recording,
-                task_started_events.setdefault(
-                    "browser_event_reader", threading.Event()
-                ),
+                task_started_events.setdefault("screen_event_reader", threading.Event()),
+                _screen_timing,
+                window_scope,
+                desktop_scope,
             ),
-        )
-        browser_event_reader.start()
-        task_by_name["browser_event_reader"] = browser_event_reader
-
-    screen_event_reader = threading.Thread(
-        target=read_screen_events,
-        daemon=True,
-        args=(
-            event_q,
             terminate_processing,
-            recording,
-            task_started_events.setdefault("screen_event_reader", threading.Event()),
-            _screen_timing,
-            window_scope,
+            task_errors,
         ),
     )
     screen_event_reader.start()
@@ -1973,33 +1834,11 @@ def record(
             recording,
             db_path,
             terminate_processing,
-            task_started_events.setdefault(
-                "screen_event_writer", multiprocessing.Event()
-            ),
+            task_started_events.setdefault("screen_event_writer", multiprocessing.Event()),
         ),
     )
     screen_event_writer.start()
     task_by_name["screen_event_writer"] = screen_event_writer
-
-    if config.RECORD_BROWSER_EVENTS:
-        browser_event_writer = multiprocessing.Process(
-            target=write_events,
-            args=(
-                "browser",
-                write_browser_event,
-                browser_write_q,
-                num_browser_events,
-                perf_q,
-                recording,
-                db_path,
-                terminate_processing,
-                task_started_events.setdefault(
-                    "browser_event_writer", multiprocessing.Event()
-                ),
-            ),
-        )
-        browser_event_writer.start()
-        task_by_name["browser_event_writer"] = browser_event_writer
 
     action_event_writer = multiprocessing.Process(
         target=utils.WrapStdout(write_events),
@@ -2012,9 +1851,7 @@ def record(
             recording,
             db_path,
             terminate_processing,
-            task_started_events.setdefault(
-                "action_event_writer", multiprocessing.Event()
-            ),
+            task_started_events.setdefault("action_event_writer", multiprocessing.Event()),
         ),
     )
     action_event_writer.start()
@@ -2032,9 +1869,7 @@ def record(
                 recording,
                 db_path,
                 terminate_processing,
-                task_started_events.setdefault(
-                    "window_event_writer", multiprocessing.Event()
-                ),
+                task_started_events.setdefault("window_event_writer", multiprocessing.Event()),
             ),
         )
         window_event_writer.start()
@@ -2059,9 +1894,7 @@ def record(
                     # Window-scoped frames are the window's pixels, not the
                     # monitor's: size the stream from the initial frame.
                     frame_size=(
-                        initial_window_frame.size
-                        if initial_window_frame is not None
-                        else None
+                        initial_window_frame.size if initial_window_frame is not None else None
                     ),
                     provision=video_provision,
                     timeout_seconds=config.VIDEO_FFMPEG_TIMEOUT_SECONDS,
@@ -2079,9 +1912,7 @@ def record(
                 recording,
                 db_path,
                 terminate_processing,
-                task_started_events.setdefault(
-                    "audio_event_writer", multiprocessing.Event()
-                ),
+                task_started_events.setdefault("audio_event_writer", multiprocessing.Event()),
             ),
         )
         audio_recorder.start()
@@ -2095,9 +1926,7 @@ def record(
             recording,
             db_path,
             terminate_perf_event,
-            task_started_events.setdefault(
-                "perf_stats_writer", multiprocessing.Event()
-            ),
+            task_started_events.setdefault("perf_stats_writer", multiprocessing.Event()),
         ),
     )
     perf_stats_writer.start()
@@ -2136,9 +1965,7 @@ def record(
     if startup_ready:
         for _ in range(5):
             logger.info("*" * 40)
-        logger.info(
-            "All readers and writers have started. Waiting for input events..."
-        )
+        logger.info("All readers and writers have started. Waiting for input events...")
 
         if status_pipe:
             status_pipe.send({"type": "record.started"})
@@ -2159,19 +1986,15 @@ def record(
         collect_stats(performance_snapshots)
         log_memory_usage(_tracker, performance_snapshots)
 
-    pre_ready_timeout = (
-        None if startup_ready else PRE_READY_TASK_JOIN_TIMEOUT_SECONDS
-    )
+    pre_ready_timeout = None if startup_ready else PRE_READY_TASK_JOIN_TIMEOUT_SECONDS
     _join_tasks(
         task_by_name,
         [
             "window_event_reader",
-            "browser_event_reader",
             "screen_event_reader",
             "input_event_reader",
             "event_processor",
             "screen_event_writer",
-            "browser_event_writer",
             "action_event_writer",
             "window_event_writer",
             "video_writer",
@@ -2195,13 +2018,19 @@ def record(
         add_exception_note(task_error, f"recording task {task_name!r} failed")
         raise task_error
     _raise_for_failed_processes(task_by_name)
+    if desktop_scope is not None:
+        # Close the interval between the last captured frame and operator stop.
+        # A topology change in that interval still invalidates the session.
+        desktop_scope.assert_current(force=True)
 
     if config.PLOT_PERFORMANCE and startup_ready:
         from openadapt_capture import plotting
 
         session = get_session_for_path(db_path)
         plotting.plot_performance(
-            session, recording, save_dir=capture_dir,
+            session,
+            recording,
+            save_dir=capture_dir,
         )
 
     logger.info(f"Saved {recording_timestamp=}")
@@ -2247,6 +2076,7 @@ def record(
     _profile_path = os.path.join(capture_dir, "profiling.json")
     try:
         import json as _json
+
         with open(_profile_path, "w") as _f:
             _json.dump(_profile_data, _f, indent=2)
         logger.info(f"Profiling saved to {_profile_path}")
@@ -2261,13 +2091,17 @@ def record(
             print(f"  {k}: {v} events ({rate:.1f}/s)")
         if _screen_timing:
             st = _profile_data["screen_timing"]
-            print(f"  screenshot: avg={st['screenshot_avg_ms']}ms "
-                  f"max={st['screenshot_max_ms']}ms "
-                  f"min={st['screenshot_min_ms']}ms")
-        print(f"Config: WINDOW_DATA={config.RECORD_WINDOW_DATA} "
-              f"VIDEO={config.RECORD_VIDEO} "
-              f"PLOT_PERF={config.PLOT_PERFORMANCE} "
-              f"FPS={config.SCREEN_CAPTURE_FPS}")
+            print(
+                f"  screenshot: avg={st['screenshot_avg_ms']}ms "
+                f"max={st['screenshot_max_ms']}ms "
+                f"min={st['screenshot_min_ms']}ms"
+            )
+        print(
+            f"Config: WINDOW_DATA={config.RECORD_WINDOW_DATA} "
+            f"VIDEO={config.RECORD_VIDEO} "
+            f"PLOT_PERF={config.PLOT_PERFORMANCE} "
+            f"FPS={config.SCREEN_CAPTURE_FPS}"
+        )
         print("=========================\n")
 
         # Auto-send profiling via wormhole if requested
@@ -2344,6 +2178,11 @@ class Recorder:
         self.capture_dir = str(Path(capture_dir).resolve())
         self.task_description = task_description
         self._send_profile = send_profile
+
+        if capture_browser_events:
+            # Preserve a clear error for callers of the former keyword while
+            # preventing the unsupported server from reaching record().
+            raise ValueError(BROWSER_RECORDING_GUIDANCE)
 
         # Validate the window spec up front (loud, before any thread starts).
         window_target = WindowTarget.from_spec(window)
@@ -2446,7 +2285,8 @@ class Recorder:
     def __enter__(self) -> "Recorder":
         # Start status drain thread
         self._status_thread = threading.Thread(
-            target=self._drain_status_pipe, daemon=True,
+            target=self._drain_status_pipe,
+            daemon=True,
         )
         self._status_thread.start()
 
@@ -2465,8 +2305,7 @@ class Recorder:
         if self._worker_error is not None:
             if exc_val is not None:
                 add_exception_note(
-                    exc_val,
-                    f"the recorder worker also failed: {self._worker_error!r}"
+                    exc_val, f"the recorder worker also failed: {self._worker_error!r}"
                 )
             else:
                 raise self._worker_error

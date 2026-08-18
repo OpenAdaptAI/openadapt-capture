@@ -14,16 +14,19 @@ on an interactive macOS/Windows desktop (e.g. the Parallels rig):
 """
 
 import os
+import queue
 import sys
+import threading
 import time
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 
 from openadapt_capture.capture import CaptureSession
 from openadapt_capture.db import create_db, crud
-from openadapt_capture.recorder import Recorder
+from openadapt_capture.recorder import Recorder, read_screen_events
 from openadapt_capture.window_capture import (
     TargetWindow,
     WindowCaptureError,
@@ -250,10 +253,42 @@ class TestWindowCaptureScope:
         scope.capture_frame()
         assert scope.translate(310.0, 170.0) == (420.0, 240.0)
 
+    def test_resolve_does_not_mix_new_bounds_with_previous_frame(self, scope, fake):
+        scope.capture_frame()
+        assert scope.translate(310.0, 170.0) == (20.0, 40.0)
+
+        fake.bounds = (100.0, 50.0, 800.0, 600.0)
+        scope.resolve()
+
+        # A resolver poll alone cannot commit geometry. Translation changes
+        # only after the corresponding frame has been captured.
+        assert scope.translate(310.0, 170.0) == (20.0, 40.0)
+        scope.capture_frame()
+        assert scope.translate(310.0, 170.0) == (420.0, 240.0)
+
+    def test_window_identity_change_terminates_scope(self, scope, fake):
+        scope.capture_frame()
+        fake.window_id = 99
+
+        with pytest.raises(WindowCaptureError, match="changed window identity"):
+            scope.capture_frame()
+
     def test_missing_window_raises_loudly(self, scope, fake):
         fake.missing = True
         with pytest.raises(WindowCaptureError, match="no window matching"):
             scope.capture_frame()
+
+    def test_screen_reader_propagates_capture_failure_without_retry(self, scope, fake):
+        fake.missing = True
+
+        with pytest.raises(WindowCaptureError, match="no window matching"):
+            read_screen_events(
+                queue.Queue(),
+                threading.Event(),
+                SimpleNamespace(timestamp=time.time()),
+                threading.Event(),
+                window_scope=scope,
+            )
 
     def test_window_event_data_matches_window_event_columns(self, scope):
         scope.capture_frame()
@@ -366,14 +401,12 @@ class TestActionTranslation:
         utils.set_start_time()
         scope.capture_frame()
         q = queue.Queue()
-        trigger_action_event(
-            q, {"name": "click", "mouse_x": 310.0, "mouse_y": 170.0}, scope
-        )
+        trigger_action_event(q, {"name": "click", "mouse_x": 310.0, "mouse_y": 170.0}, scope)
         (event,) = self._drain(q)
         assert event.data["mouse_x"] == 20.0
         assert event.data["mouse_y"] == 40.0
 
-    def test_mouse_action_before_first_frame_discarded(self, scope):
+    def test_mouse_action_before_first_frame_fails_session(self, scope):
         import queue
 
         from openadapt_capture import utils
@@ -381,10 +414,13 @@ class TestActionTranslation:
 
         utils.set_start_time()
         q = queue.Queue()
-        trigger_action_event(
-            q, {"name": "click", "mouse_x": 310.0, "mouse_y": 170.0}, scope
-        )
-        assert self._drain(q) == []  # discarded loudly, not mis-recorded
+        with pytest.raises(WindowCaptureError, match="before the first"):
+            trigger_action_event(
+                q,
+                {"name": "click", "mouse_x": 310.0, "mouse_y": 170.0},
+                scope,
+            )
+        assert self._drain(q) == []
 
     def test_key_action_unaffected(self, scope):
         import queue
@@ -449,9 +485,7 @@ class TestWindowCapturePersistence:
             "scale": 2.0,
             "viewport": [1600, 1200],
         }
-        capture_path = self._insert_recording(
-            str(tmp_path / "cap"), {"capture_window": scope_info}
-        )
+        capture_path = self._insert_recording(str(tmp_path / "cap"), {"capture_window": scope_info})
         with CaptureSession.load(capture_path) as capture:
             assert capture.window_capture == scope_info
             assert capture.window_capture["coordinate_space"] == "window_pixels"
@@ -476,9 +510,7 @@ _PLATFORM_SKIP_REASON = (
 # is no guarantee a resolvable/capturable application window exists. Run on
 # an interactive desktop (developer machine or the Parallels rig).
 _NO_INPUT_INJECTION = os.environ.get("OPENADAPT_CI_NO_INPUT_INJECTION") == "1"
-_PRODUCTION_QUALIFICATION = (
-    os.environ.get("OPENADAPT_CAPTURE_PRODUCTION_QUALIFICATION") == "1"
-)
+_PRODUCTION_QUALIFICATION = os.environ.get("OPENADAPT_CAPTURE_PRODUCTION_QUALIFICATION") == "1"
 _SESSION_SKIP_REASON = (
     "OPENADAPT_CI_NO_INPUT_INJECTION=1: non-interactive hosted-runner session "
     "has no guaranteed capturable application window (hosted CI limitation, "
@@ -499,10 +531,7 @@ def _geometry_changed(
 ) -> bool:
     """Return true only after both the position and the size change."""
     moved = abs(current[0] - original[0]) >= 1 or abs(current[1] - original[1]) >= 1
-    resized = (
-        abs(current[2] - original[2]) >= 1
-        or abs(current[3] - original[3]) >= 1
-    )
+    resized = abs(current[2] - original[2]) >= 1 or abs(current[3] - original[3]) >= 1
     return moved and resized
 
 
@@ -579,9 +608,7 @@ def _temporary_windows_geometry(window: TargetWindow):
                 original_height,
                 True,
             )
-            assert restored, (
-                f"could not restore Win32 window {window.window_id} geometry"
-            )
+            assert restored, f"could not restore Win32 window {window.window_id} geometry"
 
 
 def _macos_ax_attribute(application_services, element, name: str):
@@ -746,9 +773,7 @@ class TestWindowCaptureLive:
     """Capture a real window end to end (resolve -> frame -> translate)."""
 
     def _scope(self) -> WindowCaptureScope:
-        scope = WindowCaptureScope(
-            WindowTarget(owner=_SMOKE_OWNER, title=_SMOKE_TITLE)
-        )
+        scope = WindowCaptureScope(WindowTarget(owner=_SMOKE_OWNER, title=_SMOKE_TITLE))
         try:
             scope.resolve()
         except WindowCaptureError as exc:
@@ -804,9 +829,7 @@ class TestWindowCaptureLive:
         # Bind this test to the exact resolved application/title. This prevents
         # an owner-only selector from switching to another large window after
         # the target changes size.
-        scope = WindowCaptureScope(
-            WindowTarget(owner=target.owner, title=target.title)
-        )
+        scope = WindowCaptureScope(WindowTarget(owner=target.owner, title=target.title))
         initial_image, initial_changed = scope.capture_frame()
         assert initial_changed is True
         initial_data = scope.window_event_data()
@@ -831,9 +854,7 @@ class TestWindowCaptureLive:
             # A changed aspect ratio must be represented by a content rectangle
             # inside the fixed output viewport, not by a dropped or stretched
             # frame.
-            content_x, content_y, content_width, content_height = moved_state[
-                "content_rect"
-            ]
+            content_x, content_y, content_width, content_height = moved_state["content_rect"]
             assert 0 <= content_x < initial_viewport[0]
             assert 0 <= content_y < initial_viewport[1]
             assert 0 < content_width <= initial_viewport[0]
@@ -855,8 +876,7 @@ class TestWindowCaptureLive:
         restored_image, restored_changed, restored_data = _capture_until_bounds(
             scope,
             lambda bounds: all(
-                abs(current - original) <= 4
-                for current, original in zip(bounds, initial_bounds)
+                abs(current - original) <= 4 for current, original in zip(bounds, initial_bounds)
             ),
         )
         assert restored_changed is True
@@ -864,8 +884,6 @@ class TestWindowCaptureLive:
         assert restored_data["window_id"] == str(target.window_id)
 
     def test_live_missing_window_fails_loud(self):
-        scope = WindowCaptureScope(
-            WindowTarget(owner="no-such-app-obviously-not-running-xyz")
-        )
+        scope = WindowCaptureScope(WindowTarget(owner="no-such-app-obviously-not-running-xyz"))
         with pytest.raises(WindowCaptureError, match="no window matching"):
             scope.capture_frame()

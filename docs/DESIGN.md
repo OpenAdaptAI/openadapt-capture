@@ -24,7 +24,7 @@ operation exports it.
 | Full virtual desktop | Capture the combined MSS desktop and translate global input into that exact pixel space. |
 | One native window | Re-resolve and capture the selected window on each frame; translate input into a fixed encoded viewport. |
 | RDP or Citrix client window | Use the native window path. Treat the remote application as pixels; local accessibility APIs do not cross the remote boundary. |
-| Browser | `openadapt-flow` owns the supported Playwright recorder. The Chrome extension in this repository is an experimental observer. |
+| Browser | `openadapt-flow` owns the supported Playwright recorder. The Chrome extension and bridge in this repository are source-only development prototypes and are excluded from Capture release artifacts. |
 
 Capture supports native input observation on macOS, Windows, and X11 Linux.
 Windows can also retain UI Automation evidence at action time. The structural
@@ -175,6 +175,11 @@ It should not replace the Playwright recorder only to consolidate packages.
 The stronger ownership and redaction boundary is more important than package
 uniformity.
 
+The extension and its unauthenticated development bridge are repository-only.
+Wheel and source archives exclude the bridge and its legacy direct replay. The
+production package keeps only the passive browser-event schemas needed to read
+old local captures.
+
 ## Release qualification
 
 The production release workflow is manual and binds evidence to one exact
@@ -201,8 +206,9 @@ commit. Missing, stale, skipped, partial, or failed evidence blocks publication.
 - Windows window capture uses a screen-region grab and requires an unobstructed
   target window.
 - A display-topology change requires a new recording.
-- Browser extension capture is experimental and is not the supported browser
-  recorder.
+- Browser extension capture is a repository-only development prototype. Its
+  bridge and direct replay are not in release artifacts. It is not the
+  supported browser recorder.
 - A raw capture is sensitive and has no automatic safe-for-egress derivative.
 - Customer RDP and Citrix environments require their own task-specific
   qualification.

@@ -32,6 +32,31 @@ def test_multiple_monitor_scope_translates_negative_global_origin() -> None:
     assert scope.translate(2559, 1439) == (4479, 1439)
 
 
+def test_live_scope_rejects_same_size_origin_and_layout_change() -> None:
+    original = [
+        {"left": -1920, "top": 0, "width": 4480, "height": 1440},
+        {"left": -1920, "top": 0, "width": 1920, "height": 1080},
+        {"left": 0, "top": 0, "width": 2560, "height": 1440},
+    ]
+    current = list(original)
+    scope = DesktopCaptureScope.from_monitors(
+        original,
+        topology_reader=lambda: current,
+    )
+    assert scope.translate(-100, 50) == (1820, 50)
+
+    # The combined viewport keeps the same size. Only the global origin and
+    # physical layout move. A video-frame dimension check cannot detect this.
+    current = [
+        {"left": 0, "top": 0, "width": 4480, "height": 1440},
+        {"left": 0, "top": 0, "width": 1920, "height": 1080},
+        {"left": 1920, "top": 0, "width": 2560, "height": 1440},
+    ]
+
+    with pytest.raises(DesktopCaptureError, match="topology changed"):
+        scope.assert_current(force=True)
+
+
 def test_multiple_monitor_snapshot_is_privacy_safe_geometry() -> None:
     assert _two_monitor_scope().snapshot() == {
         "coordinate_space": "virtual_desktop_pixels",
@@ -47,9 +72,7 @@ def test_multiple_monitor_snapshot_is_privacy_safe_geometry() -> None:
 
 def test_desktop_scope_rejects_missing_physical_monitor() -> None:
     with pytest.raises(DesktopCaptureError, match="physical monitor"):
-        DesktopCaptureScope.from_monitors(
-            [{"left": 0, "top": 0, "width": 1920, "height": 1080}]
-        )
+        DesktopCaptureScope.from_monitors([{"left": 0, "top": 0, "width": 1920, "height": 1080}])
 
 
 @pytest.mark.parametrize("value", [True, 1.5, "1"])

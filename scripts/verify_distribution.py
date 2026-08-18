@@ -13,8 +13,8 @@ if __package__:
 else:  # Direct execution: python scripts/verify_distribution.py
     from check_changelog import validate_documents
 
-FORBIDDEN_DEPENDENCIES = ("oa-atomacos", "pynput")
-FORBIDDEN_SOURCE_TOKENS = ("oa_atomacos", "pynput")
+FORBIDDEN_DEPENDENCIES = ("oa-atomacos", "pynput", "websockets")
+FORBIDDEN_SOURCE_TOKENS = ("oa_atomacos", "pynput", "EXECUTE_ACTION")
 FORBIDDEN_ARCHIVE_PATHS = (
     ".env.example",
     ".github/",
@@ -24,6 +24,7 @@ FORBIDDEN_ARCHIVE_PATHS = (
     "docs/whisper-integration-plan.md",
     "scripts/",
     "tests/",
+    "openadapt_capture/browser_bridge.py",
 )
 
 
@@ -31,17 +32,14 @@ def _archive_files(path: Path) -> dict[str, bytes]:
     if path.suffix == ".whl":
         with zipfile.ZipFile(path) as archive:
             return {
-                name: archive.read(name)
-                for name in archive.namelist()
-                if not name.endswith("/")
+                name: archive.read(name) for name in archive.namelist() if not name.endswith("/")
             }
     if path.name.endswith(".tar.gz"):
         with tarfile.open(path, "r:gz") as archive:
             return {
                 member.name: extracted.read()
                 for member in archive.getmembers()
-                if member.isfile()
-                and (extracted := archive.extractfile(member)) is not None
+                if member.isfile() and (extracted := archive.extractfile(member)) is not None
             }
     raise ValueError(f"Unsupported distribution archive: {path}")
 
@@ -118,8 +116,7 @@ def verify_distribution(path: Path) -> None:
     python_sources = "\n".join(
         content.decode("utf-8")
         for name, content in files.items()
-        if name.endswith(".py")
-        and "/openadapt_capture/" in f"/{name}"
+        if name.endswith(".py") and "/openadapt_capture/" in f"/{name}"
     )
     for token in FORBIDDEN_SOURCE_TOKENS:
         assert token not in python_sources, (

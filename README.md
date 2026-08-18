@@ -68,7 +68,7 @@ Documentation for the whole stack lives at
 | Windows, macOS, and Linux demonstrations | `openadapt-capture` records native input and action-gated screen video; Windows can also retain action-time UI Automation evidence. `openadapt-flow` converts the session into compiler input. |
 | RDP and Citrix/VDI demonstrations | `openadapt-capture` records the selected client window in its own pixel space. The remote application remains externally black-box, and `openadapt-flow` converts the session into compiler input. |
 | Browser demonstrations | `openadapt-flow` uses its Playwright recorder. It can launch Chromium or attach to one existing signed-in local Chromium tab. It does not require this package. |
-| Chrome extension in this repository | Prototype alternate acquisition transport. It is not the supported recorder and must not perform direct replay. |
+| Chrome extension in this repository | Repository-only prototype. Its bridge and legacy direct replay are excluded from the wheel and source archive. It is not the supported recorder. |
 
 The supported browser path stays inside `openadapt-flow`. Playwright owns the
 browser context and can bind DOM identity, field geometry, ordered before/after
@@ -320,13 +320,16 @@ boundary. `openadapt-flow` still refuses desktop `--secret` authoring until its
 source-time field-redaction contract can prove that sensitive values were not
 retained. Review the desktop guide before recording sensitive workflows.
 
-The Chrome extension prototype can observe pages across its configured host
-permissions and can emit DOM text and keyboard events to a local WebSocket.
-It does not yet provide source-time secret exclusion, authenticated
+The repository-only Chrome extension prototype can observe pages across its
+configured host permissions. Its development bridge can emit DOM text and
+keyboard events to an unauthenticated local WebSocket and contains legacy
+direct DOM replay. These files are excluded from the package wheel and source
+archive. The production Capture API does not export the bridge, and the former
+`browser_events=True` opt-in fails before it binds a listener. The prototype
+does not provide source-time secret exclusion, authenticated
 profile/tab/document/session binding, acknowledged ordered delivery, or exact
-frame-to-event evidence. Its direct DOM replay does not use Flow's identity,
-policy, fresh-frame, and effect checks. Treat it as development code. Do not
-deploy it in a sensitive browser profile.
+frame-to-event evidence. Treat it as development code. Do not deploy it in a
+sensitive browser profile.
 
 Use Flow's supported attach recorder when an existing SSO or 2FA browser
 session is required. See the
@@ -344,10 +347,11 @@ session is required. See the
   unmapped keys instead of silently compiling an incomplete workflow.
 - Display hot-plug, rotation, resolution changes, and scale changes require a
   new recording because one media stream has one fixed virtual-desktop viewport.
-- Browser-extension installation, security hardening, and compiler integration
-  are not part of the supported browser path. Promotion requires the shared Flow
-  schema, source-time secret exclusion, authenticated and sequenced delivery,
-  exact frame binding, compiler integration, and removal of direct replay.
+- Browser-extension installation, bridge code, and direct replay are not part
+  of the published Capture artifacts or supported browser path. Promotion
+  requires the shared Flow schema, source-time secret exclusion, authenticated
+  and sequenced delivery, exact frame binding, compiler integration, and
+  removal of direct replay.
 
 See the organization-wide
 [repository lifecycle registry](https://github.com/OpenAdaptAI/.github/blob/main/REPOSITORY_LIFECYCLE.md)

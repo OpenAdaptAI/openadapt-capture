@@ -88,13 +88,10 @@ class WindowTarget:
             unknown = set(spec) - {"owner", "title"}
             if unknown:
                 raise ValueError(
-                    f"unknown window spec keys {sorted(unknown)}; "
-                    "expected {'owner', 'title'}"
+                    f"unknown window spec keys {sorted(unknown)}; expected {{'owner', 'title'}}"
                 )
             return cls(owner=spec.get("owner"), title=spec.get("title"))
-        raise TypeError(
-            f"window spec must be a dict or WindowTarget, got {type(spec).__name__}"
-        )
+        raise TypeError(f"window spec must be a dict or WindowTarget, got {type(spec).__name__}")
 
 
 @dataclass(frozen=True)
@@ -170,6 +167,7 @@ class WindowCaptureScope:
         self._source_viewport: tuple[int, int] | None = None
         self._content_rect: tuple[int, int, int, int] | None = None
         self._fit_scale: float | None = None
+        self._bound_window_id: int | None = None
         # Window of the last CAPTURED frame (not merely resolved): the
         # bounds-timeline 'changed' flag compares frame to frame, so a bare
         # resolve() (e.g. a pre-flight existence check) never suppresses the
@@ -177,7 +175,7 @@ class WindowCaptureScope:
         self._frame_window: TargetWindow | None = None
 
     def resolve(self) -> TargetWindow:
-        """Resolve the target window now, updating shared bounds.
+        """Resolve the target window without changing captured-frame geometry.
 
         Raises:
             WindowCaptureError: If no matching window is on screen.
@@ -189,8 +187,6 @@ class WindowCaptureScope:
                 f"title {self.target.title!r}; is the target application "
                 "running with a visible window?"
             )
-        with self._lock:
-            self._window = win
         return win
 
     def capture_frame(self) -> tuple["Image.Image", bool]:
@@ -212,8 +208,15 @@ class WindowCaptureScope:
         Raises:
             WindowCaptureError: If the window is gone or capture fails.
         """
-        prev = self._frame_window
+        with self._lock:
+            prev = self._frame_window
+            bound_window_id = self._bound_window_id
         win = self.resolve()
+        if bound_window_id is not None and win.window_id != bound_window_id:
+            raise WindowCaptureError(
+                "the resolved target changed window identity during recording: "
+                f"expected {bound_window_id}, got {win.window_id}"
+            )
         source_image = self._capturer(win)
         if source_image.width <= 0 or source_image.height <= 0:
             raise WindowCaptureError("window capture returned an empty frame")
@@ -233,9 +236,7 @@ class WindowCaptureScope:
         else:
             from PIL import Image
 
-            resized = source_image.resize(
-                (fitted_width, fitted_height), Image.Resampling.LANCZOS
-            )
+            resized = source_image.resize((fitted_width, fitted_height), Image.Resampling.LANCZOS)
             image = Image.new("RGB", output_viewport, color=(0, 0, 0))
             image.paste(resized, (offset_x, offset_y))
         bounds_w = win.bounds[2] or float(source_image.width)
@@ -254,6 +255,7 @@ class WindowCaptureScope:
             self._source_viewport = source_viewport
             self._content_rect = (offset_x, offset_y, fitted_width, fitted_height)
             self._fit_scale = fit_scale
+            self._bound_window_id = win.window_id
             self._frame_window = win
         changed = (
             prev is None
@@ -279,12 +281,7 @@ class WindowCaptureScope:
             scale_x = self._scale_x
             scale_y = self._scale_y
             content_rect = self._content_rect
-        if (
-            window is None
-            or scale_x is None
-            or scale_y is None
-            or content_rect is None
-        ):
+        if window is None or scale_x is None or scale_y is None or content_rect is None:
             raise WindowCaptureError(
                 "translate() called before the first captured frame; "
                 "capture_frame() must succeed before input can be scoped"
@@ -330,9 +327,7 @@ class WindowCaptureScope:
                 "scale_x": scale_x,
                 "scale_y": scale_y,
                 "viewport": list(viewport) if viewport else None,
-                "source_viewport": (
-                    list(source_viewport) if source_viewport else None
-                ),
+                "source_viewport": (list(source_viewport) if source_viewport else None),
                 "content_rect": list(content_rect) if content_rect else None,
                 "fit_scale": fit_scale,
                 "on_screen": window.on_screen,
@@ -371,9 +366,7 @@ class WindowCaptureScope:
                     "scale_x": scale_x,
                     "scale_y": scale_y,
                     "viewport": list(viewport) if viewport else None,
-                    "source_viewport": (
-                        list(source_viewport) if source_viewport else None
-                    ),
+                    "source_viewport": (list(source_viewport) if source_viewport else None),
                     "content_rect": list(content_rect) if content_rect else None,
                     "fit_scale": fit_scale,
                 }
@@ -393,8 +386,7 @@ def resolve_window(target: WindowTarget) -> TargetWindow | None:
     if sys.platform == "win32":
         return _resolve_window_windows(target)
     raise WindowCaptureError(
-        f"window-scoped capture is not supported on {sys.platform} "
-        "(supported: darwin, win32)"
+        f"window-scoped capture is not supported on {sys.platform} (supported: darwin, win32)"
     )
 
 
@@ -405,8 +397,7 @@ def capture_window(window: TargetWindow) -> "Image.Image":
     if sys.platform == "win32":
         return _capture_window_windows(window)
     raise WindowCaptureError(
-        f"window-scoped capture is not supported on {sys.platform} "
-        "(supported: darwin, win32)"
+        f"window-scoped capture is not supported on {sys.platform} (supported: darwin, win32)"
     )
 
 
@@ -422,9 +413,7 @@ def _resolve_window_macos(target: WindowTarget) -> TargetWindow | None:
 
     owner_l = target.owner.lower() if target.owner else None
     title_l = target.title.lower() if target.title else None
-    wins = Quartz.CGWindowListCopyWindowInfo(
-        Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID
-    )
+    wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID)
     best: TargetWindow | None = None
     best_area = -1.0
     for w in wins or []:
@@ -609,9 +598,7 @@ def _capture_window_windows(window: TargetWindow) -> "Image.Image":
     return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
 
 
-def build_window_scope(
-    owner: str | None, title: str | None
-) -> WindowCaptureScope | None:
+def build_window_scope(owner: str | None, title: str | None) -> WindowCaptureScope | None:
     """Build a :class:`WindowCaptureScope` when a target is configured.
 
     Central place the recorder uses to turn (possibly-empty) config values
