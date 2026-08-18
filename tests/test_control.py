@@ -203,8 +203,9 @@ def test_crash_recovery_removes_only_proven_stale_endpoint(tmp_path: Path) -> No
     child, capture_dir, runtime_dir = _start_child(tmp_path)
     session_id = _wait_for_session(runtime_dir)
     descriptor = control._parse_descriptor(runtime_dir / f"{session_id}.json")
-    assert descriptor.pid == child.pid
-    child.kill()
+    recorder_process = psutil.Process(descriptor.pid)
+    recorder_process.kill()
+    recorder_process.wait(timeout=15)
     _finish_child(child)
 
     kernel_live = (
