@@ -39,7 +39,6 @@ TERMINAL_STATE_SCHEMA_VERSION = "openadapt.capture-terminal.v1"
 TERMINAL_STATE_FILENAME = "capture-state.json"
 _MAX_MESSAGE_BYTES = 64 * 1024
 _REQUEST_CLOCK_SKEW_SECONDS = 60.0
-_PROCESS_START_TOLERANCE_SECONDS = 0.01
 _DEFAULT_TIMEOUT_SECONDS = 60.0
 _MAX_TIMEOUT_SECONDS = 15 * 60.0
 _MAX_CONTROL_REQUEST_THREADS = 16
@@ -694,22 +693,63 @@ def _parse_descriptor(path: Path) -> _ControlDescriptor:
         ) from exc
 
 
+def _windows_process_live(pid: int, *, _kernel32: Any | None = None) -> bool | None:
+    """Return exact Windows process signal state, or ``None`` if unknown."""
+
+    from ctypes import wintypes
+
+    kernel32 = _kernel32
+    if kernel32 is None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+    synchronize = 0x00100000
+    process_query_limited_information = 0x1000
+    wait_object_0 = 0x00000000
+    wait_timeout = 0x00000102
+    error_invalid_parameter = 87
+
+    handle = kernel32.OpenProcess(
+        synchronize | process_query_limited_information,
+        False,
+        pid,
+    )
+    if not handle:
+        error = ctypes.get_last_error()
+        return False if error == error_invalid_parameter else None
+    try:
+        result = int(kernel32.WaitForSingleObject(handle, 0))
+        if result == wait_object_0:
+            return False
+        if result == wait_timeout:
+            return True
+        return None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _process_instance_live(pid: int, process_started_at: float) -> bool:
     if pid <= 0:
         return False
     try:
         process = psutil.Process(pid)
         actual = process.create_time()
-        if abs(actual - process_started_at) > _PROCESS_START_TOLERANCE_SECONDS:
+        if actual != process_started_at:
             return False
         if not process.is_running():
             return False
         if process.status() in {psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE}:
             return False
+        if sys.platform == "win32":
+            windows_live = _windows_process_live(pid)
+            # Failure to open or query the object is not proof that it is stale.
+            return True if windows_live is None else windows_live
         try:
-            # On Windows, an exited process can remain inspectable while another
-            # process retains a handle to its kernel object. A zero-time wait
-            # distinguishes that object from the exact running instance.
             process.wait(timeout=0)
         except psutil.TimeoutExpired:
             return True

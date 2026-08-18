@@ -503,11 +503,9 @@ def test_exited_but_inspectable_process_is_not_live(
         def status(self) -> str:
             return psutil.STATUS_RUNNING
 
-        def wait(self, timeout: float) -> int:
-            assert timeout == 0
-            return 1
-
     monkeypatch.setattr(control.psutil, "Process", lambda _pid: ExitedProcess())
+    monkeypatch.setattr(control.sys, "platform", "win32")
+    monkeypatch.setattr(control, "_windows_process_live", lambda _pid: False)
 
     assert control._process_instance_live(123, started_at) is False
 
@@ -527,12 +525,77 @@ def test_exact_running_process_instance_is_live(
         def status(self) -> str:
             return psutil.STATUS_RUNNING
 
-        def wait(self, timeout: float) -> None:
-            raise psutil.TimeoutExpired(timeout, pid=123)
-
     monkeypatch.setattr(control.psutil, "Process", lambda _pid: RunningProcess())
+    monkeypatch.setattr(control.sys, "platform", "win32")
+    monkeypatch.setattr(control, "_windows_process_live", lambda _pid: True)
 
     assert control._process_instance_live(123, started_at) is True
+
+
+def test_windows_signaled_process_object_is_terminal_and_handle_is_closed() -> None:
+    class Kernel32:
+        closed: list[int] = []
+
+        @staticmethod
+        def OpenProcess(access: int, inherit: bool, pid: int) -> int:
+            assert access == 0x00101000
+            assert inherit is False
+            assert pid == 123
+            return 456
+
+        @staticmethod
+        def WaitForSingleObject(handle: int, timeout: int) -> int:
+            assert handle == 456
+            assert timeout == 0
+            return 0x00000000
+
+        @classmethod
+        def CloseHandle(cls, handle: int) -> bool:
+            cls.closed.append(handle)
+            return True
+
+    kernel32 = Kernel32()
+
+    assert control._windows_process_live(123, _kernel32=kernel32) is False
+    assert kernel32.closed == [456]
+
+
+@pytest.mark.parametrize("wait_result", [0x00000102, 0xFFFFFFFF])
+def test_windows_live_and_unknown_wait_results_fail_closed(wait_result: int) -> None:
+    class Kernel32:
+        closed: list[int] = []
+
+        @staticmethod
+        def OpenProcess(_access: int, _inherit: bool, _pid: int) -> int:
+            return 456
+
+        @staticmethod
+        def WaitForSingleObject(_handle: int, _timeout: int) -> int:
+            return wait_result
+
+        @classmethod
+        def CloseHandle(cls, handle: int) -> bool:
+            cls.closed.append(handle)
+            return True
+
+    kernel32 = Kernel32()
+
+    expected = True if wait_result == 0x00000102 else None
+    assert control._windows_process_live(123, _kernel32=kernel32) is expected
+    assert kernel32.closed == [456]
+
+
+def test_windows_access_denied_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Kernel32:
+        @staticmethod
+        def OpenProcess(_access: int, _inherit: bool, _pid: int) -> int:
+            return 0
+
+    monkeypatch.setattr(control.ctypes, "get_last_error", lambda: 5, raising=False)
+
+    assert control._windows_process_live(123, _kernel32=Kernel32()) is None
 
 
 def test_recorder_failure_keeps_incomplete_state_and_removes_endpoint(
