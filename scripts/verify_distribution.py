@@ -8,6 +8,13 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+try:
+    from scripts.check_changelog import validate_documents
+except ModuleNotFoundError as exc:  # Direct execution: python scripts/verify_distribution.py
+    if exc.name != "scripts":
+        raise
+    from check_changelog import validate_documents
+
 FORBIDDEN_DEPENDENCIES = ("oa-atomacos", "pynput")
 FORBIDDEN_SOURCE_TOKENS = ("oa_atomacos", "pynput")
 FORBIDDEN_ARCHIVE_PATHS = (
@@ -51,7 +58,8 @@ def _relative_archive_name(name: str) -> str:
 
 def verify_distribution(path: Path) -> None:
     files = _archive_files(path)
-    relative_names = {_relative_archive_name(name) for name in files}
+    relative_files = {_relative_archive_name(name): content for name, content in files.items()}
+    relative_names = set(relative_files)
     assert any(Path(name).name == "LICENSE" for name in files), (
         f"{path}: MIT LICENSE file is missing"
     )
@@ -64,6 +72,7 @@ def verify_distribution(path: Path) -> None:
 
     if path.name.endswith(".tar.gz"):
         required_source_files = {
+            "CHANGELOG.md",
             "LICENSE",
             "README.md",
             "pyproject.toml",
@@ -71,6 +80,13 @@ def verify_distribution(path: Path) -> None:
         }
         missing = required_source_files - relative_names
         assert not missing, f"{path}: required source files are missing: {sorted(missing)}"
+        try:
+            validate_documents(
+                relative_files["CHANGELOG.md"].decode("utf-8"),
+                relative_files["pyproject.toml"].decode("utf-8"),
+            )
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise AssertionError(f"{path}: invalid changelog contract: {exc}") from exc
 
     metadata_files = [
         content.decode("utf-8")

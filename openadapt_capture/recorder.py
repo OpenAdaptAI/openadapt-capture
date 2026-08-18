@@ -44,6 +44,7 @@ from openadapt_capture import platform, utils, video, window
 from openadapt_capture.config import config
 from openadapt_capture.db import create_db, crud, get_session_for_path
 from openadapt_capture.db.models import ActionEvent, Recording
+from openadapt_capture.desktop_capture import DesktopCaptureScope
 from openadapt_capture.extensions import synchronized_queue as sq
 from openadapt_capture.input_observer import (
     ObservedInput,
@@ -65,6 +66,8 @@ from openadapt_capture.window_capture import (
     WindowCaptureScope,
     build_window_scope,
 )
+
+CoordinateScope = WindowCaptureScope | DesktopCaptureScope
 
 try:
     import soundfile
@@ -791,24 +794,14 @@ def write_video_event(
     screenshot_timestamp = event.timestamp
     stream_size = (video_stream.width, video_stream.height)
     if (screenshot_image.width, screenshot_image.height) != stream_size:
-        # A frame whose size differs from the stream (e.g. the target window
-        # of a window-scoped recording was resized mid-recording) cannot be
-        # encoded into this stream. Skip it LOUDLY: screenshots and the
-        # bounds timeline still record the change exactly.
-        logger.warning(
-            f"Skipping video frame {screenshot_image.size} != stream "
-            f"{stream_size} (window resized mid-recording?)"
+        # Window-scoped capture normalizes every resize into its initial fixed
+        # viewport. A mismatch now means a producer violated the stream
+        # contract. Stop instead of emitting a complete-looking video with a
+        # silent evidence gap.
+        raise ValueError(
+            f"video frame {screenshot_image.size} differs from fixed stream "
+            f"{stream_size}"
         )
-        perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
-        return {
-            **kwargs,
-            **{
-                "video_container": video_container,
-                "video_stream": video_stream,
-                "video_start_timestamp": video_start_timestamp,
-                "last_pts": last_pts,
-            },
-        }
     force_key_frame = last_pts == 0
     # ensure that the first frame is available (otherwise occasionally it is not)
     # TODO: why isn't force_key_frame sufficient?
@@ -841,7 +834,7 @@ def write_video_event(
 def trigger_action_event(
     event_q: queue.Queue,
     action_event_args: dict[str, Any],
-    window_scope: WindowCaptureScope | None = None,
+    coordinate_scope: CoordinateScope | None = None,
     timestamp: float | None = None,
     structural_observer: StructuralObserver | None = None,
 ) -> None:
@@ -850,10 +843,10 @@ def trigger_action_event(
     Args:
         event_q: The event queue to add the action event to.
         action_event_args: A dictionary containing the arguments for the action event.
-        window_scope: When set (window-scoped capture), global mouse
-            coordinates are translated into the target window's pixel space
-            before being recorded, so recorded coordinates match the captured
-            frames directly.
+        coordinate_scope: When set, global mouse coordinates are translated
+            into the exact captured-frame pixel space. A window scope tracks
+            the target window. A desktop scope subtracts the combined virtual
+            desktop origin, including negative-origin secondary monitors.
         timestamp: Native event-receipt time. Defaults to the current recording
             clock only for legacy/direct callers.
         structural_observer: Optional accessibility observer. Evidence is
@@ -886,9 +879,9 @@ def trigger_action_event(
         else:
             element_state = {}
         action_event_args["element_state"] = element_state
-        if window_scope is not None:
+        if coordinate_scope is not None:
             try:
-                wx, wy = window_scope.translate(x, y)
+                wx, wy = coordinate_scope.translate(x, y)
             except WindowCaptureError as exc:
                 # No frame captured yet: recording a global coordinate in a
                 # window-scoped session would silently mix coordinate spaces.
@@ -907,7 +900,7 @@ def trigger_action_event(
 
 def on_move(
     event_q: queue.Queue,
-    window_scope: WindowCaptureScope | None,
+    coordinate_scope: CoordinateScope | None,
     x: float,
     y: float,
     injected: bool = False,
@@ -917,7 +910,7 @@ def on_move(
 
     Args:
         event_q: The event queue to add the 'move' event to.
-        window_scope: Optional window scope for coordinate translation.
+        coordinate_scope: Optional captured-frame coordinate translator.
         x: The x-coordinate of the mouse.
         y: The y-coordinate of the mouse.
         injected: Whether the event was injected or not.
@@ -930,14 +923,14 @@ def on_move(
         trigger_action_event(
             event_q,
             {"name": "move", "mouse_x": x, "mouse_y": y},
-            window_scope,
+            coordinate_scope,
             timestamp,
         )
 
 
 def on_click(
     event_q: queue.Queue,
-    window_scope: WindowCaptureScope | None,
+    coordinate_scope: CoordinateScope | None,
     x: float,
     y: float,
     button: str,
@@ -950,7 +943,7 @@ def on_click(
 
     Args:
         event_q: The event queue to add the 'click' event to.
-        window_scope: Optional window scope for coordinate translation.
+        coordinate_scope: Optional captured-frame coordinate translator.
         x: The x-coordinate of the mouse.
         y: The y-coordinate of the mouse.
         button: The mouse button.
@@ -971,7 +964,7 @@ def on_click(
                 "mouse_button_name": button,
                 "mouse_pressed": pressed,
             },
-            window_scope,
+            coordinate_scope,
             timestamp,
             structural_observer if pressed else None,
         )
@@ -979,7 +972,7 @@ def on_click(
 
 def on_scroll(
     event_q: queue.Queue,
-    window_scope: WindowCaptureScope | None,
+    coordinate_scope: CoordinateScope | None,
     x: float,
     y: float,
     dx: float,
@@ -992,7 +985,7 @@ def on_scroll(
 
     Args:
         event_q: The event queue to add the 'scroll' event to.
-        window_scope: Optional window scope for coordinate translation.
+        coordinate_scope: Optional captured-frame coordinate translator.
         x: The x-coordinate of the mouse.
         y: The y-coordinate of the mouse.
         dx: The horizontal scroll amount.
@@ -1013,7 +1006,7 @@ def on_scroll(
                 "mouse_dx": dx,
                 "mouse_dy": dy,
             },
-            window_scope,
+            coordinate_scope,
             timestamp,
             structural_observer,
         )
@@ -1296,6 +1289,7 @@ def create_recording(
     task_description: str,
     capture_dir: str,
     window_capture_info: dict | None = None,
+    desktop_capture_info: dict | None = None,
 ) -> tuple[Recording, str]:
     """Create a new recording entry in the per-capture database.
 
@@ -1306,10 +1300,16 @@ def create_recording(
             (``WindowCaptureScope.snapshot()``) persisted in the recording's
             config JSON under ``capture_window`` so converters know the
             session's coordinates are in window-pixel space.
+        desktop_capture_info: Combined-monitor geometry persisted under
+            ``capture_desktop`` for full-screen recordings.
 
     Returns:
         tuple of (Recording object, db_path).
     """
+    if window_capture_info is not None and desktop_capture_info is not None:
+        raise ValueError(
+            "a recording cannot declare both window and desktop capture scopes"
+        )
     os.makedirs(capture_dir, exist_ok=True)
     db_path = os.path.join(capture_dir, "recording.db")
 
@@ -1337,8 +1337,13 @@ def create_recording(
         "platform": sys.platform,
         "task_description": task_description,
     }
+    capture_config: dict[str, Any] = {}
     if window_capture_info is not None:
-        recording_data["config"] = {"capture_window": window_capture_info}
+        capture_config["capture_window"] = window_capture_info
+    if desktop_capture_info is not None:
+        capture_config["capture_desktop"] = desktop_capture_info
+    if capture_config:
+        recording_data["config"] = capture_config
     engine, Session = create_db(db_path)
     session = Session()
     recording = crud.insert_recording(session, recording_data)
@@ -1351,7 +1356,7 @@ def read_input_events(
     terminate_processing: multiprocessing.Event,
     recording: Recording,
     started_event: threading.Event,
-    window_scope: WindowCaptureScope | None = None,
+    coordinate_scope: CoordinateScope | None = None,
     structural_observer: StructuralObserver | None = None,
 ) -> None:
     """Read globally ordered keyboard and mouse events from one native observer."""
@@ -1362,7 +1367,7 @@ def read_input_events(
         if isinstance(event, ObservedMouseMove):
             on_move(
                 event_q,
-                window_scope,
+                coordinate_scope,
                 event.x,
                 event.y,
                 event.injected,
@@ -1372,7 +1377,7 @@ def read_input_events(
         if isinstance(event, ObservedMouseButton):
             on_click(
                 event_q,
-                window_scope,
+                coordinate_scope,
                 event.x,
                 event.y,
                 event.button,
@@ -1385,7 +1390,7 @@ def read_input_events(
         if isinstance(event, ObservedMouseScroll):
             on_scroll(
                 event_q,
-                window_scope,
+                coordinate_scope,
                 event.x,
                 event.y,
                 event.dx,
@@ -1795,12 +1800,20 @@ def record(
         window_title or config.RECORD_WINDOW_TITLE,
     )
     initial_window_frame = None
+    desktop_scope = None
     if window_scope is not None:
         initial_window_frame, _ = window_scope.capture_frame()
         logger.info(
             f"window-scoped capture resolved: {window_scope.snapshot()} "
             f"initial frame {initial_window_frame.size}"
         )
+    else:
+        # MSS monitor zero is the exact combined frame read by
+        # ``utils.take_screenshot``. Retain its origin and translate native
+        # input into that same pixel space so secondary monitors with negative
+        # global coordinates remain aligned with the video.
+        desktop_scope = DesktopCaptureScope.current()
+        logger.info(f"virtual desktop capture resolved: {desktop_scope.snapshot()}")
 
     if structural_observer is None:
         structural_observer = create_structural_observer(
@@ -1814,6 +1827,9 @@ def record(
         capture_dir,
         window_capture_info=(
             window_scope.snapshot() if window_scope is not None else None
+        ),
+        desktop_capture_info=(
+            desktop_scope.snapshot() if desktop_scope is not None else None
         ),
     )
     recording_timestamp = recording.timestamp
@@ -1894,7 +1910,7 @@ def record(
         terminate_processing,
         recording,
         task_started_events.setdefault("input_event_reader", threading.Event()),
-        window_scope,
+        window_scope or desktop_scope,
         structural_observer,
     )
     input_event_reader = threading.Thread(
