@@ -202,9 +202,27 @@ def test_concurrent_repeated_stop_is_idempotent(tmp_path: Path) -> None:
 def test_crash_recovery_removes_only_proven_stale_endpoint(tmp_path: Path) -> None:
     child, capture_dir, runtime_dir = _start_child(tmp_path)
     session_id = _wait_for_session(runtime_dir)
+    descriptor = control._parse_descriptor(runtime_dir / f"{session_id}.json")
+    assert descriptor.pid == child.pid
     child.kill()
     _finish_child(child)
 
+    kernel_live = (
+        control._windows_process_live(descriptor.pid)
+        if sys.platform == "win32"
+        else None
+    )
+    instance_live = control._process_instance_live(
+        descriptor.pid,
+        descriptor.process_started_at,
+    )
+    assert instance_live is False, {
+        "child_pid": child.pid,
+        "descriptor_pid": descriptor.pid,
+        "child_returncode": child.returncode,
+        "kernel_live": kernel_live,
+        "pid_exists": psutil.pid_exists(descriptor.pid),
+    }
     assert discover_recorders(runtime_dir) == []
     assert not (runtime_dir / f"{session_id}.json").exists()
     terminal = json.loads(
