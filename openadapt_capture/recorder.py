@@ -2470,7 +2470,7 @@ class Recorder:
             raise RuntimeError("The finalized Capture database is not a regular file.")
         if details.st_size <= 0:
             raise RuntimeError("The finalized Capture database is empty.")
-        database = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        database = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
             quick_check = database.execute("PRAGMA quick_check").fetchall()
             if quick_check != [("ok",)]:
