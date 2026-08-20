@@ -1,12 +1,19 @@
 name: Release and PyPI Publish
 
-# Publication is a deliberate operation from protected main. Ordinary merges
-# run Tests only; this workflow refuses to version or publish until that exact
-# main commit has completed the full test.yml workflow (including the package
-# archive contract).
+# A release has two deliberate phases.
 #
-# Requires ADMIN_TOKEN (GitHub PAT with repo scope) to push the release commit
-# and tag through branch protection. PyPI publication uses Trusted Publishing.
+# 1. prepare-candidate creates and pushes the semantic-release version commit,
+#    but it creates no tag, GitHub Release, package, or Production claim. It
+#    then dispatches hardware qualification for that exact versioned commit.
+# 2. publish-candidate waits for exact-commit Tests and Production
+#    qualification, downloads the one wheel/sdist pair built by qualification,
+#    and publishes those unchanged bytes. It verifies exact PyPI parity before
+#    it emits an attested, explicitly not-admitted candidate for the canonical
+#    OpenAdaptAI/.github Production admission process.
+#
+# PyPI latest is never a Production selector. This workflow does not update a
+# Production default. Only the canonical signed, expiring, revocable central
+# admission ledger can select a Production release.
 
 on:
   workflow_dispatch:
@@ -15,48 +22,152 @@ on:
         description: "Release operation"
         type: choice
         required: true
-        default: semantic-release
+        default: prepare-candidate
         options:
-          - semantic-release
+          - prepare-candidate
+          - publish-candidate
 
 concurrency:
   group: release
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
-  semantic-release:
-    name: Version, tag, and publish the green main release train
+  prepare-candidate:
+    name: Prepare and dispatch the exact release candidate
     if: >-
       github.event_name == 'workflow_dispatch' &&
-      inputs.operation == 'semantic-release' &&
+      inputs.operation == 'prepare-candidate' &&
       github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      actions: read
-      id-token: write
+      actions: write
       contents: write
-      issues: write
 
     steps:
       - name: Checkout protected main at the dispatched commit
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           token: ${{ secrets.ADMIN_TOKEN }}
 
-      - name: Refuse a release commit replay
-        id: check_skip
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Require the dispatched commit to remain protected main
         shell: bash
         run: |
           set -euo pipefail
-          author="$(git log -1 --pretty=format:'%an')"
-          subject="$(git log -1 --pretty=format:'%s')"
-          if [ "${author}" = "semantic-release" ] || printf '%s' "${subject}" | grep -q '^chore: release'; then
-            echo "skip=true" >> "${GITHUB_OUTPUT}"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          current_main="$(git rev-parse refs/remotes/origin/main)"
+          if [ "${current_main}" != "${GITHUB_SHA}" ]; then
+            echo "Refusing stale candidate preparation: main is ${current_main}, dispatched head is ${GITHUB_SHA}."
+            exit 1
+          fi
+          if git log -1 --pretty=format:'%s' | grep -Eq '^chore: release [0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "The current main commit is already a prepared release. Use publish-candidate."
+            exit 1
           fi
 
-      - name: Wait for exact-head test and production qualification evidence
-        if: steps.check_skip.outputs.skip != 'true'
+      - name: Prepare the versioned release commit
+        id: prepare
+        uses: python-semantic-release/python-semantic-release@39dd2052f2ce8282a5d932c31d58a2ca06d2550e # v10.6.1
+        with:
+          github_token: ${{ secrets.ADMIN_TOKEN }}
+          git_committer_name: "semantic-release"
+          git_committer_email: "bot@openadapt.ai"
+          commit: true
+          tag: false
+          push: true
+          changelog: true
+          vcs_release: false
+          build: false
+
+      - name: Verify and dispatch the prepared candidate
+        if: steps.prepare.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          RELEASE_SHA: ${{ steps.prepare.outputs.commit_sha }}
+          RELEASE_VERSION: ${{ steps.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if [ "$(git rev-parse refs/remotes/origin/main)" != "${RELEASE_SHA}" ]; then
+            echo "Prepared release commit did not become protected main."
+            exit 1
+          fi
+          git checkout --detach "${RELEASE_SHA}"
+          python scripts/check_prepared_release.py \
+            --expected-sha "${RELEASE_SHA}" \
+            --expected-version "${RELEASE_VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/v${RELEASE_VERSION}" >/dev/null 2>&1; then
+            echo "Candidate preparation must not create the release tag."
+            exit 1
+          fi
+          gh workflow run production-qualification.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref main \
+            -f candidate_sha="${RELEASE_SHA}" \
+            -f candidate_version="${RELEASE_VERSION}"
+
+      - name: Report that no release is required
+        if: steps.prepare.outputs.released != 'true'
+        run: echo "No release-worthy commit exists after the latest release."
+
+  stage-candidate:
+    name: Stage the exact qualified candidate for publication
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.operation == 'publish-candidate' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    outputs:
+      version: ${{ steps.candidate.outputs.version }}
+      tag: ${{ steps.candidate.outputs.tag }}
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout the prepared release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.ADMIN_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Bind the exact prepared commit and version
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          current_main="$(git rev-parse refs/remotes/origin/main)"
+          if [ "${current_main}" != "${GITHUB_SHA}" ]; then
+            echo "Refusing stale candidate publication: main is ${current_main}, dispatched head is ${GITHUB_SHA}."
+            exit 1
+          fi
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          python scripts/check_prepared_release.py \
+            --expected-sha "${GITHUB_SHA}" \
+            --expected-version "${version}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Wait for exact prepared-commit qualification
+        id: evidence
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -65,74 +176,254 @@ jobs:
           python scripts/check_release_ci.py \
             --repository "${GITHUB_REPOSITORY}" \
             --sha "${GITHUB_SHA}" \
-            --timeout-seconds 2700
+            --timeout-seconds 3600 \
+            --output release-evidence.json
+          run_id="$(python -c 'import json; print(json.load(open("release-evidence.json"))["production-qualification.yml"])')"
+          echo "qualification_run_id=${run_id}" >> "${GITHUB_OUTPUT}"
 
-      - name: Require dispatched head to remain current protected main
-        if: steps.check_skip.outputs.skip != 'true'
+      - name: Require the prepared commit to remain protected main
         shell: bash
         run: |
           set -euo pipefail
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           current_main="$(git rev-parse refs/remotes/origin/main)"
           if [ "${current_main}" != "${GITHUB_SHA}" ]; then
-            echo "Refusing stale release dispatch: main is ${current_main}, dispatched head is ${GITHUB_SHA}."
+            echo "Refusing stale candidate publication: main advanced to ${current_main}."
             exit 1
           fi
 
+      - name: Download the exact qualified archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUALIFICATION_RUN_ID: ${{ steps.evidence.outputs.qualification_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "${QUALIFICATION_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name "capture-candidate-${GITHUB_SHA}" \
+            --dir dist
+          python - <<'PY'
+          from pathlib import Path
+          from scripts.candidate_lifecycle import verify_manifest
+          verify_manifest(Path("dist"), Path("dist/SHA256SUMS"))
+          PY
+          python scripts/verify_distribution.py dist/*.whl dist/*.tar.gz
+          python scripts/check_source_boundary.py --require-dist
+          mkdir -p evidence
+          mv dist/SHA256SUMS evidence/SHA256SUMS
+
+      - name: Attest the exact qualified archives
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+
+      - name: Create the immutable release tag
+        env:
+          TAG: ${{ steps.candidate.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            git fetch --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+            if [ "$(git rev-list -n 1 "${TAG}")" != "${GITHUB_SHA}" ]; then
+              echo "Existing ${TAG} does not identify the exact qualified commit."
+              exit 1
+            fi
+          else
+            git config user.name "semantic-release"
+            git config user.email "bot@openadapt.ai"
+            git tag --annotate "${TAG}" --message "OpenAdapt Capture ${TAG}" "${GITHUB_SHA}"
+            git push origin "refs/tags/${TAG}"
+          fi
+
+      - name: Retain the exact qualified release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: capture-qualified-release-${{ github.sha }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            evidence/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-pypi:
+    name: Publish the exact qualified archives to PyPI
+    needs: stage-candidate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Download the exact qualified release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: capture-qualified-release-${{ github.sha }}
+          path: release-bundle
+
+      - name: Publish the exact qualified archives to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: release-bundle/dist/
+          skip-existing: true
+
+  finalize-candidate:
+    name: Emit the not-admitted candidate after exact PyPI parity
+    needs: [stage-candidate, publish-pypi]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout the prepared release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.ADMIN_TOKEN }}
+
       - name: Set up Python
-        if: steps.check_skip.outputs.skip != 'true'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
-      - name: Install exact uv
-        if: steps.check_skip.outputs.skip != 'true'
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
-        with:
-          version: "0.11.29"
-
-      - name: Python Semantic Release
-        if: steps.check_skip.outputs.skip != 'true'
-        id: release
-        uses: python-semantic-release/python-semantic-release@39dd2052f2ce8282a5d932c31d58a2ca06d2550e # v10.6.1
-        with:
-          github_token: ${{ secrets.ADMIN_TOKEN }}
-
-      # Do not trust the semantic-release action's transient build directory.
-      # Rebuild the versioned tree and re-run the exact archive boundary guard
-      # before either external publication channel sees an artifact.
-      - name: Rebuild and verify release artifacts
-        if: steps.check_skip.outputs.skip != 'true' && steps.release.outputs.released == 'true'
+      - name: Require the exact prepared commit
+        env:
+          VERSION: ${{ needs.stage-candidate.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf dist
-          uv build --wheel --sdist
-          python scripts/verify_distribution.py dist/*
+          python scripts/check_prepared_release.py \
+            --expected-sha "${GITHUB_SHA}" \
+            --expected-version "${VERSION}"
+
+      - name: Download the exact qualified release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: capture-qualified-release-${{ github.sha }}
+
+      - name: Verify the retained archive bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          from scripts.candidate_lifecycle import verify_manifest
+          verify_manifest(Path("dist"), Path("evidence/SHA256SUMS"))
+          PY
+          python scripts/verify_distribution.py dist/*.whl dist/*.tar.gz
           python scripts/check_source_boundary.py --require-dist
 
-      - name: Publish to PyPI
-        if: steps.check_skip.outputs.skip != 'true' && steps.release.outputs.released == 'true'
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-
-      - name: Publish to GitHub Releases
-        if: steps.check_skip.outputs.skip != 'true' && steps.release.outputs.released == 'true'
-        uses: python-semantic-release/publish-action@5a5718ce47b892ef699f2972dae122297771d641 # v10.6.1
+      - name: Checkout the canonical lifecycle authority
+        id: lifecycle
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          github_token: ${{ secrets.ADMIN_TOKEN }}
+          repository: OpenAdaptAI/.github
+          ref: main
+          path: lifecycle-policy
+          persist-credentials: false
 
-      # Releases in openadapt-ml failed silently for 3 months (Mar-Jun
-      # 2026) while PyPI went stale; see OpenAdaptAI/OpenAdapt#999.
-      - name: File issue on release failure
-        if: failure()
+      - name: Validate the exact canonical lifecycle authority
+        id: authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          authority_commit="$(git -C lifecycle-policy rev-parse HEAD)"
+          if [[ ! "${authority_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "The lifecycle authority checkout is not an immutable commit."
+            exit 1
+          fi
+          python lifecycle-policy/scripts/validate_production_lifecycle.py \
+            --root lifecycle-policy
+          echo "commit=${authority_commit}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify PyPI parity and write the admission candidate
+        env:
+          VERSION: ${{ needs.stage-candidate.outputs.version }}
+          POLICY_COMMIT: ${{ steps.authority.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            if python scripts/release_admission_candidate.py \
+              --dist dist \
+              --manifest evidence/SHA256SUMS \
+              --version "${VERSION}" \
+              --source-commit "${GITHUB_SHA}" \
+              --policy lifecycle-policy/production-lifecycle-policy.json \
+              --policy-commit "${POLICY_COMMIT}" \
+              --output admission/openadapt-capture-release-admission-candidate.json; then
+              break
+            fi
+            if [ "${attempt}" -eq 20 ]; then
+              echo "PyPI did not expose the exact qualified archives in time."
+              exit 1
+            fi
+            echo "Exact PyPI parity is not visible yet; retrying in 15 seconds."
+            sleep 15
+          done
+
+      - name: Attest the not-admitted candidate record
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: admission/openadapt-capture-release-admission-candidate.json
+
+      - name: Retain the exact admission candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: capture-release-admission-candidate-${{ needs.stage-candidate.outputs.tag }}
+          path: admission/openadapt-capture-release-admission-candidate.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish the GitHub Release and candidate record
         env:
           GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          TAG: ${{ needs.stage-candidate.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "GitHub Release ${TAG} already exists; refusing to replace immutable assets."
+            exit 1
+          fi
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "OpenAdapt Capture ${TAG}" \
+            --generate-notes \
+            dist/*.whl dist/*.tar.gz \
+            evidence/SHA256SUMS \
+            admission/openadapt-capture-release-admission-candidate.json
+
+  report-release-failure:
+    name: Report a failed release transaction
+    if: >-
+      always() &&
+      (needs.prepare-candidate.result == 'failure' ||
+       needs.stage-candidate.result == 'failure' ||
+       needs.publish-pypi.result == 'failure' ||
+       needs.finalize-candidate.result == 'failure')
+    needs: [prepare-candidate, stage-candidate, publish-pypi, finalize-candidate]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: File issue on release failure
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           TITLE="Release workflow failed on main"
           BODY="The release workflow failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-          Until this is fixed, merged fix/feat commits are NOT being published to PyPI, and users install stale versions."
+          The release is not a Production default. The central admission ledger remains the only Production authority."
           EXISTING=$(gh issue list --repo "${{ github.repository }}" --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo "${{ github.repository }}" --body "$BODY"

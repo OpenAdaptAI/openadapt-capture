@@ -7,6 +7,10 @@ on:
         description: "Exact 40-character main commit SHA to qualify"
         type: string
         required: true
+      candidate_version:
+        description: "Stable version already written into the candidate commit"
+        type: string
+        required: true
 
 concurrency:
   group: capture-production-qualification-${{ github.sha }}
@@ -51,6 +55,14 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+
+      - name: Require a prepared versioned release commit
+        env:
+          CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+        run: |
+          python scripts/check_prepared_release.py \
+            --expected-sha "${GITHUB_SHA}" \
+            --expected-version "${CANDIDATE_VERSION}"
 
       - name: Install exact uv
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
@@ -120,6 +132,63 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  control-contract:
+    name: Candidate control contract (${{ matrix.os }})
+    needs: build-candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the exact candidate source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install exact uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.29"
+
+      - name: Download the exact candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: capture-candidate-${{ github.sha }}
+          path: dist
+
+      - name: Verify and install the exact wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          from scripts.candidate_lifecycle import verify_manifest
+          verify_manifest(Path("dist"), Path("dist/SHA256SUMS"))
+          PY
+          control_root="${RUNNER_TEMP}/capture-control-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          control_python="${control_root}/bin/python"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            control_python="${control_root}/Scripts/python.exe"
+          fi
+          uv venv --clear --python 3.12 "${control_root}"
+          uv pip install --python "${control_python}" \
+            dist/*.whl pytest==9.1.1 pytest-timeout==2.4.0
+          echo "CONTROL_PYTHON=${control_python}" >> "${GITHUB_ENV}"
+
+      - name: Run the authenticated control contract from the installed wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          "${CONTROL_PYTHON}" -m pytest \
+            "${GITHUB_WORKSPACE}/tests/test_control.py" \
+            -v --timeout=120 --import-mode=importlib
+
   interactive-linux:
     name: Interactive qualification (Linux X64)
     needs: build-candidate
@@ -152,10 +221,26 @@ jobs:
           set -euo pipefail
           qualification_root="${RUNNER_TEMP}/capture-qualification-${GITHUB_RUN_ID}-${GITHUB_JOB}"
           qualification_python="${qualification_root}/bin/python"
-          uv venv --clear --python 3.12 "${qualification_root}"
+          uv venv --clear --system-site-packages --python 3.12 "${qualification_root}"
+          wheel=(dist/*.whl)
+          if [ "${#wheel[@]}" -ne 1 ]; then
+            echo "Expected exactly one candidate wheel."
+            exit 1
+          fi
           uv pip install --python "${qualification_python}" \
-            dist/*.whl pytest==9.1.1 pytest-timeout==2.4.0 pynput==1.8.2
+            "${wheel[0]}[linux]" pytest==9.1.1 pytest-timeout==2.4.0 pynput==1.8.2
           echo "QUALIFICATION_PYTHON=${qualification_python}" >> "${GITHUB_ENV}"
+
+      - name: Require the reviewed Linux GI and AT-SPI runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+            echo "The qualification host has no interactive desktop D-Bus session."
+            exit 1
+          fi
+          "${QUALIFICATION_PYTHON}" -c \
+            "import gi; gi.require_version('Atspi', '2.0'); from gi.repository import Atspi; assert Atspi.Registry is not None"
 
       - name: Require the reviewed external video tools
         shell: bash
@@ -184,6 +269,8 @@ jobs:
           cd "${RUNNER_TEMP}"
           "${QUALIFICATION_PYTHON}" -m pytest \
             "${GITHUB_WORKSPACE}/tests/test_performance.py" \
+            "${GITHUB_WORKSPACE}/tests/test_window_capture.py" \
+            "${GITHUB_WORKSPACE}/tests/test_structural_observation.py" \
             -m slow -v --timeout=300 --import-mode=importlib \
             --junitxml="${GITHUB_WORKSPACE}/evidence/interactive-linux.xml"
 
@@ -267,6 +354,7 @@ jobs:
           "${QUALIFICATION_PYTHON}" -m pytest \
             "${GITHUB_WORKSPACE}/tests/test_performance.py" \
             "${GITHUB_WORKSPACE}/tests/test_window_capture.py" \
+            "${GITHUB_WORKSPACE}/tests/test_structural_observation.py" \
             -m slow -v --timeout=300 --import-mode=importlib \
             --junitxml="${GITHUB_WORKSPACE}/evidence/interactive-macos.xml"
 
@@ -355,6 +443,7 @@ jobs:
             & $env:QUALIFICATION_PYTHON -m pytest `
               "$env:GITHUB_WORKSPACE/tests/test_performance.py" `
               "$env:GITHUB_WORKSPACE/tests/test_window_capture.py" `
+              "$env:GITHUB_WORKSPACE/tests/test_structural_observation.py" `
               -m slow -v --timeout=300 --import-mode=importlib `
               "--junitxml=$env:GITHUB_WORKSPACE/evidence/interactive-windows.xml"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

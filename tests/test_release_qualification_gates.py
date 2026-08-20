@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -10,11 +13,20 @@ import pytest
 from scripts.candidate_lifecycle import CandidateLifecycleError, verify_manifest
 from scripts.check_display_topology import DisplayTopologyError, qualify_topology
 from scripts.check_junit_no_skips import JUnitQualificationError, check_reports
+from scripts.check_prepared_release import (
+    PreparedReleaseError,
+    validate_prepared_release,
+)
 from scripts.check_release_ci import (
     EXPECTED_QUALIFICATION_JOBS,
     ReleaseEvidenceError,
     check_once,
     validate_qualification_jobs,
+)
+from scripts.release_admission_candidate import (
+    AdmissionCandidateError,
+    build_admission_candidate,
+    verify_registry_parity,
 )
 
 
@@ -49,6 +61,159 @@ def test_candidate_manifest_rejects_unaccounted_archive(tmp_path: Path) -> None:
 
     with pytest.raises(CandidateLifecycleError, match="manifest and candidate archives differ"):
         verify_manifest(tmp_path, manifest)
+
+
+def _policy(path: Path) -> Path:
+    policy = {
+        "schema_version": "openadapt.production-lifecycle-policy/v1",
+        "revision": 1,
+        "targets": [
+            {
+                "id": "capture",
+                "source_repository": "OpenAdaptAI/openadapt-capture",
+                "release_kind": "public_package",
+                "required_claim_scope": "qualified_native_recorder_release",
+                "required_artifact_kinds": ["sdist", "wheel"],
+                "package_index_project": "openadapt-capture",
+                "artifact_authority_by_kind": {"sdist": "pypi", "wheel": "pypi"},
+            }
+        ],
+    }
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    return path
+
+
+def test_registry_parity_emits_only_an_explicit_not_admitted_candidate(
+    tmp_path: Path,
+) -> None:
+    version = "1.3.0"
+    wheel = tmp_path / f"openadapt_capture-{version}-py3-none-any.whl"
+    sdist = tmp_path / f"openadapt_capture-{version}.tar.gz"
+    wheel.write_bytes(b"wheel")
+    sdist.write_bytes(b"sdist")
+    manifest = _write_manifest(tmp_path, [wheel, sdist])
+
+    def get_json(url: str) -> dict:
+        assert url == f"https://pypi.org/pypi/openadapt-capture/{version}/json"
+        return {
+            "info": {"name": "openadapt-capture", "version": version},
+            # A newer index version is deliberately irrelevant. PyPI latest is
+            # not a Production selector.
+            "releases": {"99.0.0": []},
+            "urls": [
+                {
+                    "filename": path.name,
+                    "url": f"https://files.pythonhosted.org/{path.name}",
+                    "size": path.stat().st_size,
+                    "digests": {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()},
+                    "yanked": False,
+                    "packagetype": "bdist_wheel" if path.suffix == ".whl" else "sdist",
+                }
+                for path in (wheel, sdist)
+            ],
+        }
+
+    endpoint, artifacts = verify_registry_parity(
+        dist_dir=tmp_path,
+        manifest_path=manifest,
+        version=version,
+        get_json=get_json,
+    )
+    candidate = build_admission_candidate(
+        policy_path=_policy(tmp_path / "policy.json"),
+        policy_commit="a" * 40,
+        source_commit="b" * 40,
+        version=version,
+        endpoint=endpoint,
+        artifacts=artifacts,
+        verified_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+    )
+
+    assert candidate["release_status"] == "not_admitted"
+    assert candidate["production_default"] is None
+    assert candidate["production_authority"]["activation_required"] is True
+    assert candidate["production_authority"]["pypi_latest_is_authority"] is False
+    assert candidate["release"]["version"] == version
+    assert {item["kind"] for item in candidate["release"]["artifacts"]} == {
+        "sdist",
+        "wheel",
+    }
+
+
+def test_registry_parity_rejects_changed_published_bytes(tmp_path: Path) -> None:
+    version = "1.3.0"
+    wheel = tmp_path / f"openadapt_capture-{version}-py3-none-any.whl"
+    sdist = tmp_path / f"openadapt_capture-{version}.tar.gz"
+    wheel.write_bytes(b"wheel")
+    sdist.write_bytes(b"sdist")
+    manifest = _write_manifest(tmp_path, [wheel, sdist])
+
+    def get_json(_url: str) -> dict:
+        return {
+            "info": {"name": "openadapt-capture", "version": version},
+            "urls": [
+                {
+                    "filename": path.name,
+                    "url": f"https://files.pythonhosted.org/{path.name}",
+                    "size": path.stat().st_size,
+                    "digests": {"sha256": "0" * 64},
+                    "yanked": False,
+                    "packagetype": "bdist_wheel" if path.suffix == ".whl" else "sdist",
+                }
+                for path in (wheel, sdist)
+            ],
+        }
+
+    with pytest.raises(AdmissionCandidateError, match="does not verify exact archive"):
+        verify_registry_parity(
+            dist_dir=tmp_path,
+            manifest_path=manifest,
+            version=version,
+            get_json=get_json,
+        )
+
+
+def test_prepared_release_binds_commit_version_and_changelog(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    for name in ("pyproject.toml", "CHANGELOG.md"):
+        (repository / name).write_bytes((Path(__file__).parents[1] / name).read_bytes())
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "semantic-release"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "bot@openadapt.ai"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(["git", "add", "pyproject.toml", "CHANGELOG.md"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "chore: release 1.2.2"],
+        cwd=repository,
+        check=True,
+    )
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert (
+        validate_prepared_release(
+            repository,
+            expected_sha=sha,
+            expected_version="1.2.2",
+        )["tag"]
+        == "v1.2.2"
+    )
+
+    with pytest.raises(PreparedReleaseError, match="subject"):
+        validate_prepared_release(
+            repository,
+            expected_sha=sha,
+            expected_version="1.2.3",
+        )
 
 
 def test_display_topology_requires_stable_multiple_monitors() -> None:

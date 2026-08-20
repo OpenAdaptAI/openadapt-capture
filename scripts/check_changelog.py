@@ -160,7 +160,12 @@ def validate_documents(changelog: str, pyproject: str) -> list[Release]:
     return releases
 
 
-def validate_git_tags(releases: list[Release], repository: Path) -> None:
+def validate_git_tags(
+    releases: list[Release],
+    repository: Path,
+    *,
+    prepared_version: str | None = None,
+) -> None:
     """Require every stable Git tag to have exactly one changelog section."""
     try:
         result = subprocess.run(
@@ -188,7 +193,10 @@ def validate_git_tags(releases: list[Release], repository: Path) -> None:
             "stable Git tag(s) are absent from CHANGELOG.md: "
             + ", ".join(f"v{version}" for version in missing)
         )
-    untagged = sorted(documented - tags, key=_version_key)
+    untagged = documented - tags
+    if prepared_version is not None:
+        untagged.discard(prepared_version)
+    untagged = sorted(untagged, key=_version_key)
     if untagged:
         raise ChangelogContractError(
             "CHANGELOG.md contains untagged stable release(s): "
@@ -200,7 +208,26 @@ def check_repository(repository: Path) -> list[Release]:
     changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
     pyproject = (repository / "pyproject.toml").read_text(encoding="utf-8")
     releases = validate_documents(changelog, pyproject)
-    validate_git_tags(releases, repository)
+    prepared_version: str | None = None
+    try:
+        head = subprocess.run(
+            ["git", "log", "-1", "--pretty=format:%an%n%s"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+    except (OSError, subprocess.CalledProcessError):
+        head = []
+    author, subject = head if len(head) == 2 else ("", "")
+    match = re.fullmatch(r"chore: release (?P<version>\d+\.\d+\.\d+)", subject)
+    if (
+        author == "semantic-release"
+        and match is not None
+        and releases[0].version == match.group("version")
+    ):
+        prepared_version = match.group("version")
+    validate_git_tags(releases, repository, prepared_version=prepared_version)
     return releases
 
 
