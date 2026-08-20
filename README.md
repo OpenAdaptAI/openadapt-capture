@@ -396,8 +396,9 @@ session is required. See the
   browser recorder remains the Flow Playwright recorder.
 
 The canonical
-[production admission ledger](https://github.com/OpenAdaptAI/.github/blob/main/production-lifecycle-admissions.json)
-binds each admitted claim scope to an exact release and evidence record. Package
+[release policy](https://github.com/OpenAdaptAI/.github/blob/main/production-lifecycle-policy.json)
+and [production admission ledger](https://github.com/OpenAdaptAI/.github/blob/main/production-lifecycle-admissions.json)
+bind each admitted claim scope to an exact release and evidence record. Package
 metadata and repository copy do not select Production maturity.
 
 ## Optional extras

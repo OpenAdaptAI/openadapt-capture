@@ -126,6 +126,32 @@ def test_git_tag_contract_refuses_an_incomplete_tag_inventory(monkeypatch) -> No
         validate_git_tags(releases, REPOSITORY)
 
 
+def test_git_tag_contract_allows_only_the_prepared_head_to_be_untagged(
+    monkeypatch,
+) -> None:
+    changelog, pyproject = _documents()
+    releases = validate_documents(changelog, pyproject)
+    prepared_version = releases[0].version
+    prior_tags = "\n".join(f"v{release.version}" for release in releases[1:])
+    monkeypatch.setattr(
+        "scripts.check_changelog.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=prior_tags),
+    )
+
+    validate_git_tags(
+        releases,
+        REPOSITORY,
+        prepared_version=prepared_version,
+    )
+
+    with pytest.raises(ChangelogContractError, match="untagged stable release"):
+        validate_git_tags(
+            releases,
+            REPOSITORY,
+            prepared_version=releases[1].version,
+        )
+
+
 def test_source_distribution_refuses_a_version_without_release_notes(tmp_path: Path) -> None:
     changelog, pyproject = _documents()
     pyproject, next_version = _project_with_next_patch(changelog, pyproject)

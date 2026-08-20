@@ -8,8 +8,10 @@ structure into one local session. `openadapt-flow` consumes the session, applies
 the compiler and qualification contracts, and owns governed replay.
 
 Capture has no static Experimental, Beta, or Production package label. It is a
-stable component with one canonical native role. A release becomes selectable
-for a Production claim scope only through an active, signed entry in the
+stable component with one canonical native role. A successful unit test,
+runnable package, or newest PyPI version does not select a Production default.
+A release becomes selectable for a Production claim scope only through an
+active, signed entry in the
 [production admission ledger](https://github.com/OpenAdaptAI/.github/blob/main/production-lifecycle-admissions.json).
 An inactive release is not actively admitted. Exact-commit clean-install and
 interactive native qualification provide the evidence for admission.

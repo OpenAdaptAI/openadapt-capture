@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 EXPECTED_QUALIFICATION_JOBS = frozenset(
@@ -22,6 +23,8 @@ EXPECTED_QUALIFICATION_JOBS = frozenset(
         "Interactive qualification (Linux X64)",
         "Interactive qualification (macOS ARM64)",
         "Interactive qualification (Windows X64)",
+        "Candidate control contract (macos-latest)",
+        "Candidate control contract (windows-latest)",
     }
 )
 ACTIVE_STATES = frozenset({"queued", "in_progress", "waiting", "pending", "requested"})
@@ -175,6 +178,7 @@ def main() -> None:
     parser.add_argument("--sha", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=2700)
     parser.add_argument("--interval-seconds", type=int, default=10)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if len(args.sha) != 40 or any(char not in "0123456789abcdef" for char in args.sha):
         raise SystemExit("--sha must be a lowercase 40-character Git commit SHA")
@@ -188,6 +192,12 @@ def main() -> None:
         timeout_seconds=args.timeout_seconds,
         interval_seconds=args.interval_seconds,
     )
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     print(f"exact-commit release evidence is complete: {json.dumps(evidence, sort_keys=True)}")
 
 
