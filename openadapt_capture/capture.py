@@ -27,6 +27,7 @@ from openadapt_capture.events import (
     ActionEvent as PydanticActionEvent,
 )
 from openadapt_capture.events import (
+    CapturedWindowEvent,
     KeyDownEvent,
     KeyShortcutEvent,
     KeyTypeEvent,
@@ -35,6 +36,7 @@ from openadapt_capture.events import (
     MouseMoveEvent,
     MouseScrollEvent,
     MouseUpEvent,
+    WindowCaptureStateV2,
 )
 from openadapt_capture.processing import process_events
 from openadapt_capture.structural import StructuralObservation
@@ -109,9 +111,12 @@ def _convert_action_event(db_event) -> PydanticActionEvent:
     """
     common = {
         "timestamp": db_event.timestamp,
+        "screenshot_timestamp": getattr(db_event, "screenshot_timestamp", None),
+        "window_event_timestamp": getattr(db_event, "window_event_timestamp", None),
         "structural_observation": _parse_structural_observation(
             getattr(db_event, "structural_observation", None)
         ),
+        "window_geometry_generation": getattr(db_event, "window_geometry_generation", None),
     }
 
     if db_event.name == "move":
@@ -448,6 +453,21 @@ class Action:
         return self.event.structural_observation
 
     @property
+    def window_geometry_generation(self) -> int | None:
+        """Exact published window geometry used for this action."""
+        return self.event.window_geometry_generation
+
+    @property
+    def screenshot_timestamp(self) -> float | None:
+        """Exact ScreenEvent timestamp bound to this action."""
+        return self.event.screenshot_timestamp
+
+    @property
+    def window_event_timestamp(self) -> float | None:
+        """Exact WindowEvent timestamp bound to this action."""
+        return self.event.window_event_timestamp
+
+    @property
     def screenshot(self) -> "Image" | None:
         """Get the screenshot at the time of this action.
 
@@ -688,6 +708,55 @@ class CaptureSession:
                 continue
             events.append(_convert_action_event(db_event))
         return events
+
+    def window_events(self) -> list[CapturedWindowEvent]:
+        """Return stored window rows through the public validated event view."""
+        events: list[CapturedWindowEvent] = []
+        for row in self._recording.window_events:
+            state = getattr(row, "state", None)
+            if not isinstance(state, dict):
+                raise InvalidCaptureEvent(
+                    f"stored WindowEvent at {row.timestamp!r} has invalid state"
+                )
+            events.append(
+                CapturedWindowEvent(
+                    timestamp=row.timestamp,
+                    title=row.title,
+                    left=row.left,
+                    top=row.top,
+                    width=row.width,
+                    height=row.height,
+                    window_id=row.window_id,
+                    state=state,
+                )
+            )
+        return events
+
+    def window_capture_events_v2(self) -> list[CapturedWindowEvent]:
+        """Return current scoped rows after strict v2 state validation."""
+        result: list[CapturedWindowEvent] = []
+        for event in self.window_events():
+            if event.state.get("schema_version") != "openadapt.capture.window-scoped/v2":
+                continue
+            state: WindowCaptureStateV2 | None = event.window_capture_v2
+            if state is None:  # pragma: no cover - guarded by the version test
+                continue
+            if not event.window_id:
+                raise InvalidCaptureEvent(
+                    f"stored WindowEvent at {event.timestamp!r} has no window identity"
+                )
+            x, y, width, height = state.bounds
+            if (
+                event.left != int(x)
+                or event.top != int(y)
+                or event.width != int(width)
+                or event.height != int(height)
+            ):
+                raise InvalidCaptureEvent(
+                    f"stored WindowEvent at {event.timestamp!r} columns do not match v2 bounds"
+                )
+            result.append(event)
+        return result
 
     def actions(self, include_moves: bool = False) -> Iterator[Action]:
         """Iterate over processed actions.

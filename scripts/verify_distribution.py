@@ -15,6 +15,7 @@ else:  # Direct execution: python scripts/verify_distribution.py
 
 FORBIDDEN_DEPENDENCIES = ("oa-atomacos", "pynput", "websockets")
 FORBIDDEN_SOURCE_TOKENS = ("oa_atomacos", "pynput", "EXECUTE_ACTION")
+STATIC_LIFECYCLE_CLASSIFIER_PREFIX = "classifier: development status ::"
 FORBIDDEN_ARCHIVE_PATHS = (
     ".env.example",
     ".github/",
@@ -91,6 +92,10 @@ def verify_distribution(path: Path) -> None:
     ]
     assert metadata_files, f"{path}: package metadata is missing"
     metadata = "\n".join(metadata_files).lower()
+    assert STATIC_LIFECYCLE_CLASSIFIER_PREFIX not in metadata, (
+        f"{path}: static lifecycle classifier is in package metadata; "
+        "the signed admission ledger owns release maturity"
+    )
     for dependency in FORBIDDEN_DEPENDENCIES:
         assert f"requires-dist: {dependency}" not in metadata, (
             f"{path}: forbidden dependency {dependency!r} is in package metadata"

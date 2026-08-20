@@ -7,10 +7,12 @@ screen media, native input, timing, window geometry, and optional action-time UI
 structure into one local session. `openadapt-flow` consumes the session, applies
 the compiler and qualification contracts, and owns governed replay.
 
-The package lifecycle is **Experimental**. A successful unit test or a runnable package
-does not by itself make a recording path production-qualified. A release must
-also pass the exact-commit clean-install and interactive native qualification
-described below.
+Capture has no static Experimental, Beta, or Production package label. It is a
+stable component with one canonical native role. A release becomes selectable
+for a Production claim scope only through an active, signed entry in the
+[production admission ledger](https://github.com/OpenAdaptAI/.github/blob/main/production-lifecycle-admissions.json).
+An inactive release is not actively admitted. Exact-commit clean-install and
+interactive native qualification provide the evidence for admission.
 
 Capture is local-first. It does not upload a recording. A raw session can
 contain screen text, typed secrets, accessibility text, and optional narration.
@@ -89,6 +91,25 @@ window changed size.
 Input outside the selected window remains out of range. Capture does not clamp
 it into a valid-looking target coordinate.
 
+Current sessions declare `openadapt.capture.window-scoped/v2`. Each frame has a
+monotonic geometry generation. Capture persists the frame and its WindowEvent
+at one timestamp. Every pointer or keyboard action references that timestamp
+and generation. The compiler must reject a missing or mismatched v2 binding. It
+must not select geometry by a nearest-time estimate.
+
+Each frame binds the native window handle to the owner PID, process start time,
+and platform coordinate source. Capture resolves the identity and bounds on
+both sides of the frame grab. It publishes a monotonic geometry generation only
+after the frame and its WindowEvent enter the ordered event queue. Every action
+re-resolves the live target and records the exact published generation.
+An action during an unobserved move, resize, process replacement, or handle
+reuse fails the session.
+
+Windows accepts DWM extended-frame bounds only. It does not fall back to the
+DPI-virtualized `GetWindowRect` coordinate space. Linux window scope uses
+native X11 EWMH identity and root-pixel geometry. A native Wayland session
+fails closed until a compositor portal can supply the same stable contract.
+
 ## Native input
 
 Capture records these primitive event classes:
@@ -160,20 +181,11 @@ The supported browser recorder remains Playwright-native in `openadapt-flow`.
 It needs one owner for the browser context, DOM identity, field geometry,
 ordered before/after frames, page state, and source-time secret redaction.
 
-The Chrome extension can supply useful DOM observations, but it does not yet
-provide this complete contract. It can become a supported auxiliary observer
-after it has:
-
-1. a shared versioned event schema;
-2. source-time secret redaction;
-3. explicit permission and browser-profile boundaries;
-4. fail-closed reconnect and tab-lifecycle behavior;
-5. exact frame and event binding; and
-6. end-to-end compiler qualification.
-
-It should not replace the Playwright recorder only to consolidate packages.
-The stronger ownership and redaction boundary is more important than package
-uniformity.
+The Chrome extension is a repository-only research prototype. It does not own
+the complete browser contract, and Capture does not package or promote it.
+Browser recording stays in Flow because DOM identity, field geometry,
+navigation, source-time secret exclusion, and browser-context ownership are
+load-bearing inputs to compilation and replay.
 
 The extension and its unauthenticated development bridge are repository-only.
 Wheel and source archives exclude the bridge and its legacy direct replay. The
@@ -198,13 +210,15 @@ commit. It must:
 
 The release workflow accepts only a successful, complete job set for its exact
 commit. Missing, stale, skipped, partial, or failed evidence blocks publication.
+Publication does not select a Production default. The signed admission ledger
+binds an exact published release to its approved claim scope and evidence.
 
 ## Known boundaries
 
 - A visible logged-in desktop session and operating-system permissions are
   required.
-- Windows window capture uses a screen-region grab and requires an unobstructed
-  target window.
+- Windows and X11 window capture use a screen-region grab and require an
+  unobstructed target window.
 - A display-topology change requires a new recording.
 - Browser extension capture is a repository-only development prototype. Its
   bridge and direct replay are not in release artifacts. It is not the

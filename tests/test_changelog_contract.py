@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import tarfile
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -60,6 +61,29 @@ def test_changelog_matches_project_version_and_release_config() -> None:
         "1.2.2",
     } <= {release.version for release in releases}
     assert releases[-1].version == "0.1.0"
+
+
+def test_project_metadata_has_no_static_lifecycle_classifier() -> None:
+    _changelog, pyproject = _documents()
+
+    assert "Development Status ::" not in pyproject
+
+
+def test_distribution_refuses_a_static_lifecycle_classifier(tmp_path: Path) -> None:
+    wheel = tmp_path / "openadapt_capture-1.2.2-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("openadapt_capture/__init__.py", "")
+        archive.writestr("openadapt_capture-1.2.2.dist-info/licenses/LICENSE", "MIT\n")
+        archive.writestr(
+            "openadapt_capture-1.2.2.dist-info/METADATA",
+            "Metadata-Version: 2.4\n"
+            "Name: openadapt-capture\n"
+            "Version: 1.2.2\n"
+            "Classifier: Development Status :: 5 - Production/Stable\n",
+        )
+
+    with pytest.raises(AssertionError, match="static lifecycle classifier"):
+        verify_distribution(wheel)
 
 
 def test_changelog_refuses_a_project_version_without_release_notes() -> None:

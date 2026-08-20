@@ -1,21 +1,17 @@
 # OpenAdapt Capture
 
 > [!IMPORTANT]
-> **Status: Experimental.** OpenAdapt Capture records native mouse, keyboard,
-> and screen activity into a time-aligned local capture session. Its current
-> product role is the optional cross-platform desktop recorder used by
+> OpenAdapt Capture is the canonical native recorder for OpenAdapt. It records
+> native mouse, keyboard, screen, timing, window-geometry, and optional
+> accessibility evidence into a time-aligned local session for
 > [`openadapt-flow`](https://github.com/OpenAdaptAI/openadapt-flow).
 >
-> The OpenAdapt product is the demonstration compiler,
-> [`openadapt-flow`](https://github.com/OpenAdaptAI/openadapt-flow), installed
-> via the [`OpenAdapt`](https://github.com/OpenAdaptAI/OpenAdapt) launcher
-> (first run: `pip install 'openadapt[browser]'` then `openadapt quickstart`;
-> on Windows `cmd.exe` use `pip install "openadapt[browser]"`): it compiles a
-> demonstrated GUI workflow into a
-> deterministic, locally executable program. Healthy runs make no model calls,
-> and it halts instead of guessing when verification fails. Lifecycle labels for
-> every repository are in the
-> [repository lifecycle registry](https://github.com/OpenAdaptAI/.github/blob/main/REPOSITORY_LIFECYCLE.md).
+> Capture does not use a static Experimental, Beta, or Production package
+> label. OpenAdapt selects a release only while it has an active, signed entry
+> in the canonical
+> [production admission ledger](https://github.com/OpenAdaptAI/.github/blob/main/production-lifecycle-admissions.json).
+> An inactive release is not actively admitted. It is not reclassified as an
+> Experimental or Beta implementation.
 
 [![Build Status](https://github.com/OpenAdaptAI/openadapt-capture/actions/workflows/test.yml/badge.svg)](https://github.com/OpenAdaptAI/openadapt-capture/actions/workflows/test.yml)
 [![PyPI version](https://img.shields.io/pypi/v/openadapt-capture.svg)](https://pypi.org/project/openadapt-capture/)
@@ -38,14 +34,15 @@ model calls on the healthy path. When the live screen does not match what was
 demonstrated it halts instead of guessing, using identity gates and independent
 effect verification. Every substrate is first-class.
 
-Substrate maturity, stated the same way across the OpenAdapt repositories:
+Each recording path has one canonical implementation. A Production run uses
+the exact release and claim scope selected by the signed admission ledger.
 
-| Substrate | Maturity |
+| Substrate | Canonical implementation |
 | --- | --- |
-| Browser (web) | Beta; available in production today through the managed browser product |
-| Native desktop (Windows, macOS, Linux) | Available for customer-controlled execution; qualification evidence is task- and environment-specific |
-| Remote display (RDP) | Available for customer-controlled execution; qualification evidence is task- and environment-specific |
-| Citrix / VDI | Available for customer-controlled execution; real-environment ICA/HDX qualification is deployment-specific |
+| Browser (web) | The `openadapt-flow` Playwright recorder owns browser context, DOM identity, field geometry, navigation, and source-time secret exclusion. |
+| Native desktop (Windows, macOS, Linux) | `openadapt-capture` records native input, media, geometry, and local structural evidence. |
+| Remote display (RDP) | `openadapt-capture` records the client window; Flow treats the remote application as a visual black box. |
+| Citrix / VDI | `openadapt-capture` records the client window; deployment qualification proves the exact ICA/HDX environment. |
 
 The packages in the stack:
 
@@ -65,7 +62,7 @@ Documentation for the whole stack lives at
 
 | Recording path | Current implementation |
 | --- | --- |
-| Windows, macOS, and Linux demonstrations | `openadapt-capture` records native input and action-gated screen video; Windows can also retain action-time UI Automation evidence. `openadapt-flow` converts the session into compiler input. |
+| Windows, macOS, and Linux demonstrations | `openadapt-capture` records native input and action-gated screen video. It also retains action-time Windows UIA, macOS Accessibility, or Linux AT-SPI evidence when the local provider exposes it. `openadapt-flow` converts the session into compiler input. |
 | RDP and Citrix/VDI demonstrations | `openadapt-capture` records the selected client window in its own pixel space. The remote application remains externally black-box, and `openadapt-flow` converts the session into compiler input. |
 | Browser demonstrations | `openadapt-flow` uses its Playwright recorder. It can launch Chromium or attach to one existing signed-in local Chromium tab. It does not require this package. |
 | Chrome extension in this repository | Repository-only prototype. Its bridge and legacy direct replay are excluded from the wheel and source archive. It is not the supported recorder. |
@@ -76,15 +73,12 @@ frames, and source-time secret redaction to one recording contract. A Chrome
 extension cannot guarantee that contract across browser profiles, extension
 permissions, browser-internal pages, and process or tab disconnects.
 
-The extension remains useful as a research observer and as a possible future
-source of optional DOM evidence. It should become a supported auxiliary
-observer only after it emits the shared event schema, has a fail-closed
-connection and permission contract, redacts secret fields before persistence,
-and passes the same compiler qualification as the Playwright path. It should
-not replace the Playwright recorder merely to make the package layout uniform,
-create a second compiler format, or bypass governed replay. Flow supports an
-existing authenticated browser session through its local-loopback CDP attach
-mode.
+The extension remains a repository-only research prototype. It is not packaged
+or promoted as a recorder or replay path. Browser recording stays in Flow
+because DOM identity, field geometry, navigation, source-time secret exclusion,
+and browser-context ownership are load-bearing parts of one compiler contract.
+Flow supports an existing authenticated browser session through its
+local-loopback CDP attach mode.
 
 ## Use it with OpenAdapt
 
@@ -225,11 +219,12 @@ retain window-scoped pixels and coordinates for Flow's remote visual compiler.
 
 ## Window-scoped recording
 
-**Status: implemented, with display-free unit coverage on every
-supported operating system.** The production release gate also requires live
+Window-scoped recording is implemented with display-free unit coverage on every
+supported operating system. The production release gate also requires live
 window capture, input injection, movement, resize, video verification, and no
-skipped tests on interactive macOS and Windows runners. A customer RDP or
-Citrix deployment still requires task- and environment-specific qualification.
+skipped tests on interactive Linux, macOS, and Windows runners. A customer RDP
+or Citrix deployment still requires task- and environment-specific
+qualification.
 
 By default the recorder captures the full screen. Window-scoped mode records
 ONE window in that window's own pixel space. This is the mode built for
@@ -249,9 +244,9 @@ with Recorder(
     input("Perform the task, then press Enter...")
 ```
 
-`owner` matches the application (macOS: window owner name; Windows: process
-executable name) and `title` optionally disambiguates among its windows; both
-are case-insensitive substrings, mirroring how `openadapt-flow`'s
+`owner` matches the application (macOS: window owner name; Windows and X11:
+process executable name) and `title` optionally disambiguates among its
+windows; both are case-insensitive substrings, mirroring how `openadapt-flow`'s
 remote-display backend identifies the same window at replay time. The
 selectors can also be set via config/environment
 (`RECORD_WINDOW_OWNER` / `RECORD_WINDOW_TITLE`).
@@ -260,7 +255,9 @@ In this mode:
 
 - **Frames are the target window's pixels.** macOS captures the window's own
   buffer (`CGWindowListCreateImage`, the identical call flow's replay uses);
-  Windows grabs the window's screen region, so keep the window unoccluded.
+  Windows and native X11 grab the window's screen region, so keep the window
+  unoccluded. Native Wayland fails closed until a compositor portal supplies
+  stable window identity and geometry.
 - **Input coordinates are translated at capture time** into the captured
   frame's pixel space (`pixel = (global_point - window_origin) * scale`, the
   exact inverse of the replay mapping). Input outside the window records
@@ -269,13 +266,19 @@ In this mode:
   target, resolved window, initial bounds, fixed output viewport, current
   source viewport, scale-to-fit mapping, and content rectangle
   (`CaptureSession.window_capture`), and the window is re-resolved every
-  frame with bounds changes recorded as window events, a bounds timeline
-  converters can use to be exact even when the window moves.
+  frame. Each frame records a process-bound window identity, physical
+  coordinate source, and monotonic geometry generation. Every action binds
+  to that exact published generation. Capture refuses input during an
+  unobserved move or resize instead of translating against stale bounds.
 - **Window movement and resize are supported.** The first frame fixes the
   encoded video size. Later source frames scale to fit and letterbox into that
   viewport. Input uses the exact current bounds and content rectangle. No frame
   is silently skipped because the window changed size or moved to a display
   with a different scale.
+- **The geometry contract is versioned.** Current window sessions declare
+  `openadapt.capture.window-scoped/v2`. The frame pixels and WindowEvent share
+  one timestamp. Every pointer or keyboard action references that timestamp
+  and the exact geometry generation.
 - **Fail-loud guarantees:** recording refuses to start if the window cannot be
   resolved and captured; input arriving before the first frame is discarded
   with a warning instead of being recorded in the wrong coordinate space; a
@@ -382,15 +385,13 @@ session is required. See the
 - Display hot-plug, rotation, resolution changes, and scale changes require a
   new recording because one media stream has one fixed virtual-desktop viewport.
 - Browser-extension installation, bridge code, and direct replay are not part
-  of the published Capture artifacts or supported browser path. Promotion
-  requires the shared Flow schema, source-time secret exclusion, authenticated
-  and sequenced delivery, exact frame binding, compiler integration, and
-  removal of direct replay.
+  of the published Capture artifacts or supported browser path. The supported
+  browser recorder remains the Flow Playwright recorder.
 
-See the organization-wide
-[repository lifecycle registry](https://github.com/OpenAdaptAI/.github/blob/main/REPOSITORY_LIFECYCLE.md)
-and [`openadapt-flow` product status](https://github.com/OpenAdaptAI/openadapt-flow/blob/main/docs/PRODUCT_STATUS.md)
-for the evidence behind current maturity labels.
+The canonical
+[production admission ledger](https://github.com/OpenAdaptAI/.github/blob/main/production-lifecycle-admissions.json)
+binds each admitted claim scope to an exact release and evidence record. Package
+metadata and repository copy do not select Production maturity.
 
 ## Optional extras
 

@@ -90,6 +90,28 @@ def _first_structural_observation(
     return None
 
 
+def _first_binding_timestamp(events: list[ActionEvent], field: str) -> float | None:
+    """Retain the first primitive event's exact evidence timestamp."""
+    for event in events:
+        value = getattr(event, field)
+        if value is not None:
+            return value
+    return None
+
+
+def _consistent_window_geometry_generation(events: list[ActionEvent]) -> int | None:
+    """Return one shared generation or reject a mixed merged action."""
+    values = [event.window_geometry_generation for event in events]
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    if len(present) != len(values) or any(value != present[0] for value in present[1:]):
+        raise ValueError(
+            "cannot merge action primitives with missing or mixed window geometry generations"
+        )
+    return present[0]
+
+
 # =============================================================================
 # Event Processing Functions
 # =============================================================================
@@ -247,7 +269,16 @@ def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionE
                         modifiers=modifiers,
                         key=trigger,
                         children=list(keyboard_buffer),
+                        screenshot_timestamp=_first_binding_timestamp(
+                            list(keyboard_buffer), "screenshot_timestamp"
+                        ),
+                        window_event_timestamp=_first_binding_timestamp(
+                            list(keyboard_buffer), "window_event_timestamp"
+                        ),
                         structural_observation=_first_structural_observation(
+                            list(keyboard_buffer)
+                        ),
+                        window_geometry_generation=_consistent_window_geometry_generation(
                             list(keyboard_buffer)
                         ),
                     )
@@ -263,7 +294,16 @@ def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionE
                 timestamp=first_event.timestamp,
                 text=text,
                 children=list(keyboard_buffer),
+                screenshot_timestamp=_first_binding_timestamp(
+                    list(keyboard_buffer), "screenshot_timestamp"
+                ),
+                window_event_timestamp=_first_binding_timestamp(
+                    list(keyboard_buffer), "window_event_timestamp"
+                ),
                 structural_observation=_first_structural_observation(
+                    list(keyboard_buffer)
+                ),
+                window_geometry_generation=_consistent_window_geometry_generation(
                     list(keyboard_buffer)
                 ),
             )
@@ -325,7 +365,16 @@ def merge_consecutive_mouse_move_events(events: list[ActionEvent]) -> list[Actio
                 timestamp=first.timestamp,
                 x=last.x,
                 y=last.y,
+                screenshot_timestamp=_first_binding_timestamp(
+                    list(move_buffer), "screenshot_timestamp"
+                ),
+                window_event_timestamp=_first_binding_timestamp(
+                    list(move_buffer), "window_event_timestamp"
+                ),
                 structural_observation=_first_structural_observation(
+                    list(move_buffer)
+                ),
+                window_geometry_generation=_consistent_window_geometry_generation(
                     list(move_buffer)
                 ),
             )
@@ -377,7 +426,16 @@ def merge_consecutive_mouse_scroll_events(events: list[ActionEvent]) -> list[Act
                 y=first.y,
                 dx=total_dx,
                 dy=total_dy,
+                screenshot_timestamp=_first_binding_timestamp(
+                    list(scroll_buffer), "screenshot_timestamp"
+                ),
+                window_event_timestamp=_first_binding_timestamp(
+                    list(scroll_buffer), "window_event_timestamp"
+                ),
                 structural_observation=_first_structural_observation(
+                    list(scroll_buffer)
+                ),
+                window_geometry_generation=_consistent_window_geometry_generation(
                     list(scroll_buffer)
                 ),
             )
@@ -484,7 +542,18 @@ def merge_consecutive_mouse_click_events(
                             y=down.y,
                             button=down.button,
                             children=[down, up, next_down, next_up],
+                            screenshot_timestamp=_first_binding_timestamp(
+                                [down, up, next_down, next_up],
+                                "screenshot_timestamp",
+                            ),
+                            window_event_timestamp=_first_binding_timestamp(
+                                [down, up, next_down, next_up],
+                                "window_event_timestamp",
+                            ),
                             structural_observation=_first_structural_observation(
+                                [down, up, next_down, next_up]
+                            ),
+                            window_geometry_generation=_consistent_window_geometry_generation(
                                 [down, up, next_down, next_up]
                             ),
                         )
@@ -501,7 +570,16 @@ def merge_consecutive_mouse_click_events(
                     y=down.y,
                     button=down.button,
                     children=[down, up],
+                    screenshot_timestamp=_first_binding_timestamp(
+                        [down, up], "screenshot_timestamp"
+                    ),
+                    window_event_timestamp=_first_binding_timestamp(
+                        [down, up], "window_event_timestamp"
+                    ),
                     structural_observation=_first_structural_observation(
+                        [down, up]
+                    ),
+                    window_geometry_generation=_consistent_window_geometry_generation(
                         [down, up]
                     ),
                 )
@@ -568,7 +646,18 @@ def detect_drag_events(
                         dy=event.y - down_event.y,
                         button=down_event.button,
                         children=[down_event] + moves + [event],
+                        screenshot_timestamp=_first_binding_timestamp(
+                            [down_event] + moves + [event],
+                            "screenshot_timestamp",
+                        ),
+                        window_event_timestamp=_first_binding_timestamp(
+                            [down_event] + moves + [event],
+                            "window_event_timestamp",
+                        ),
                         structural_observation=_first_structural_observation(
+                            [down_event] + moves + [event]
+                        ),
+                        window_geometry_generation=_consistent_window_geometry_generation(
                             [down_event] + moves + [event]
                         ),
                     )
