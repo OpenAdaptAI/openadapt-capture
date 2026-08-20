@@ -1211,6 +1211,15 @@ class TestWindowCaptureLive:
         assert restored_data["window_id"] == str(target.window_id)
 
     def test_live_missing_window_fails_loud(self):
+        if sys.platform.startswith("linux"):
+            try:
+                _require_x11_session()
+            except WindowCaptureError as exc:
+                if _PRODUCTION_QUALIFICATION:
+                    raise AssertionError(
+                        "production qualification requires a native X11 display"
+                    ) from exc
+                pytest.skip(f"live missing-window test requires native X11: {exc}")
         scope = WindowCaptureScope(WindowTarget(owner="no-such-app-obviously-not-running-xyz"))
         with pytest.raises(WindowCaptureError, match="no window matching"):
             scope.capture_frame()
