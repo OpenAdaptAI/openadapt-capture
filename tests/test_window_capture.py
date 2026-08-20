@@ -8,7 +8,7 @@ The live smoke test (TestWindowCaptureLive) captures a REAL window and is
 gated like the input-injection tests in tests/test_performance.py: marked
 'slow', skipped on unsupported platforms and when
 OPENADAPT_CI_NO_INPUT_INJECTION=1 (hosted-runner session limitation). Run it
-on an interactive macOS/Windows desktop (e.g. the Parallels rig):
+on an interactive Linux, macOS, or Windows desktop:
 
     OPENADAPT_WINDOW_SMOKE_OWNER=Parallels pytest tests/test_window_capture.py -m slow
 """
@@ -26,12 +26,20 @@ from PIL import Image
 
 from openadapt_capture.capture import CaptureSession
 from openadapt_capture.db import create_db, crud
-from openadapt_capture.recorder import Recorder, read_screen_events
+from openadapt_capture.db.models import Recording
+from openadapt_capture.recorder import (
+    Recorder,
+    WindowScopedFrame,
+    read_screen_events,
+)
 from openadapt_capture.window_capture import (
+    WINDOW_CAPTURE_SCHEMA_VERSION,
     TargetWindow,
     WindowCaptureError,
     WindowCaptureScope,
     WindowTarget,
+    _require_x11_session,
+    _x11_library,
     build_window_scope,
     translate_point,
 )
@@ -123,6 +131,23 @@ class TestWindowTarget:
         assert isinstance(scope, WindowCaptureScope)
         assert scope.target.owner == "Parallels"
 
+    def test_native_wayland_fails_closed_even_when_xwayland_display_exists(self):
+        with pytest.raises(WindowCaptureError, match="Wayland"):
+            _require_x11_session(
+                {
+                    "XDG_SESSION_TYPE": "wayland",
+                    "WAYLAND_DISPLAY": "wayland-0",
+                    "DISPLAY": ":1",
+                }
+            )
+
+    def test_x11_requires_display(self):
+        with pytest.raises(WindowCaptureError, match="DISPLAY"):
+            _require_x11_session({"XDG_SESSION_TYPE": "x11"})
+
+    def test_x11_display_contract(self):
+        assert _require_x11_session({"XDG_SESSION_TYPE": "x11", "DISPLAY": ":99"}) == ":99"
+
 
 # ---------------------------------------------------------------------------
 # WindowCaptureScope with injected fakes (no display)
@@ -137,6 +162,7 @@ class FakePlatform:
         self.scale = scale
         self.window_id = 42
         self.title = "Fake Window"
+        self.process_start_time = 100.0
         self.missing = False
 
     def resolver(self, target: WindowTarget):
@@ -148,6 +174,8 @@ class FakePlatform:
             title=self.title,
             pid=1234,
             bounds=self.bounds,
+            process_start_time=self.process_start_time,
+            coordinate_source="fake-physical-pixels",
         )
 
     def capturer(self, window: TargetWindow) -> Image.Image:
@@ -227,7 +255,7 @@ class TestWindowCaptureScope:
             ]
         )
         scope = WindowCaptureScope(
-            WindowTarget(owner="Parallels"),
+            WindowTarget(owner="FakeApp"),
             resolver=fake.resolver,
             capturer=lambda _window: next(images),
         )
@@ -253,16 +281,17 @@ class TestWindowCaptureScope:
         scope.capture_frame()
         assert scope.translate(310.0, 170.0) == (420.0, 240.0)
 
-    def test_resolve_does_not_mix_new_bounds_with_previous_frame(self, scope, fake):
+    def test_action_refuses_bounds_without_a_matching_frame(self, scope, fake):
         scope.capture_frame()
         assert scope.translate(310.0, 170.0) == (20.0, 40.0)
 
         fake.bounds = (100.0, 50.0, 800.0, 600.0)
         scope.resolve()
 
-        # A resolver poll alone cannot commit geometry. Translation changes
-        # only after the corresponding frame has been captured.
-        assert scope.translate(310.0, 170.0) == (20.0, 40.0)
+        # A resolver poll alone cannot commit geometry. An action must halt
+        # until a frame with the new geometry enters the event stream.
+        with pytest.raises(WindowCaptureError, match="last published frame"):
+            scope.translate(310.0, 170.0)
         scope.capture_frame()
         assert scope.translate(310.0, 170.0) == (420.0, 240.0)
 
@@ -272,6 +301,59 @@ class TestWindowCaptureScope:
 
         with pytest.raises(WindowCaptureError, match="changed window identity"):
             scope.capture_frame()
+
+    def test_process_replacement_with_recycled_window_id_terminates_scope(self, scope, fake):
+        scope.capture_frame()
+        fake.process_start_time += 1.0
+
+        with pytest.raises(WindowCaptureError, match="owning process"):
+            scope.capture_frame()
+
+    def test_move_during_capture_never_commits_mixed_geometry(self, fake):
+        before = fake.bounds
+
+        def capture_then_move(window):
+            image = fake.capturer(window)
+            fake.bounds = (before[0] + 10.0, before[1], before[2], before[3])
+            return image
+
+        scope = WindowCaptureScope(
+            WindowTarget(owner="FakeApp"),
+            resolver=fake.resolver,
+            capturer=capture_then_move,
+        )
+
+        with pytest.raises(WindowCaptureError, match="while a frame was captured"):
+            scope.capture_frame()
+        assert scope.snapshot().get("geometry_generation") is None
+
+    def test_generation_changes_only_when_geometry_changes(self, scope, fake):
+        scope.capture_frame()
+        first = scope.window_event_data()["state"]
+        scope.capture_frame()
+        second = scope.window_event_data()["state"]
+        fake.bounds = (100.0, 50.0, 800.0, 600.0)
+        scope.capture_frame()
+        third = scope.window_event_data()["state"]
+
+        assert first["geometry_generation"] == 1
+        assert second["geometry_generation"] == 1
+        assert third["geometry_generation"] == 2
+        assert second["process_start_time"] == 100.0
+        assert second["coordinate_source"] == "fake-physical-pixels"
+
+    def test_unpublished_frame_cannot_change_action_geometry(self, scope, fake):
+        scope.capture_frame()
+        assert scope.translate_with_generation(310.0, 170.0)[2] == 1
+        fake.bounds = (100.0, 50.0, 800.0, 600.0)
+        scope.capture_frame(publish=False)
+
+        with pytest.raises(WindowCaptureError, match="last published frame"):
+            scope.translate(310.0, 170.0)
+
+        generation = scope.window_event_data()["state"]["geometry_generation"]
+        scope.publish_frame(generation)
+        assert scope.translate_with_generation(310.0, 170.0) == (420.0, 240.0, 2)
 
     def test_missing_window_raises_loudly(self, scope, fake):
         fake.missing = True
@@ -289,6 +371,35 @@ class TestWindowCaptureScope:
                 threading.Event(),
                 window_scope=scope,
             )
+
+    def test_screen_reader_queues_frame_and_geometry_atomically(self, scope):
+        terminate = threading.Event()
+
+        class OneFrameQueue(queue.Queue):
+            def put(self, item, *args, **kwargs):
+                super().put(item, *args, **kwargs)
+                terminate.set()
+
+        events = OneFrameQueue()
+        started = threading.Event()
+        read_screen_events(
+            events,
+            terminate,
+            SimpleNamespace(timestamp=time.time()),
+            started,
+            window_scope=scope,
+        )
+
+        frame = events.get_nowait()
+        assert frame.type == "screen"
+        assert isinstance(frame.data, WindowScopedFrame)
+        assert frame.data.geometry_generation == frame.data.window_event_data[
+            "state"
+        ]["geometry_generation"]
+        assert scope.translate_with_generation(310.0, 170.0)[2] == (
+            frame.data.geometry_generation
+        )
+        assert started.is_set()
 
     def test_window_event_data_matches_window_event_columns(self, scope):
         scope.capture_frame()
@@ -308,6 +419,7 @@ class TestWindowCaptureScope:
         assert data["window_id"] == "42"
         state = data["state"]
         assert state["window_capture"] is True
+        assert state["schema_version"] == WINDOW_CAPTURE_SCHEMA_VERSION
         assert state["scale"] == 2.0
         assert state["bounds"] == [300.0, 150.0, 800.0, 600.0]
         assert state["viewport"] == [1600, 1200]
@@ -322,6 +434,7 @@ class TestWindowCaptureScope:
     def test_snapshot_shape(self, scope):
         scope.capture_frame()
         snap = scope.snapshot()
+        assert snap["schema_version"] == WINDOW_CAPTURE_SCHEMA_VERSION
         assert snap["coordinate_space"] == "window_pixels"
         assert snap["target"] == {"owner": "FakeApp", "title": None}
         assert snap["window_id"] == 42
@@ -405,6 +518,7 @@ class TestActionTranslation:
         (event,) = self._drain(q)
         assert event.data["mouse_x"] == 20.0
         assert event.data["mouse_y"] == 40.0
+        assert event.data["window_geometry_generation"] == 1
 
     def test_mouse_action_before_first_frame_fails_session(self, scope):
         import queue
@@ -422,17 +536,35 @@ class TestActionTranslation:
             )
         assert self._drain(q) == []
 
-    def test_key_action_unaffected(self, scope):
+    def test_key_action_binds_to_exact_window_generation(self, scope):
         import queue
 
         from openadapt_capture import utils
         from openadapt_capture.recorder import trigger_action_event
 
         utils.set_start_time()
+        scope.capture_frame()
         q = queue.Queue()
         trigger_action_event(q, {"name": "press", "key_char": "a"}, scope)
         (event,) = self._drain(q)
         assert event.data["key_char"] == "a"
+        assert event.data["window_geometry_generation"] == 1
+
+    def test_key_action_refuses_stale_window_geometry(self, scope, fake):
+        import queue
+
+        from openadapt_capture import utils
+        from openadapt_capture.recorder import trigger_action_event
+
+        utils.set_start_time()
+        scope.capture_frame()
+        fake.bounds = (100.0, 50.0, 800.0, 600.0)
+        with pytest.raises(WindowCaptureError, match="last published frame"):
+            trigger_action_event(
+                queue.Queue(),
+                {"name": "press", "key_char": "a"},
+                scope,
+            )
 
     def test_no_scope_leaves_globals(self):
         import queue
@@ -445,6 +577,34 @@ class TestActionTranslation:
         trigger_action_event(q, {"name": "click", "mouse_x": 310.0, "mouse_y": 170.0})
         (event,) = self._drain(q)
         assert event.data["mouse_x"] == 310.0
+
+    def test_processed_click_rejects_mixed_geometry_generations(self):
+        from openadapt_capture.events import MouseDownEvent, MouseUpEvent
+        from openadapt_capture.processing import process_events
+
+        events = [
+            MouseDownEvent(
+                timestamp=1.0,
+                x=10,
+                y=20,
+                button="left",
+                screenshot_timestamp=0.9,
+                window_event_timestamp=0.9,
+                window_geometry_generation=1,
+            ),
+            MouseUpEvent(
+                timestamp=1.1,
+                x=10,
+                y=20,
+                button="left",
+                screenshot_timestamp=1.05,
+                window_event_timestamp=1.05,
+                window_geometry_generation=2,
+            ),
+        ]
+
+        with pytest.raises(ValueError, match="mixed window geometry"):
+            process_events(events)
 
 
 # ---------------------------------------------------------------------------
@@ -495,15 +655,114 @@ class TestWindowCapturePersistence:
         with CaptureSession.load(capture_path) as capture:
             assert capture.window_capture is None
 
+    def test_action_geometry_generation_round_trips(self, tmp_path):
+        capture_path = self._insert_recording(str(tmp_path / "cap"))
+        engine, Session = create_db(os.path.join(capture_path, "recording.db"))
+        session = Session()
+        recording = session.query(Recording).one()
+        evidence_timestamp = recording.timestamp + 0.01
+        crud.insert_action_event(
+            session,
+            recording,
+            recording.timestamp + 0.1,
+            {
+                "name": "move",
+                "mouse_x": 10.0,
+                "mouse_y": 20.0,
+                "screenshot_timestamp": evidence_timestamp,
+                "window_event_timestamp": evidence_timestamp,
+                "window_geometry_generation": 7,
+            },
+        )
+        session.close()
+        engine.dispose()
+
+        with CaptureSession.load(capture_path) as capture:
+            raw = capture.raw_events()
+            assert raw[0].window_geometry_generation == 7
+            assert raw[0].screenshot_timestamp == evidence_timestamp
+            assert raw[0].window_event_timestamp == evidence_timestamp
+            action = next(capture.actions(include_moves=True))
+            assert action.screenshot_timestamp == evidence_timestamp
+            assert action.window_event_timestamp == evidence_timestamp
+
+    def test_public_window_event_view_validates_v2_geometry(self, tmp_path, scope):
+        scope.capture_frame()
+        capture_path = self._insert_recording(str(tmp_path / "cap"))
+        engine, Session = create_db(os.path.join(capture_path, "recording.db"))
+        session = Session()
+        recording = session.query(Recording).one()
+        timestamp = recording.timestamp + 0.01
+        crud.insert_window_event(
+            session,
+            recording,
+            timestamp,
+            scope.window_event_data(),
+        )
+        session.close()
+        engine.dispose()
+
+        with CaptureSession.load(capture_path) as capture:
+            (event,) = capture.window_events()
+            assert event.timestamp == timestamp
+            assert event.window_capture_v2 is not None
+            assert event.window_capture_v2.geometry_generation == 1
+            assert capture.window_capture_events_v2() == [event]
+
+    def test_public_v2_window_event_rejects_column_mismatch(self, tmp_path, scope):
+        scope.capture_frame()
+        capture_path = self._insert_recording(str(tmp_path / "cap"))
+        engine, Session = create_db(os.path.join(capture_path, "recording.db"))
+        session = Session()
+        recording = session.query(Recording).one()
+        event_data = scope.window_event_data()
+        event_data["left"] += 1
+        crud.insert_window_event(
+            session,
+            recording,
+            recording.timestamp + 0.01,
+            event_data,
+        )
+        session.close()
+        engine.dispose()
+
+        with CaptureSession.load(capture_path) as capture:
+            with pytest.raises(ValueError, match="columns do not match"):
+                capture.window_capture_events_v2()
+
+    def test_legacy_action_table_adds_nullable_generation(self, tmp_path):
+        capture_path = self._insert_recording(str(tmp_path / "legacy"))
+        database_path = os.path.join(capture_path, "recording.db")
+        import sqlite3
+
+        connection = sqlite3.connect(database_path)
+        connection.execute(
+            "ALTER TABLE action_event DROP COLUMN window_geometry_generation"
+        )
+        connection.commit()
+        connection.close()
+
+        with CaptureSession.load(capture_path):
+            pass
+
+        connection = sqlite3.connect(database_path)
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(action_event)")
+        }
+        connection.close()
+        assert "window_geometry_generation" in columns
+
 
 # ---------------------------------------------------------------------------
 # Live smoke test: capture a REAL window (interactive desktop only)
 # ---------------------------------------------------------------------------
 
-_ON_SUPPORTED_PLATFORM = sys.platform in ("darwin", "win32")
+_ON_SUPPORTED_PLATFORM = sys.platform in ("darwin", "win32") or sys.platform.startswith(
+    "linux"
+)
 _PLATFORM_SKIP_REASON = (
-    "window-scoped capture supports macOS (CGWindowListCreateImage) and "
-    "Windows (Win32 + mss region grab) only; no Linux implementation"
+    "window-scoped capture supports macOS, Windows, and native X11 Linux"
 )
 # Same gate as the input-injection tests in tests/test_performance.py: on
 # hosted CI runners the job executes in a non-interactive session, so there
@@ -514,13 +773,17 @@ _PRODUCTION_QUALIFICATION = os.environ.get("OPENADAPT_CAPTURE_PRODUCTION_QUALIFI
 _SESSION_SKIP_REASON = (
     "OPENADAPT_CI_NO_INPUT_INJECTION=1: non-interactive hosted-runner session "
     "has no guaranteed capturable application window (hosted CI limitation, "
-    "not a window-capture bug); run on an interactive macOS/Windows desktop"
+    "not a window-capture bug); run on an interactive Linux, macOS, or Windows desktop"
 )
 # Default smoke target: a window that exists on any logged-in desktop.
 # Override on the rig: OPENADAPT_WINDOW_SMOKE_OWNER=Parallels
 _SMOKE_OWNER = os.environ.get(
     "OPENADAPT_WINDOW_SMOKE_OWNER",
-    "Finder" if sys.platform == "darwin" else "explorer",
+    (
+        "Finder"
+        if sys.platform == "darwin"
+        else "explorer" if sys.platform == "win32" else "gnome-terminal-server"
+    ),
 )
 _SMOKE_TITLE = os.environ.get("OPENADAPT_WINDOW_SMOKE_TITLE") or None
 
@@ -753,6 +1016,60 @@ def _temporary_macos_geometry(window: TargetWindow):
 
 
 @contextmanager
+def _temporary_linux_geometry(window: TargetWindow):
+    """Move and resize one X11 client, then restore its exact root geometry."""
+    import ctypes
+
+    display_name = _require_x11_session()
+    x11, display = _x11_library(display_name)
+    x11.XMoveResizeWindow.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.c_uint,
+    ]
+    x11.XMoveResizeWindow.restype = ctypes.c_int
+    x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XSync.restype = ctypes.c_int
+
+    original_x, original_y, original_width, original_height = window.bounds
+    target_width = max(320, round(original_width) - 137)
+    target_height = max(240, round(original_height) - 83)
+    if target_width == round(original_width):
+        target_width += 137
+    if target_height == round(original_height):
+        target_height += 83
+
+    mutated = False
+    try:
+        x11.XMoveResizeWindow(
+            display,
+            ctypes.c_ulong(window.window_id),
+            round(original_x) + 37,
+            round(original_y) + 29,
+            target_width,
+            target_height,
+        )
+        x11.XSync(display, 0)
+        mutated = True
+        yield
+    finally:
+        if mutated:
+            x11.XMoveResizeWindow(
+                display,
+                ctypes.c_ulong(window.window_id),
+                round(original_x),
+                round(original_y),
+                round(original_width),
+                round(original_height),
+            )
+            x11.XSync(display, 0)
+        x11.XCloseDisplay(display)
+
+
+@contextmanager
 def _temporary_window_geometry(window: TargetWindow):
     """Dispatch a reversible live geometry change to the current platform."""
     if sys.platform == "win32":
@@ -761,6 +1078,10 @@ def _temporary_window_geometry(window: TargetWindow):
         return
     if sys.platform == "darwin":
         with _temporary_macos_geometry(window):
+            yield
+        return
+    if sys.platform.startswith("linux"):
+        with _temporary_linux_geometry(window):
             yield
         return
     raise AssertionError(f"no live window geometry controller for {sys.platform}")
@@ -775,7 +1096,7 @@ class TestWindowCaptureLive:
     def _scope(self) -> WindowCaptureScope:
         scope = WindowCaptureScope(WindowTarget(owner=_SMOKE_OWNER, title=_SMOKE_TITLE))
         try:
-            scope.resolve()
+            target = scope.resolve()
         except WindowCaptureError as exc:
             if _PRODUCTION_QUALIFICATION:
                 raise AssertionError(
@@ -787,6 +1108,12 @@ class TestWindowCaptureLive:
                 f"title {_SMOKE_TITLE!r} on this desktop; open one (or set "
                 "OPENADAPT_WINDOW_SMOKE_OWNER) to run the live smoke test"
             )
+        if not target.on_screen:
+            if _PRODUCTION_QUALIFICATION:
+                raise AssertionError(
+                    "production qualification requires the target window to be on screen"
+                )
+            pytest.skip("the resolved smoke target is not currently on screen")
         return scope
 
     def test_live_window_frame_and_translation(self):
@@ -884,6 +1211,15 @@ class TestWindowCaptureLive:
         assert restored_data["window_id"] == str(target.window_id)
 
     def test_live_missing_window_fails_loud(self):
+        if sys.platform.startswith("linux"):
+            try:
+                _require_x11_session()
+            except WindowCaptureError as exc:
+                if _PRODUCTION_QUALIFICATION:
+                    raise AssertionError(
+                        "production qualification requires a native X11 display"
+                    ) from exc
+                pytest.skip(f"live missing-window test requires native X11: {exc}")
         scope = WindowCaptureScope(WindowTarget(owner="no-such-app-obviously-not-running-xyz"))
         with pytest.raises(WindowCaptureError, match="no window matching"):
             scope.capture_frame()

@@ -127,6 +127,9 @@ class ActionEvent(Base):
     # Versioned optional accessibility evidence captured at action time.
     # Nullable + additive migration keep older recording.db files readable.
     structural_observation = sa.Column(sa.JSON)
+    # Exact window-frame geometry bound to this action.
+    # Nullable keeps full-desktop and pre-1.3 captures compatible.
+    window_geometry_generation = sa.Column(sa.Integer)
     disabled = sa.Column(sa.Boolean, default=False)
 
     children = sa.orm.relationship("ActionEvent")

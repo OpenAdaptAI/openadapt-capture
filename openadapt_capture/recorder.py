@@ -31,6 +31,7 @@ import time
 import tracemalloc
 import uuid
 from collections import namedtuple
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable
 
@@ -63,11 +64,22 @@ from openadapt_capture.structural import (
     observe_structural_action,
 )
 from openadapt_capture.window_capture import (
+    WindowCaptureError,
     WindowCaptureScope,
     build_window_scope,
 )
 
 CoordinateScope = WindowCaptureScope | DesktopCaptureScope
+
+
+@dataclass(frozen=True)
+class WindowScopedFrame:
+    """One atomic frame plus the exact geometry that produced it."""
+
+    image: Any
+    window_event_data: dict[str, Any]
+    geometry_generation: int
+
 
 try:
     import soundfile
@@ -410,6 +422,21 @@ def process_events(
                 # behavior undefined, swallow for now
                 # XXX TODO: mitigate
         if event.type == "screen":
+            if isinstance(event.data, WindowScopedFrame):
+                scoped_frame = event.data
+                metadata_generation = scoped_frame.window_event_data.get("state", {}).get(
+                    "geometry_generation"
+                )
+                if metadata_generation != scoped_frame.geometry_generation:
+                    raise WindowCaptureError(
+                        "the scoped frame geometry generation does not match its metadata"
+                    )
+                prev_window_event = Event(
+                    event.timestamp,
+                    "window",
+                    scoped_frame.window_event_data,
+                )
+                event = event._replace(data=scoped_frame.image)
             prev_screen_event = event
             if config.RECORD_FULL_VIDEO:
                 video_event = event._replace(type="screen/video")
@@ -447,6 +474,17 @@ def process_events(
                 # Window capture disabled — skip window timestamp requirement
             else:
                 event.data["window_event_timestamp"] = prev_window_event.timestamp
+                action_generation = event.data.get("window_geometry_generation")
+                if action_generation is not None:
+                    window_generation = prev_window_event.data.get("state", {}).get(
+                        "geometry_generation"
+                    )
+                    if action_generation != window_generation:
+                        raise WindowCaptureError(
+                            "the action geometry generation does not match its "
+                            f"published frame: action={action_generation}, "
+                            f"frame={window_generation}"
+                        )
 
             process_event(
                 event,
@@ -859,9 +897,19 @@ def trigger_action_event(
             # The recorder captures and validates its first scoped frame before
             # starting input. A translation failure after that boundary means
             # evidence is incomplete and must terminate the session.
-            wx, wy = coordinate_scope.translate(x, y)
+            if isinstance(coordinate_scope, WindowCaptureScope):
+                wx, wy, generation = coordinate_scope.translate_with_generation(x, y)
+                action_event_args["window_geometry_generation"] = generation
+            else:
+                wx, wy = coordinate_scope.translate(x, y)
             action_event_args["mouse_x"] = wx
             action_event_args["mouse_y"] = wy
+    elif isinstance(coordinate_scope, WindowCaptureScope):
+        # Keyboard actions have no pointer coordinate, but still need the
+        # exact target identity and frame geometry that existed at action time.
+        action_event_args["window_geometry_generation"] = (
+            coordinate_scope.generation_for_action()
+        )
     event_q.put(
         Event(
             event_timestamp,
@@ -1054,23 +1102,15 @@ def read_screen_events(
 
     logger.info(f"Starting (fps={fps}, min_interval={min_interval:.3f}s)")
     started = False
-    announced_window = False
     while not terminate_processing.is_set():
         t_start = time.perf_counter()
         if window_scope is not None:
             # Any failed capture terminates the session. Retrying would omit a
             # frame while input continues and could produce complete-looking
             # evidence with a missing interval.
-            screenshot, window_changed = window_scope.capture_frame()
-            if window_changed or not announced_window:
-                event_q.put(
-                    Event(
-                        utils.get_timestamp(),
-                        "window",
-                        window_scope.window_event_data(),
-                    )
-                )
-                announced_window = True
+            screenshot, _window_changed = window_scope.capture_frame(publish=False)
+            window_event_data = window_scope.window_event_data()
+            generation = int(window_event_data["state"]["geometry_generation"])
         elif desktop_scope is not None:
             # A monitor can move or change scale while the combined frame keeps
             # the same dimensions. Check both sides of the grab so neither the
@@ -1084,10 +1124,29 @@ def read_screen_events(
         if screenshot is None:
             logger.warning("Screenshot was None")
             continue
+        frame_timestamp = utils.get_timestamp()
+        if window_scope is not None:
+            event_q.put(
+                Event(
+                    frame_timestamp,
+                    "screen",
+                    WindowScopedFrame(
+                        image=screenshot,
+                        window_event_data=window_event_data,
+                        geometry_generation=generation,
+                    ),
+                )
+            )
+            # Action observers can use this geometry only after the exact
+            # frame/metadata pair has entered the shared ordered queue.
+            window_scope.publish_frame(generation)
+        else:
+            event_q.put(Event(frame_timestamp, "screen", screenshot))
         if not started:
+            # Do not report this reader ready before its first exact frame is
+            # ordered and, for window scope, published for action translation.
             started_event.set()
             started = True
-        event_q.put(Event(utils.get_timestamp(), "screen", screenshot))
         # Throttle: sleep for the remainder of the frame interval
         if min_interval > 0:
             elapsed = time.perf_counter() - t_start
@@ -1681,7 +1740,7 @@ def record(
     initial_window_frame = None
     desktop_scope = None
     if window_scope is not None:
-        initial_window_frame, _ = window_scope.capture_frame()
+        initial_window_frame, _ = window_scope.capture_frame(publish=False)
         logger.info(
             f"window-scoped capture resolved: {window_scope.snapshot()} "
             f"initial frame {initial_window_frame.size}"

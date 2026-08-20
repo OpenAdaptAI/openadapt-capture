@@ -7,12 +7,14 @@ battle-tested implementation.
 
 from __future__ import annotations
 
+import math
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openadapt_capture.structural import StructuralObservation
+from openadapt_capture.window_capture import WINDOW_CAPTURE_SCHEMA_VERSION
 
 
 class EventType(str, Enum):
@@ -64,12 +66,101 @@ class BaseEvent(BaseModel):
     model_config = {"use_enum_values": True}
 
 
+class WindowCaptureStateV2(BaseModel):
+    """Exact per-frame geometry contract for a current window session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["openadapt.capture.window-scoped/v2"]
+    window_capture: Literal[True]
+    owner: str = Field(min_length=1)
+    pid: int = Field(gt=0)
+    process_start_time: float
+    coordinate_source: str = Field(min_length=1)
+    geometry_generation: int = Field(ge=1)
+    bounds: tuple[float, float, float, float]
+    scale: float = Field(gt=0)
+    scale_x: float = Field(gt=0)
+    scale_y: float = Field(gt=0)
+    viewport: tuple[int, int]
+    source_viewport: tuple[int, int]
+    content_rect: tuple[int, int, int, int]
+    fit_scale: float = Field(gt=0)
+    on_screen: bool
+
+    @model_validator(mode="after")
+    def validate_geometry(self) -> "WindowCaptureStateV2":
+        """Reject non-finite or internally inconsistent frame geometry."""
+        numeric = (
+            self.process_start_time,
+            *self.bounds,
+            self.scale,
+            self.scale_x,
+            self.scale_y,
+            self.fit_scale,
+        )
+        if not all(math.isfinite(float(value)) for value in numeric):
+            raise ValueError("window capture geometry must be finite")
+        if self.process_start_time <= 0 or self.bounds[2] <= 0 or self.bounds[3] <= 0:
+            raise ValueError("window capture process identity and bounds must be positive")
+        if any(value <= 0 for value in (*self.viewport, *self.source_viewport)):
+            raise ValueError("window capture viewports must be positive")
+        left, top, width, height = self.content_rect
+        if (
+            left < 0
+            or top < 0
+            or width <= 0
+            or height <= 0
+            or left + width > self.viewport[0]
+            or top + height > self.viewport[1]
+        ):
+            raise ValueError("window capture content_rect falls outside the viewport")
+        return self
+
+
+class CapturedWindowEvent(BaseModel):
+    """Public validated view of one stored WindowEvent row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    timestamp: float
+    title: str | None = None
+    left: int | None = None
+    top: int | None = None
+    width: int | None = None
+    height: int | None = None
+    window_id: str | None = None
+    state: dict[str, Any]
+
+    @property
+    def window_capture_v2(self) -> WindowCaptureStateV2 | None:
+        """Return strict v2 state, or None for a non-v2 legacy row."""
+        if self.state.get("schema_version") != WINDOW_CAPTURE_SCHEMA_VERSION:
+            return None
+        return WindowCaptureStateV2.model_validate(self.state)
+
+
 class ActionBaseEvent(BaseEvent):
     """Base event for native actions with optional structural evidence."""
 
+    screenshot_timestamp: float | None = Field(
+        default=None,
+        description="Exact preceding ScreenEvent timestamp retained by Capture",
+    )
+    window_event_timestamp: float | None = Field(
+        default=None,
+        description="Exact preceding WindowEvent timestamp retained by Capture",
+    )
     structural_observation: StructuralObservation | None = Field(
         default=None,
         description="Versioned accessibility evidence observed at action time",
+    )
+    window_geometry_generation: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Exact WindowEvent geometry generation bound to a window-scoped action"
+        ),
     )
 
 
