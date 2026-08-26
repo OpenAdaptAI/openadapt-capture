@@ -28,6 +28,7 @@ from openadapt_capture.events import (
     ActionEvent as PydanticActionEvent,
 )
 from openadapt_capture.events import (
+    CapturedWindowEvent,
     KeyDownEvent,
     KeyShortcutEvent,
     KeyTypeEvent,
@@ -36,6 +37,7 @@ from openadapt_capture.events import (
     MouseMoveEvent,
     MouseScrollEvent,
     MouseUpEvent,
+    WindowCaptureStateV2,
 )
 from openadapt_capture.processing import process_events
 from openadapt_capture.structural import StructuralObservation
@@ -48,6 +50,15 @@ if TYPE_CHECKING:
 
 class InvalidCaptureEvent(ValueError):
     """A stored input event lacks the data required for deterministic replay."""
+
+
+@dataclass(frozen=True)
+class CapturedFrame:
+    """Public identity of one retained source frame."""
+
+    timestamp: float
+    source_ordinal: int | None
+    png_sha256: str | None
 
 
 def _parse_structural_observation(raw: object) -> StructuralObservation | None:
@@ -110,10 +121,15 @@ def _convert_action_event(db_event) -> PydanticActionEvent:
     """
     common = {
         "timestamp": db_event.timestamp,
+        "source_ordinal": getattr(db_event, "source_ordinal", None),
         "structural_observation": _parse_structural_observation(
             getattr(db_event, "structural_observation", None)
         ),
         "screenshot_timestamp": getattr(db_event, "screenshot_timestamp", None),
+        "screenshot_source_ordinal": getattr(db_event, "screenshot_source_ordinal", None),
+        "window_event_timestamp": getattr(db_event, "window_event_timestamp", None),
+        "window_event_source_ordinal": getattr(db_event, "window_event_source_ordinal", None),
+        "window_geometry_generation": getattr(db_event, "window_geometry_generation", None),
     }
 
     if db_event.name == "move":
@@ -140,9 +156,7 @@ def _convert_action_event(db_event) -> PydanticActionEvent:
                 button=button,
             )
         else:
-            raise InvalidCaptureEvent(
-                "stored 'click' event has no pressed/released state"
-            )
+            raise InvalidCaptureEvent("stored 'click' event has no pressed/released state")
     elif db_event.name == "scroll":
         return MouseScrollEvent(
             **common,
@@ -194,15 +208,19 @@ def _parse_element_ref(raw: dict | None) -> SemanticElementRef | None:
     )
 
     state_raw = raw.get("state", {})
-    state = ElementState(
-        enabled=state_raw.get("enabled", True),
-        focused=state_raw.get("focused", False),
-        visible=state_raw.get("visible", True),
-        checked=state_raw.get("checked"),
-        selected=state_raw.get("selected"),
-        expanded=state_raw.get("expanded"),
-        value=state_raw.get("value"),
-    ) if isinstance(state_raw, dict) else ElementState()
+    state = (
+        ElementState(
+            enabled=state_raw.get("enabled", True),
+            focused=state_raw.get("focused", False),
+            visible=state_raw.get("visible", True),
+            checked=state_raw.get("checked"),
+            selected=state_raw.get("selected"),
+            expanded=state_raw.get("expanded"),
+            value=state_raw.get("value"),
+        )
+        if isinstance(state_raw, dict)
+        else ElementState()
+    )
 
     return SemanticElementRef(
         role=raw.get("role") or "",
@@ -318,9 +336,7 @@ def _convert_browser_event(db_event) -> "BrowserEvent | None":
                 tab_id=tab_id,
                 previous_url=payload.get("previousUrl", ""),
                 navigation_type=(
-                    NavigationType(nav_type)
-                    if nav_type in valid
-                    else NavigationType.LINK
+                    NavigationType(nav_type) if nav_type in valid else NavigationType.LINK
                 ),
             )
         elif event_type == BrowserEventType.MOUSEMOVE:
@@ -348,6 +364,7 @@ def _convert_browser_event(db_event) -> "BrowserEvent | None":
             )
     except Exception as e:
         import logging
+
         logging.getLogger(__name__).debug("Failed to parse browser event: %s", e)
     return None
 
@@ -367,6 +384,11 @@ class Action:
     def timestamp(self) -> float:
         """Unix timestamp of the action."""
         return self.event.timestamp
+
+    @property
+    def source_ordinal(self) -> int | None:
+        """Return the action's terminal primitive source-journal position."""
+        return self.event.source_ordinal
 
     @property
     def type(self) -> str:
@@ -450,6 +472,31 @@ class Action:
         return self.event.structural_observation
 
     @property
+    def screenshot_timestamp(self) -> float | None:
+        """Exact retained frame timestamp bound to this action."""
+        return self.event.screenshot_timestamp
+
+    @property
+    def screenshot_source_ordinal(self) -> int | None:
+        """Return the exact source-journal position of the bound frame."""
+        return self.event.screenshot_source_ordinal
+
+    @property
+    def window_event_timestamp(self) -> float | None:
+        """Exact atomic WindowEvent timestamp bound to this action."""
+        return self.event.window_event_timestamp
+
+    @property
+    def window_event_source_ordinal(self) -> int | None:
+        """Return the source-journal position of the bound native geometry."""
+        return self.event.window_event_source_ordinal
+
+    @property
+    def window_geometry_generation(self) -> int | None:
+        """Exact native geometry generation bound to this action."""
+        return self.event.window_geometry_generation
+
+    @property
     def screenshot(self) -> "Image" | None:
         """Get the exact retained screen frame this action is bound to.
 
@@ -497,6 +544,8 @@ class CaptureSession:
         self.capture_dir = Path(capture_dir)
         self._session = session
         self._recording = recording
+        self._verified_tempdir = None
+        self._verified_terminal = None
 
     @classmethod
     def load(cls, capture_dir: str | Path) -> "CaptureSession":
@@ -542,6 +591,41 @@ class CaptureSession:
             raise FileNotFoundError(f"Invalid capture (no recording found): {capture_dir}")
 
         return cls(capture_dir, session, recording)
+
+    @classmethod
+    def load_verified(cls, capture_dir: str | Path) -> "CaptureSession":
+        """Verify a completed capture, snapshot it, and open its DB immutable."""
+        from openadapt_capture.db import get_immutable_session_for_path
+        from openadapt_capture.db.models import Recording
+        from openadapt_capture.terminal import copy_verified_capture
+
+        temporary, snapshot_dir, terminal = copy_verified_capture(capture_dir)
+        session = get_immutable_session_for_path(str(snapshot_dir / "recording.db"))
+
+        def _discard() -> None:
+            bind = session.get_bind()
+            session.close()
+            if bind is not None:
+                bind.dispose()
+            temporary.cleanup()
+
+        try:
+            recording = session.query(Recording).first()
+        except Exception:
+            _discard()
+            raise
+        if recording is None:
+            _discard()
+            raise FileNotFoundError(f"Invalid capture (no recording found): {capture_dir}")
+        result = cls(snapshot_dir, session, recording)
+        result._verified_tempdir = temporary
+        result._verified_terminal = terminal
+        return result
+
+    @property
+    def terminal(self):
+        """Return the verified immutable terminal, or None for a legacy load."""
+        return self._verified_terminal
 
     @property
     def id(self) -> str:
@@ -702,6 +786,71 @@ class CaptureSession:
             events.append(_convert_action_event(db_event))
         return events
 
+    def window_events(self) -> list[CapturedWindowEvent]:
+        """Return stored window rows through the public validated event view."""
+        result: list[CapturedWindowEvent] = []
+        for row in self._recording.window_events:
+            state = getattr(row, "state", None)
+            if not isinstance(state, dict):
+                raise InvalidCaptureEvent(
+                    f"stored WindowEvent at {row.timestamp!r} has invalid state"
+                )
+            result.append(
+                CapturedWindowEvent(
+                    timestamp=row.timestamp,
+                    source_ordinal=getattr(row, "source_ordinal", None),
+                    title=row.title,
+                    left=row.left,
+                    top=row.top,
+                    width=row.width,
+                    height=row.height,
+                    window_id=row.window_id,
+                    state=state,
+                )
+            )
+        return result
+
+    def frames(self) -> list[CapturedFrame]:
+        """Return the retained frame timeline without exposing database rows."""
+        return [
+            CapturedFrame(
+                timestamp=row.timestamp,
+                source_ordinal=getattr(row, "source_ordinal", None),
+                png_sha256=getattr(row, "png_sha256", None),
+            )
+            for row in self._recording.screenshots
+        ]
+
+    def window_capture_events_v2(self) -> list[CapturedWindowEvent]:
+        """Return all rows from a declared v2 window-scoped session."""
+        metadata = self.window_capture
+        if metadata is None:
+            return []
+        if metadata.get("schema_version") != "openadapt.capture.window-scoped/v2":
+            raise InvalidCaptureEvent(
+                "window-scoped capture does not declare the supported v2 schema"
+            )
+        result = self.window_events()
+        if not result:
+            raise InvalidCaptureEvent("v2 window-scoped capture has no window events")
+        for event in result:
+            state: WindowCaptureStateV2 | None = event.window_capture_v2
+            if state is None:
+                raise InvalidCaptureEvent("v2 window-scoped capture contains a non-v2 window event")
+            if event.window_id != state.window_id:
+                raise InvalidCaptureEvent("stored WindowEvent identity differs from its v2 state")
+            x, y, width, height = state.bounds
+            if (
+                event.left != int(x)
+                or event.top != int(y)
+                or event.width != int(width)
+                or event.height != int(height)
+            ):
+                raise InvalidCaptureEvent("stored WindowEvent columns differ from their v2 bounds")
+            if not state.on_screen:
+                raise InvalidCaptureEvent("v2 window event retained an off-screen target")
+        return result
+
     def actions(self, include_moves: bool = False) -> Iterator[Action]:
         """Iterate over processed actions.
 
@@ -825,6 +974,9 @@ class CaptureSession:
             if bind is not None:
                 bind.dispose()
             self._session = None
+        if self._verified_tempdir is not None:
+            self._verified_tempdir.cleanup()
+            self._verified_tempdir = None
 
     def __enter__(self) -> "CaptureSession":
         """Context manager entry."""

@@ -26,7 +26,13 @@ from PIL import Image
 
 from openadapt_capture.capture import CaptureSession
 from openadapt_capture.db import create_db, crud
-from openadapt_capture.recorder import Recorder, read_screen_events
+from openadapt_capture.desktop_capture import DesktopCaptureScope
+from openadapt_capture.recorder import (
+    OrderedEventJournal,
+    Recorder,
+    WindowScopedFrame,
+    read_screen_events,
+)
 from openadapt_capture.window_capture import (
     TargetWindow,
     WindowCaptureError,
@@ -138,6 +144,7 @@ class FakePlatform:
         self.window_id = 42
         self.title = "Fake Window"
         self.missing = False
+        self.process_start_time = 123.5
 
     def resolver(self, target: WindowTarget):
         if self.missing:
@@ -148,6 +155,8 @@ class FakePlatform:
             title=self.title,
             pid=1234,
             bounds=self.bounds,
+            process_start_time=self.process_start_time,
+            coordinate_source="test-screen-points",
         )
 
     def capturer(self, window: TargetWindow) -> Image.Image:
@@ -163,11 +172,19 @@ def fake():
 
 @pytest.fixture
 def scope(fake):
-    return WindowCaptureScope(
+    result = WindowCaptureScope(
         WindowTarget(owner="FakeApp"),
         resolver=fake.resolver,
         capturer=fake.capturer,
     )
+    result.bind_display_topology(
+        {
+            "schema_version": "openadapt.capture.display-topology/v1",
+            "topology_sha256": "a" * 64,
+        },
+        lambda **_kwargs: None,
+    )
+    return result
 
 
 class TestWindowCaptureScope:
@@ -227,9 +244,16 @@ class TestWindowCaptureScope:
             ]
         )
         scope = WindowCaptureScope(
-            WindowTarget(owner="Parallels"),
+            WindowTarget(owner="FakeApp"),
             resolver=fake.resolver,
             capturer=lambda _window: next(images),
+        )
+        scope.bind_display_topology(
+            {
+                "schema_version": "openadapt.capture.display-topology/v1",
+                "topology_sha256": "a" * 64,
+            },
+            lambda **_kwargs: None,
         )
         scope.capture_frame()
         scope.capture_frame()
@@ -260,9 +284,10 @@ class TestWindowCaptureScope:
         fake.bounds = (100.0, 50.0, 800.0, 600.0)
         scope.resolve()
 
-        # A resolver poll alone cannot commit geometry. Translation changes
-        # only after the corresponding frame has been captured.
-        assert scope.translate(310.0, 170.0) == (20.0, 40.0)
+        # A resolver poll alone cannot commit geometry. Input stops until a
+        # frame with the new bounds is captured and published.
+        with pytest.raises(WindowCaptureError, match="moved or resized"):
+            scope.translate(310.0, 170.0)
         scope.capture_frame()
         assert scope.translate(310.0, 170.0) == (420.0, 240.0)
 
@@ -289,6 +314,28 @@ class TestWindowCaptureScope:
                 threading.Event(),
                 window_scope=scope,
             )
+
+    def test_screen_reader_retains_terminal_frame_after_input_finishes(self, scope):
+        journal = OrderedEventJournal()
+        terminate = threading.Event()
+        terminate.set()
+        input_finished = threading.Event()
+        input_finished.set()
+
+        read_screen_events(
+            journal,
+            terminate,
+            SimpleNamespace(timestamp=time.time()),
+            threading.Event(),
+            window_scope=scope,
+            input_finished=input_finished,
+        )
+
+        event = journal.get_nowait()
+        assert event.source_ordinal == 1
+        assert isinstance(event.data, WindowScopedFrame)
+        assert event.data.geometry_generation == 1
+        assert journal.empty()
 
     def test_window_event_data_matches_window_event_columns(self, scope):
         scope.capture_frame()
@@ -429,6 +476,7 @@ class TestActionTranslation:
         from openadapt_capture.recorder import trigger_action_event
 
         utils.set_start_time()
+        scope.capture_frame()
         q = queue.Queue()
         trigger_action_event(q, {"name": "press", "key_char": "a"}, scope)
         (event,) = self._drain(q)
@@ -775,7 +823,7 @@ class TestWindowCaptureLive:
     def _scope(self) -> WindowCaptureScope:
         scope = WindowCaptureScope(WindowTarget(owner=_SMOKE_OWNER, title=_SMOKE_TITLE))
         try:
-            scope.resolve()
+            resolved = scope.resolve()
         except WindowCaptureError as exc:
             if _PRODUCTION_QUALIFICATION:
                 raise AssertionError(
@@ -787,6 +835,12 @@ class TestWindowCaptureLive:
                 f"title {_SMOKE_TITLE!r} on this desktop; open one (or set "
                 "OPENADAPT_WINDOW_SMOKE_OWNER) to run the live smoke test"
             )
+        if not resolved.on_screen:
+            if _PRODUCTION_QUALIFICATION:
+                raise AssertionError("the production qualification window is not on screen")
+            pytest.skip("the matching live smoke-test window is not on screen")
+        desktop = DesktopCaptureScope.current()
+        scope.bind_display_topology(desktop.snapshot(), desktop.assert_current)
         return scope
 
     def test_live_window_frame_and_translation(self):
@@ -885,5 +939,12 @@ class TestWindowCaptureLive:
 
     def test_live_missing_window_fails_loud(self):
         scope = WindowCaptureScope(WindowTarget(owner="no-such-app-obviously-not-running-xyz"))
+        scope.bind_display_topology(
+            {
+                "schema_version": "openadapt.capture.display-topology/v1",
+                "topology_sha256": "a" * 64,
+            },
+            lambda **_kwargs: None,
+        )
         with pytest.raises(WindowCaptureError, match="no window matching"):
             scope.capture_frame()

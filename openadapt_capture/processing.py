@@ -105,6 +105,51 @@ def _bound_screenshot_timestamp(events: list[ActionEvent]) -> float | None:
     return bound
 
 
+def _merged_frame_binding(events: list[ActionEvent]) -> dict[str, float | int | None]:
+    """Return the terminal child binding and reject a mixed native epoch."""
+    if not events:
+        return {
+            "source_ordinal": None,
+            "screenshot_timestamp": None,
+            "screenshot_source_ordinal": None,
+            "window_event_timestamp": None,
+            "window_event_source_ordinal": None,
+            "window_geometry_generation": None,
+        }
+    generations = [event.window_geometry_generation for event in events]
+    if any(value is not None for value in generations):
+        if any(value is None for value in generations):
+            raise ValueError(
+                "cannot merge native action primitives with an incomplete geometry binding"
+            )
+        if len(set(generations)) != 1:
+            raise ValueError(
+                "cannot merge native action primitives across geometry epochs"
+            )
+        for event in events:
+            if (
+                event.screenshot_timestamp is None
+                or event.screenshot_source_ordinal is None
+                or event.window_event_timestamp is None
+                or event.window_event_source_ordinal is None
+                or event.screenshot_timestamp != event.window_event_timestamp
+                or event.screenshot_source_ordinal
+                != event.window_event_source_ordinal
+            ):
+                raise ValueError(
+                    "cannot merge a native action without one atomic frame/window pair"
+                )
+    terminal = events[-1]
+    return {
+        "source_ordinal": terminal.source_ordinal,
+        "screenshot_timestamp": terminal.screenshot_timestamp,
+        "screenshot_source_ordinal": terminal.screenshot_source_ordinal,
+        "window_event_timestamp": terminal.window_event_timestamp,
+        "window_event_source_ordinal": terminal.window_event_source_ordinal,
+        "window_geometry_generation": terminal.window_geometry_generation,
+    }
+
+
 # =============================================================================
 # Event Processing Functions
 # =============================================================================
@@ -265,9 +310,7 @@ def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionE
                         structural_observation=_first_structural_observation(
                             list(keyboard_buffer)
                         ),
-                        screenshot_timestamp=_bound_screenshot_timestamp(
-                            list(keyboard_buffer)
-                        ),
+                        **_merged_frame_binding(list(keyboard_buffer)),
                     )
                 )
         else:
@@ -284,7 +327,7 @@ def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionE
                 structural_observation=_first_structural_observation(
                     list(keyboard_buffer)
                 ),
-                screenshot_timestamp=_bound_screenshot_timestamp(list(keyboard_buffer)),
+                **_merged_frame_binding(list(keyboard_buffer)),
             )
             result.append(type_event)
 
@@ -347,7 +390,7 @@ def merge_consecutive_mouse_move_events(events: list[ActionEvent]) -> list[Actio
                 structural_observation=_first_structural_observation(
                     list(move_buffer)
                 ),
-                screenshot_timestamp=_bound_screenshot_timestamp(list(move_buffer)),
+                **_merged_frame_binding(list(move_buffer)),
             )
             result.append(merged)
 
@@ -400,7 +443,7 @@ def merge_consecutive_mouse_scroll_events(events: list[ActionEvent]) -> list[Act
                 structural_observation=_first_structural_observation(
                     list(scroll_buffer)
                 ),
-                screenshot_timestamp=_bound_screenshot_timestamp(list(scroll_buffer)),
+                **_merged_frame_binding(list(scroll_buffer)),
             )
             result.append(merged)
 
@@ -508,9 +551,7 @@ def merge_consecutive_mouse_click_events(
                             structural_observation=_first_structural_observation(
                                 [down, up, next_down, next_up]
                             ),
-                            screenshot_timestamp=_bound_screenshot_timestamp(
-                                [down, up, next_down, next_up]
-                            ),
+                            **_merged_frame_binding([down, up, next_down, next_up]),
                         )
                         result.append(double_click)
                         skip_timestamps.add(up.timestamp)
@@ -528,7 +569,7 @@ def merge_consecutive_mouse_click_events(
                     structural_observation=_first_structural_observation(
                         [down, up]
                     ),
-                    screenshot_timestamp=_bound_screenshot_timestamp([down, up]),
+                    **_merged_frame_binding([down, up]),
                 )
                 result.append(single_click)
                 skip_timestamps.add(up.timestamp)
@@ -596,9 +637,7 @@ def detect_drag_events(
                         structural_observation=_first_structural_observation(
                             [down_event] + moves + [event]
                         ),
-                        screenshot_timestamp=_bound_screenshot_timestamp(
-                            [down_event] + moves + [event]
-                        ),
+                        **_merged_frame_binding([down_event] + moves + [event]),
                     )
                     result.append(drag)
                 else:

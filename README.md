@@ -262,6 +262,13 @@ In this mode:
   (`CaptureSession.window_capture`), and the window is re-resolved every
   frame with bounds changes recorded as window events, a bounds timeline
   converters can use to be exact even when the window moves.
+- **Each frame has one ordered geometry identity.** Current window captures
+  store the frame and its window event under the same source ordinal. An action
+  stores a later ordinal and names the exact earlier pair it used. The pair
+  binds the process start identity, display topology, bounds, scale, fixed
+  viewport, and geometry generation. Recorder shutdown retains one final frame
+  after input has stopped, so a consumer can select an exact after-action frame
+  by ordinal instead of by nearest timestamp.
 - **Window movement and resize are supported.** The first frame fixes the
   encoded video size. Later source frames scale to fit and letterbox into that
   viewport. Input uses the exact current bounds and content rectangle. No frame
@@ -276,6 +283,15 @@ In this mode:
 Note for converters: window-mode coordinates are already in captured-frame
 pixels (`coordinate_space == "window_pixels"`); do not rescale them by
 `pixel_ratio`.
+
+After every producer and writer has stopped, `Recorder` verifies the database
+and writes `capture-artifact-manifest.json` plus `capture-terminal.json`. The
+terminal binds the complete artifact inventory, event counts, final source
+ordinal, capture session identity, and completion time. A current native
+consumer should use `CaptureSession.load_verified()`. It checks the seal, copies
+the exact artifacts into a private snapshot, and opens the copied database in
+SQLite immutable read-only mode. A current window capture without this seal is
+incomplete and must not be compiled as native geometry evidence.
 
 ## Multiple monitors
 
