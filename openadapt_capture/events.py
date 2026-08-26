@@ -205,6 +205,15 @@ class ActionBaseEvent(BaseEvent):
         ge=1,
         description="Source journal ordinal of the exact retained screen frame",
     )
+    after_screenshot_timestamp: float | None = Field(
+        default=None,
+        description="Exact timestamp of the first retained frame after this action",
+    )
+    after_screenshot_source_ordinal: int | None = Field(
+        default=None,
+        ge=1,
+        description="Source journal ordinal of the exact retained after frame",
+    )
     window_event_timestamp: float | None = Field(
         default=None,
         description="Exact WindowEvent timestamp paired with the bound frame",
@@ -214,10 +223,24 @@ class ActionBaseEvent(BaseEvent):
         ge=1,
         description="Source journal ordinal of the geometry paired with the frame",
     )
+    after_window_event_timestamp: float | None = Field(
+        default=None,
+        description="Exact WindowEvent timestamp paired with the retained after frame",
+    )
+    after_window_event_source_ordinal: int | None = Field(
+        default=None,
+        ge=1,
+        description="Source journal ordinal of geometry paired with the after frame",
+    )
     window_geometry_generation: int | None = Field(
         default=None,
         ge=1,
         description="Exact native geometry generation bound to this action",
+    )
+    after_window_geometry_generation: int | None = Field(
+        default=None,
+        ge=1,
+        description="Exact native geometry generation paired with the after frame",
     )
 
 

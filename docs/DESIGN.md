@@ -139,6 +139,10 @@ Platform observers have one ordered callback contract. They identify injected
 events when the operating system provides that information. Capture can exclude
 its own injected qualification events from a normal session. It refuses an
 incomplete observer startup instead of reporting partial coverage as complete.
+On macOS, an active pass-through session tap holds downstream event delivery
+only while Capture commits a clean frame. This requires both Input Monitoring
+and Accessibility permission. The interactive macOS qualification proves that
+an annotated downstream event cannot pass that cut before the frame commit.
 
 The post-processing layer merges primitive events into higher-level actions.
 The compiler remains responsible for refusing action forms that its selected

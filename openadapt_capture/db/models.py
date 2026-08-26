@@ -103,9 +103,13 @@ class ActionEvent(Base):
     screenshot_timestamp = sa.Column(ForceFloat)
     screenshot_source_ordinal = sa.Column(sa.Integer)
     screenshot_id = sa.Column(sa.ForeignKey("screenshot.id"))
+    after_screenshot_timestamp = sa.Column(ForceFloat)
+    after_screenshot_source_ordinal = sa.Column(sa.Integer)
     window_event_timestamp = sa.Column(ForceFloat)
     window_event_source_ordinal = sa.Column(sa.Integer)
     window_event_id = sa.Column(sa.ForeignKey("window_event.id"))
+    after_window_event_timestamp = sa.Column(ForceFloat)
+    after_window_event_source_ordinal = sa.Column(sa.Integer)
     browser_event_timestamp = sa.Column(ForceFloat)
     browser_event_id = sa.Column(sa.ForeignKey("browser_event.id"))
     mouse_x = sa.Column(sa.Numeric(asdecimal=False))
@@ -133,6 +137,8 @@ class ActionEvent(Base):
     # Exact native geometry generation bound to the action's retained frame.
     # Nullable keeps legacy and full-desktop captures readable.
     window_geometry_generation = sa.Column(sa.Integer)
+    # Exact geometry generation paired with the first retained after frame.
+    after_window_geometry_generation = sa.Column(sa.Integer)
     disabled = sa.Column(sa.Boolean, default=False)
 
     children = sa.orm.relationship("ActionEvent")

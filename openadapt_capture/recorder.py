@@ -51,6 +51,8 @@ from openadapt_capture.db.models import ActionEvent, Recording
 from openadapt_capture.desktop_capture import DesktopCaptureScope
 from openadapt_capture.extensions import synchronized_queue as sq
 from openadapt_capture.input_observer import (
+    InputObserver,
+    InputObserverError,
     ObservedInput,
     ObservedKey,
     ObservedMouseButton,
@@ -81,6 +83,93 @@ class WindowScopedFrame:
     image: Any
     window_event_data: dict[str, Any]
     geometry_generation: int
+
+
+@dataclass(frozen=True)
+class _NativeFrameBoundaryUse:
+    observer: InputObserver
+    token: object | None
+
+
+class _NativeFrameBoundaryClosed(RuntimeError):
+    """The input reader closed before another ordinary frame could start."""
+
+
+class NativeInputFrameBoundary:
+    """Coordinate window pixels with the active native input observer."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._observer: InputObserver | None = None
+        self._state = "pending"
+        self._failure: BaseException | None = None
+        self._active = 0
+
+    def attach(self, observer: InputObserver) -> None:
+        with self._condition:
+            if self._state != "pending" or self._observer is not None:
+                raise InputObserverError("native frame boundary attached more than once")
+            self._observer = observer
+            self._state = "active"
+            self._condition.notify_all()
+
+    def begin(self) -> _NativeFrameBoundaryUse:
+        with self._condition:
+            while self._state == "pending":
+                self._condition.wait()
+            if self._failure is not None:
+                raise self._failure
+            if self._state != "active" or self._observer is None:
+                raise _NativeFrameBoundaryClosed()
+            observer = self._observer
+            self._active += 1
+        try:
+            token = observer.begin_frame_capture()
+        except BaseException:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+            raise
+        return _NativeFrameBoundaryUse(observer, token)
+
+    @staticmethod
+    def finish(use: _NativeFrameBoundaryUse) -> bool:
+        return use.observer.finish_frame_capture(use.token)
+
+    @staticmethod
+    def seal(use: _NativeFrameBoundaryUse) -> None:
+        use.observer.seal_frame_capture(use.token)
+
+    def complete(self, use: _NativeFrameBoundaryUse) -> None:
+        try:
+            use.observer.complete_frame_capture(use.token)
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+
+    def begin_close(self) -> None:
+        with self._condition:
+            if self._state in {"closed", "failed"}:
+                return
+            self._state = "closing"
+            self._condition.notify_all()
+            while self._active:
+                self._condition.wait()
+
+    def close(self) -> None:
+        with self._condition:
+            if self._state == "failed":
+                return
+            self._state = "closed"
+            self._condition.notify_all()
+
+    def fail(self, failure: BaseException) -> None:
+        with self._condition:
+            if self._failure is None:
+                self._failure = failure
+            self._state = "failed"
+            self._condition.notify_all()
 
 
 try:
@@ -155,6 +244,11 @@ class EventReservation:
     def source_ordinal(self) -> int:
         return self._entry.sequence
 
+    @property
+    def finished(self) -> bool:
+        """Return whether this producer has completed or failed its position."""
+        return self._finished
+
     def complete(self, event: Event) -> None:
         if self._finished:
             raise RuntimeError("the event journal reservation is already complete")
@@ -180,6 +274,48 @@ class EventReservation:
             self._entry.ready = True
             self._finished = True
             self._journal._condition.notify_all()
+
+
+class WindowActionReservation:
+    """A source position and the exact published geometry at native receipt."""
+
+    def __init__(
+        self,
+        reservation: EventReservation,
+        window_scope: WindowCaptureScope,
+        geometry: tuple[Any, float, float, tuple[int, int, int, int], int],
+    ) -> None:
+        self._reservation = reservation
+        self._window_scope = window_scope
+        self._geometry = geometry
+
+    @property
+    def source_ordinal(self) -> int:
+        return self._reservation.source_ordinal
+
+    @property
+    def finished(self) -> bool:
+        return self._reservation.finished
+
+    def bind(
+        self,
+        x: float | None,
+        y: float | None,
+    ) -> tuple[float, float, int] | int:
+        """Bind normalized input to geometry reserved at native receipt."""
+        if x is not None and y is not None:
+            return self._window_scope.translate_reserved_geometry(
+                self._geometry,
+                x,
+                y,
+            )
+        return self._window_scope.generation_for_reserved_geometry(self._geometry)
+
+    def complete(self, event: Event) -> None:
+        self._reservation.complete(event)
+
+    def fail(self, error: BaseException) -> None:
+        self._reservation.fail(error)
 
 
 class OrderedEventJournal:
@@ -240,6 +376,29 @@ class OrderedEventJournal:
                     self._condition.notify_all()
                     raise
         return reservation, binding
+
+    def reserve_window_action_receipt(
+        self,
+        timestamp: float,
+        window_scope: WindowCaptureScope,
+    ) -> WindowActionReservation:
+        """Reserve order and geometry at the first native input boundary."""
+        timestamp = float(timestamp)
+        if not math.isfinite(timestamp):
+            raise EventJournalOrderingError("event timestamps must be finite")
+        with window_scope.observation_boundary():
+            with self._condition:
+                entry = self._reserve_locked(timestamp)
+                reservation = EventReservation(self, entry)
+                try:
+                    geometry = window_scope.reserve_action_geometry()
+                except BaseException as exc:
+                    entry.error = exc
+                    entry.ready = True
+                    reservation._finished = True
+                    self._condition.notify_all()
+                    raise
+        return WindowActionReservation(reservation, window_scope, geometry)
 
     def put(self, event: Event, block: bool = True, timeout: float | None = None) -> None:
         del block, timeout
@@ -364,6 +523,7 @@ PROC_WRITE_BY_EVENT_TYPE = {
 NUM_MEMORY_STATS_TO_LOG = 3
 STARTUP_WAIT_POLL_SECONDS = 0.1
 PRE_READY_TASK_JOIN_TIMEOUT_SECONDS = 2.0
+TERMINAL_FRAME_SEAL_TIMEOUT_SECONDS = 10.0
 
 stop_sequence_detected = False
 
@@ -588,12 +748,60 @@ def process_events(
     prev_saved_window_timestamp = 0
     prev_saved_screen_ordinal = 0
     prev_saved_window_ordinal = 0
+    pending_action_events: list[Event] = []
     started = False
 
     def processing_complete() -> bool:
         if producers_finished is not None:
             return producers_finished.is_set() and event_q.empty()
         return terminate_processing.is_set() and event_q.empty()
+
+    def write_bound_action(action_event: Event) -> None:
+        process_event(
+            action_event,
+            action_write_q,
+            write_action_event,
+            recording,
+            perf_q,
+        )
+        num_action_events.value += 1
+
+    def bind_pending_actions(
+        after_screen_event: Event,
+        after_window_event: Event | None,
+    ) -> None:
+        """Bind pending actions to this first ordinal-later retained frame."""
+        for action_event in pending_action_events:
+            action_event.data["after_screenshot_timestamp"] = after_screen_event.timestamp
+            action_event.data["after_screenshot_source_ordinal"] = (
+                after_screen_event.source_ordinal
+            )
+            action_generation = action_event.data.get("window_geometry_generation")
+            if after_window_event is not None:
+                action_event.data["after_window_event_timestamp"] = (
+                    after_window_event.timestamp
+                )
+                action_event.data["after_window_event_source_ordinal"] = (
+                    after_window_event.source_ordinal
+                )
+                after_generation = after_window_event.data.get("state", {}).get(
+                    "geometry_generation"
+                )
+                action_event.data["after_window_geometry_generation"] = after_generation
+                if (
+                    after_window_event.timestamp != after_screen_event.timestamp
+                    or after_window_event.source_ordinal
+                    != after_screen_event.source_ordinal
+                ):
+                    raise WindowCaptureError(
+                        "the action after frame and native geometry are not one atomic pair"
+                    )
+            elif action_generation is not None:
+                raise WindowCaptureError(
+                    "a native action has no geometry paired with its after frame"
+                )
+            write_bound_action(action_event)
+        pending_action_events.clear()
 
     while not processing_complete():
         # Bounded get: a bare event_q.get() deadlocks shutdown when terminate
@@ -634,6 +842,7 @@ def process_events(
                 # XXX TODO: mitigate
         if event.type == "screen":
             scoped_pair = False
+            current_window_event = None
             if isinstance(event.data, WindowScopedFrame):
                 scoped_pair = True
                 scoped_frame = event.data
@@ -644,13 +853,15 @@ def process_events(
                     raise WindowCaptureError(
                         "the scoped frame geometry generation differs from its metadata"
                     )
-                prev_window_event = Event(
+                current_window_event = Event(
                     event.timestamp,
                     "window",
                     scoped_frame.window_event_data,
                     event.source_ordinal,
                 )
+                prev_window_event = current_window_event
                 event = event._replace(data=scoped_frame.image)
+            bind_pending_actions(event, current_window_event)
             prev_screen_event = event
             if config.RECORD_FULL_VIDEO:
                 video_event = event._replace(type="screen/video")
@@ -739,15 +950,7 @@ def process_events(
                             "the action frame and native geometry have different source ordinals"
                         )
 
-            process_event(
-                event,
-                action_write_q,
-                write_action_event,
-                recording,
-                perf_q,
-            )
-
-            num_action_events.value += 1
+            pending_action_events.append(event)
 
             screen_is_new = (
                 prev_screen_event.source_ordinal > prev_saved_screen_ordinal
@@ -800,6 +1003,16 @@ def process_events(
             raise Exception(f"unhandled {event.type=}")
         del prev_event
         prev_event = event
+    if pending_action_events:
+        if any(
+            event.data.get("window_geometry_generation") is not None
+            for event in pending_action_events
+        ):
+            raise WindowCaptureError(
+                "native recording ended before pending actions received an after frame"
+            )
+        for event in pending_action_events:
+            write_bound_action(event)
     logger.info("Done")
 
 
@@ -1147,6 +1360,7 @@ def trigger_action_event(
     coordinate_scope: CoordinateScope | None = None,
     timestamp: float | None = None,
     structural_observer: StructuralObserver | None = None,
+    reservation: EventReservation | WindowActionReservation | None = None,
 ) -> None:
     """Triggers an action event and adds it to the event queue.
 
@@ -1161,6 +1375,7 @@ def trigger_action_event(
             clock only for legacy/direct callers.
         structural_observer: Optional accessibility observer. Evidence is
             captured against global coordinates before any window translation.
+        reservation: Optional source position created at native input receipt.
 
     Returns:
         None
@@ -1170,7 +1385,22 @@ def trigger_action_event(
     x = event_data.get("mouse_x")
     y = event_data.get("mouse_y")
     window_binding: tuple[float, float, int] | int | None = None
-    if isinstance(event_q, OrderedEventJournal) and isinstance(
+    if reservation is not None:
+        try:
+            if isinstance(coordinate_scope, WindowCaptureScope):
+                if not isinstance(reservation, WindowActionReservation):
+                    raise EventJournalOrderingError(
+                        "window-scoped input requires a receipt-time geometry reservation"
+                    )
+                window_binding = reservation.bind(x, y)
+            elif not isinstance(reservation, EventReservation):
+                raise EventJournalOrderingError(
+                    "unscoped input received an incompatible source reservation"
+                )
+        except BaseException as exc:
+            reservation.fail(exc)
+            raise
+    elif isinstance(event_q, OrderedEventJournal) and isinstance(
         coordinate_scope,
         WindowCaptureScope,
     ):
@@ -1247,6 +1477,7 @@ def on_move(
     y: float,
     injected: bool = False,
     timestamp: float | None = None,
+    reservation: EventReservation | WindowActionReservation | None = None,
 ) -> None:
     """Handles the 'move' event.
 
@@ -1267,6 +1498,7 @@ def on_move(
             {"name": "move", "mouse_x": x, "mouse_y": y},
             coordinate_scope,
             timestamp,
+            reservation=reservation,
         )
 
 
@@ -1280,6 +1512,7 @@ def on_click(
     injected: bool = False,
     timestamp: float | None = None,
     structural_observer: StructuralObserver | None = None,
+    reservation: EventReservation | WindowActionReservation | None = None,
 ) -> None:
     """Handles the 'click' event.
 
@@ -1309,6 +1542,7 @@ def on_click(
             coordinate_scope,
             timestamp,
             structural_observer if pressed else None,
+            reservation,
         )
 
 
@@ -1322,6 +1556,7 @@ def on_scroll(
     injected: bool = False,
     timestamp: float | None = None,
     structural_observer: StructuralObserver | None = None,
+    reservation: EventReservation | WindowActionReservation | None = None,
 ) -> None:
     """Handles the 'scroll' event.
 
@@ -1351,6 +1586,7 @@ def on_scroll(
             coordinate_scope,
             timestamp,
             structural_observer,
+            reservation,
         )
 
 
@@ -1359,6 +1595,7 @@ def handle_key(
     key: ObservedKey,
     coordinate_scope: CoordinateScope | None = None,
     structural_observer: StructuralObserver | None = None,
+    reservation: EventReservation | WindowActionReservation | None = None,
 ) -> None:
     """Persist a normalized native key transition.
 
@@ -1383,6 +1620,7 @@ def handle_key(
         coordinate_scope=coordinate_scope,
         timestamp=key.timestamp,
         structural_observer=structural_observer if key.pressed else None,
+        reservation=reservation,
     )
 
 
@@ -1395,6 +1633,8 @@ def read_screen_events(
     window_scope: WindowCaptureScope | None = None,
     desktop_scope: DesktopCaptureScope | None = None,
     input_finished: threading.Event | None = None,
+    input_frame_boundary: NativeInputFrameBoundary | None = None,
+    terminal_frame_finished: threading.Event | None = None,
 ) -> None:
     """Read screen events and add them to the event queue.
 
@@ -1406,6 +1646,8 @@ def read_screen_events(
     re-resolved every frame (windows move/resize) and a bounds-timeline
     "window" event is queued whenever the resolved bounds change, so
     converters can reconstruct the exact window position for every action.
+    Both native scopes reject frames crossed by input and seal one clean
+    terminal frame after the last accepted action.
 
     Args:
         event_q: A queue for adding screen events.
@@ -1416,8 +1658,11 @@ def read_screen_events(
         window_scope: Optional window scope for window-pixel-space capture.
         desktop_scope: Full-screen virtual-desktop contract. It verifies the
             monitor topology before and after each captured frame.
-        input_finished: Input-reader completion boundary. Window capture waits
-            for it before it records the terminal after-action frame.
+        input_finished: Input-reader completion boundary. The terminal native
+            frame waits for observer shutdown after it seals native input.
+        input_frame_boundary: Active observer bridge for input-stable frames.
+        terminal_frame_finished: Signals that the exact terminal frame sealed
+            native input and entered the ordered journal.
     """
     if window_scope is not None and desktop_scope is not None:
         raise ValueError("screen reader cannot use both window and desktop scopes")
@@ -1429,10 +1674,23 @@ def read_screen_events(
     logger.info(f"Starting (fps={fps}, min_interval={min_interval:.3f}s)")
     started = False
 
-    def capture_one() -> tuple[float, float]:
+    def capture_one(
+        *,
+        require_input_boundary: bool = True,
+        seal_input: bool = False,
+    ) -> tuple[float, float] | None:
         nonlocal started
         t_start = time.perf_counter()
-        if window_scope is not None:
+        terminal_deadline = (
+            time.monotonic() + TERMINAL_FRAME_SEAL_TIMEOUT_SECONDS
+            if seal_input
+            else None
+        )
+        if window_scope is not None or desktop_scope is not None:
+            if seal_input and input_frame_boundary is None:
+                raise WindowCaptureError(
+                    "terminal native capture requires the native input boundary"
+                )
             # Do not hold the observation boundary during pixel acquisition.
             # An OS input callback that arrives while the grab is in flight must
             # reserve and bind the previously published frame before this new
@@ -1443,37 +1701,80 @@ def read_screen_events(
             # Any failed capture terminates the session. Retrying would omit a
             # frame while input continues and could produce complete-looking
             # evidence with a missing interval.
-            screenshot, _window_changed = window_scope.capture_frame(publish=False)
-            t_screenshot = time.perf_counter()
-            if screenshot is None:
-                raise WindowCaptureError("the captured screenshot was empty")
-            if not started:
-                started_event.set()
-                started = True
-            frame_timestamp = utils.get_timestamp()
-            if not isinstance(event_q, OrderedEventJournal):
-                raise WindowCaptureError("window-scoped capture requires the ordered event journal")
-            generation = window_scope.current_generation()
-            scoped_frame = WindowScopedFrame(
-                image=screenshot,
-                window_event_data=window_scope.window_event_data(),
-                geometry_generation=generation,
-            )
-            event_q.commit_window_frame(
-                Event(frame_timestamp, "screen", scoped_frame),
-                window_scope,
-                generation,
-            )
-            return t_start, t_screenshot
-        if desktop_scope is not None:
-            # A monitor can move or change scale while the combined frame keeps
-            # the same dimensions. Check both sides of the grab so neither the
-            # frame nor later input uses stale origin or monitor geometry.
-            desktop_scope.assert_current(force=True)
-            screenshot = utils.take_screenshot()
-            desktop_scope.assert_current(force=True)
-        else:
-            screenshot = utils.take_screenshot()
+            while True:
+                boundary_use = None
+                if input_frame_boundary is not None and require_input_boundary:
+                    try:
+                        boundary_use = input_frame_boundary.begin()
+                    except _NativeFrameBoundaryClosed:
+                        return None
+                try:
+                    if window_scope is not None:
+                        screenshot, _window_changed = window_scope.capture_frame(
+                            publish=False
+                        )
+                    else:
+                        assert desktop_scope is not None
+                        # A monitor can move or change scale while the combined
+                        # frame keeps the same dimensions. Check both sides of
+                        # the grab so the pixels and input use one topology.
+                        desktop_scope.assert_current(force=True)
+                        screenshot = utils.take_screenshot()
+                        desktop_scope.assert_current(force=True)
+                    t_screenshot = time.perf_counter()
+                    if screenshot is None:
+                        raise WindowCaptureError("the captured screenshot was empty")
+                    frame_timestamp = utils.get_timestamp()
+                    if boundary_use is not None and not input_frame_boundary.finish(
+                        boundary_use
+                    ):
+                        input_frame_boundary.complete(boundary_use)
+                        boundary_use = None
+                        if terminate_processing.is_set() and not seal_input:
+                            return None
+                        if (
+                            terminal_deadline is not None
+                            and time.monotonic() >= terminal_deadline
+                        ):
+                            raise WindowCaptureError(
+                                "native input did not become stable before the "
+                                "terminal-frame deadline"
+                            )
+                        if min_interval > 0:
+                            if seal_input:
+                                remaining = terminal_deadline - time.monotonic()
+                                time.sleep(min(min_interval, max(0.0, remaining)))
+                            else:
+                                terminate_processing.wait(min_interval)
+                        continue
+                    if boundary_use is not None and seal_input:
+                        input_frame_boundary.seal(boundary_use)
+                    if not isinstance(event_q, OrderedEventJournal):
+                        raise WindowCaptureError(
+                            "native-scoped capture requires the ordered event journal"
+                        )
+                    if window_scope is not None:
+                        generation = window_scope.current_generation()
+                        scoped_frame = WindowScopedFrame(
+                            image=screenshot,
+                            window_event_data=window_scope.window_event_data(),
+                            geometry_generation=generation,
+                        )
+                        event_q.commit_window_frame(
+                            Event(frame_timestamp, "screen", scoped_frame),
+                            window_scope,
+                            generation,
+                        )
+                    else:
+                        event_q.put(Event(frame_timestamp, "screen", screenshot))
+                    if not started:
+                        started_event.set()
+                        started = True
+                    return t_start, t_screenshot
+                finally:
+                    if boundary_use is not None:
+                        input_frame_boundary.complete(boundary_use)
+        screenshot = utils.take_screenshot()
         t_screenshot = time.perf_counter()
         if screenshot is None:
             raise WindowCaptureError("the captured screenshot was empty")
@@ -1485,7 +1786,10 @@ def read_screen_events(
         return t_start, t_screenshot
 
     while not terminate_processing.is_set():
-        t_start, t_screenshot = capture_one()
+        timing = capture_one()
+        if timing is None:
+            break
+        t_start, t_screenshot = timing
         # Throttle: sleep for the remainder of the frame interval
         if min_interval > 0:
             elapsed = time.perf_counter() - t_start
@@ -1496,10 +1800,26 @@ def read_screen_events(
             t_end = time.perf_counter()
             _screen_timing.append((t_screenshot - t_start, t_end - t_start))
 
-    if window_scope is not None and input_finished is not None:
+    if (window_scope is not None or desktop_scope is not None) and (
+        terminal_frame_finished is not None
+    ):
+        timing = capture_one(seal_input=True)
+        if timing is None:
+            raise WindowCaptureError("the terminal native frame was not committed")
+        terminal_frame_finished.set()
+        if input_finished is not None:
+            input_finished.wait()
+        if _screen_timing is not None and timing is not None:
+            t_start, t_screenshot = timing
+            t_end = time.perf_counter()
+            _screen_timing.append((t_screenshot - t_start, t_end - t_start))
+    elif (window_scope is not None or desktop_scope is not None) and (
+        input_finished is not None
+    ):
         input_finished.wait()
-        t_start, t_screenshot = capture_one()
-        if _screen_timing is not None:
+        timing = capture_one(require_input_boundary=False)
+        if _screen_timing is not None and timing is not None:
+            t_start, t_screenshot = timing
             t_end = time.perf_counter()
             _screen_timing.append((t_screenshot - t_start, t_end - t_start))
     logger.info("Done")
@@ -1742,12 +2062,17 @@ def read_input_events(
     coordinate_scope: CoordinateScope | None = None,
     structural_observer: StructuralObserver | None = None,
     finished_event: threading.Event | None = None,
+    input_frame_boundary: NativeInputFrameBoundary | None = None,
+    terminal_frame_finished: threading.Event | None = None,
 ) -> None:
     """Read globally ordered keyboard and mouse events from one native observer."""
     stop_sequences = [sequence for sequence in config.STOP_SEQUENCES if sequence]
     stop_sequence_indices = [0 for _ in stop_sequences]
 
-    def on_observed(event: ObservedInput) -> None:
+    def on_observed(
+        event: ObservedInput,
+        reservation: EventReservation | WindowActionReservation | None = None,
+    ) -> None:
         if isinstance(event, ObservedMouseMove):
             on_move(
                 event_q,
@@ -1756,6 +2081,7 @@ def read_input_events(
                 event.y,
                 event.injected,
                 timestamp=event.timestamp,
+                reservation=reservation,
             )
             return
         if isinstance(event, ObservedMouseButton):
@@ -1769,6 +2095,7 @@ def read_input_events(
                 event.injected,
                 timestamp=event.timestamp,
                 structural_observer=structural_observer,
+                reservation=reservation,
             )
             return
         if isinstance(event, ObservedMouseScroll):
@@ -1782,13 +2109,20 @@ def read_input_events(
                 event.injected,
                 timestamp=event.timestamp,
                 structural_observer=structural_observer,
+                reservation=reservation,
             )
             return
         if event.injected:
             return
 
         logger.debug(f"{event=}")
-        handle_key(event_q, event, coordinate_scope, structural_observer)
+        handle_key(
+            event_q,
+            event,
+            coordinate_scope,
+            structural_observer,
+            reservation,
+        )
         if not event.pressed:
             return
 
@@ -1818,9 +2152,33 @@ def read_input_events(
         if callable(stop_hook):
             setattr(on_observed, "_openadapt_delivery_thread_stop", stop_hook)
 
+    if isinstance(event_q, OrderedEventJournal):
+
+        def reserve_observed(timestamp: float):
+            if isinstance(coordinate_scope, WindowCaptureScope):
+                return event_q.reserve_window_action_receipt(
+                    timestamp,
+                    coordinate_scope,
+                )
+            return event_q.reserve(timestamp)
+
+        def deliver_observed(event: ObservedInput, reservation: object) -> None:
+            if not isinstance(
+                reservation,
+                (EventReservation, WindowActionReservation),
+            ):
+                raise EventJournalOrderingError(
+                    "native input delivery received an invalid source reservation"
+                )
+            on_observed(event, reservation)
+
+        setattr(on_observed, "_openadapt_input_receipt", reserve_observed)
+        setattr(on_observed, "_openadapt_input_delivery", deliver_observed)
+
     utils.set_start_time(recording.timestamp)
     observer = None
     started = False
+    observer_failed = False
     try:
         observer = create_input_observer(
             on_observed,
@@ -1830,15 +2188,44 @@ def read_input_events(
         )
         observer.start()
         started = True
+        if input_frame_boundary is not None:
+            input_frame_boundary.attach(observer)
         started_event.set()
         while not terminate_processing.wait(0.1):
             observer.check_health()
-    except BaseException:
+    except BaseException as exc:
+        observer_failed = True
+        if input_frame_boundary is not None:
+            input_frame_boundary.fail(exc)
         terminate_processing.set()
         raise
     finally:
         if started and observer is not None:
-            observer.stop()
+            terminal_error = None
+            if terminal_frame_finished is not None and not observer_failed:
+                terminal_timeout = max(
+                    10.0,
+                    float(getattr(observer, "shutdown_timeout", 5.0)) * 2,
+                )
+                if not terminal_frame_finished.wait(timeout=terminal_timeout):
+                    terminal_error = InputObserverError(
+                        "the terminal frame did not seal before native input shutdown"
+                    )
+                    if input_frame_boundary is not None:
+                        input_frame_boundary.fail(terminal_error)
+            if input_frame_boundary is not None:
+                input_frame_boundary.begin_close()
+            try:
+                observer.stop()
+            except BaseException as exc:
+                if input_frame_boundary is not None:
+                    input_frame_boundary.fail(exc)
+                raise
+            else:
+                if input_frame_boundary is not None:
+                    input_frame_boundary.close()
+            if terminal_error is not None:
+                raise terminal_error
         if finished_event is not None:
             finished_event.set()
 
@@ -2126,6 +2513,8 @@ def record(
     event_q = OrderedEventJournal()
     producers_finished = threading.Event()
     input_finished = threading.Event()
+    terminal_frame_finished = threading.Event()
+    input_frame_boundary = NativeInputFrameBoundary()
     if window_scope is not None:
         # The preflight frame sizes the fixed stream. Capture again after the
         # recording clock starts, then publish pixels and geometry atomically
@@ -2145,6 +2534,23 @@ def record(
             ),
             window_scope,
             initial_generation,
+        )
+    else:
+        assert desktop_scope is not None
+        # Publish one clean before-frame before the native observer can accept
+        # input. The screen thread attaches to the observer boundary for every
+        # later frame, but it cannot safely win that startup race by itself.
+        desktop_scope.assert_current(force=True)
+        initial_desktop_frame = utils.take_screenshot()
+        desktop_scope.assert_current(force=True)
+        if initial_desktop_frame is None:
+            raise WindowCaptureError("the initial desktop screenshot was empty")
+        event_q.put(
+            Event(
+                utils.get_timestamp(),
+                "screen",
+                initial_desktop_frame,
+            )
         )
     screen_write_q = sq.SynchronizedQueue()
     action_write_q = sq.SynchronizedQueue()
@@ -2199,6 +2605,8 @@ def record(
                 window_scope,
                 desktop_scope,
                 input_finished,
+                input_frame_boundary,
+                terminal_frame_finished,
             ),
             terminate_processing,
             task_errors,
@@ -2215,6 +2623,8 @@ def record(
         window_scope or desktop_scope,
         structural_observer,
         input_finished,
+        input_frame_boundary,
+        terminal_frame_finished,
     )
     input_event_reader = threading.Thread(
         target=_run_task_fail_loud,
@@ -2749,14 +3159,51 @@ class Recorder:
     def _persist_control_state(self) -> None:
         if not self._control_enabled:
             return
+        self._persist_control_payload(self._control_payload())
+
+    def _persist_control_payload(self, terminal: dict[str, Any]) -> None:
+        """Persist one explicit non-secret control snapshot."""
         from openadapt_capture.control import write_terminal_state
 
-        terminal = self._control_payload()
+        terminal = dict(terminal)
         # The file location already binds the capture. Do not retain an
         # absolute local path (which can disclose a user/profile name) in an
         # artifact that may later enter sanitization and review.
         terminal.pop("capture_dir", None)
         write_terminal_state(self.capture_dir, terminal)
+
+    def _stage_completed_control_state(self) -> float:
+        """Write the exact final state that the immutable seal will inventory."""
+        with self._control_state_lock:
+            finalized_at = time.time()
+            terminal = self._control_payload()
+            terminal.update(
+                {
+                    "phase": "complete",
+                    "complete": True,
+                    "integrity_verified": True,
+                    "error_code": None,
+                    "finalized_at": finalized_at,
+                }
+            )
+            # Final capture metadata exists even when the live control server
+            # is disabled. Do not publish these values in memory until sealing
+            # and its post-write verification succeed.
+            self._persist_control_payload(terminal)
+            return finalized_at
+
+    def _publish_completed_control_state(self, finalized_at: float) -> None:
+        """Publish an already sealed state without rewriting its artifact."""
+        with self._control_state_lock:
+            if self._control_phase in {"complete", "failed", "crashed"}:
+                raise RuntimeError(
+                    "capture control reached a terminal state before sealing completed"
+                )
+            self._control_phase = "complete"
+            self._control_complete = True
+            self._control_integrity_verified = True
+            self._control_error_code = None
+            self._control_finalized_at = finalized_at
 
     def _transition_control(
         self,
@@ -2933,6 +3380,9 @@ class Recorder:
             },
             last_source_ordinal=last_source_ordinal or None,
         )
+        from openadapt_capture.capture import CaptureSession
+
+        CaptureSession.validate_sealed(self.capture_dir)
 
     def _start_control_server(self) -> None:
         from pathlib import Path
@@ -3029,13 +3479,9 @@ class Recorder:
             self.check_health()
             if self._ready_event.is_set():
                 self._verify_completed_capture()
+                finalized_at = self._stage_completed_control_state()
                 self._seal_completed_capture()
-                self._transition_control(
-                    "complete",
-                    complete=True,
-                    integrity_verified=True,
-                    finalized=True,
-                )
+                self._publish_completed_control_state(finalized_at)
             else:
                 self._transition_control(
                     "failed",
@@ -3218,12 +3664,13 @@ class Recorder:
             return None
         self.check_health()
         if self._capture is None:
-            try:
-                from openadapt_capture.capture import CaptureSession
+            from pathlib import Path
 
-                self._capture = CaptureSession.load_verified(self.capture_dir)
-            except FileNotFoundError:
+            if not (Path(self.capture_dir) / "recording.db").is_file():
                 return None
+            from openadapt_capture.capture import CaptureSession
+
+            self._capture = CaptureSession.load_verified(self.capture_dir)
         return self._capture
 
 

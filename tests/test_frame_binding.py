@@ -355,29 +355,60 @@ def _click_pair(down_ts=10.0, up_ts=10.05, down_bound=9.9, up_bound=10.0):
     return down, up
 
 
-def test_click_merge_keeps_the_up_childs_binding():
+def test_click_merge_keeps_the_down_childs_before_binding():
     down, up = _click_pair()
     (merged,) = merge_consecutive_mouse_click_events([down, up])
     assert isinstance(merged, MouseClickEvent)
-    assert merged.screenshot_timestamp == 10.0
+    assert merged.screenshot_timestamp == 9.9
 
 
-def test_drag_merge_keeps_the_final_bindings():
+def test_click_merge_keeps_the_terminal_childs_source_and_after_bindings():
+    down = MouseDownEvent(
+        timestamp=10.0,
+        source_ordinal=2,
+        x=1.0,
+        y=2.0,
+        button="left",
+        screenshot_timestamp=9.9,
+        screenshot_source_ordinal=1,
+        after_screenshot_timestamp=10.0,
+        after_screenshot_source_ordinal=3,
+    )
+    up = MouseUpEvent(
+        timestamp=10.05,
+        source_ordinal=4,
+        x=1.0,
+        y=2.0,
+        button="left",
+        screenshot_timestamp=10.0,
+        screenshot_source_ordinal=3,
+        after_screenshot_timestamp=10.1,
+        after_screenshot_source_ordinal=5,
+    )
+
+    (merged,) = merge_consecutive_mouse_click_events([down, up])
+
+    assert merged.source_ordinal == 4
+    assert merged.screenshot_source_ordinal == 1
+    assert merged.after_screenshot_source_ordinal == 5
+
+
+def test_drag_merge_keeps_the_initial_before_binding():
     down = MouseDownEvent(timestamp=1.0, x=1.0, y=2.0, button="left", screenshot_timestamp=0.9)
     move = MouseMoveEvent(timestamp=1.5, x=30.0, y=30.0, screenshot_timestamp=1.6)
     up = MouseUpEvent(timestamp=2.0, x=30.0, y=30.0, button="left", screenshot_timestamp=2.0)
     (drag,) = detect_drag_events([down, move, up])
     assert isinstance(drag, MouseDragEvent)
-    assert drag.screenshot_timestamp == 2.0
+    assert drag.screenshot_timestamp == 0.9
 
 
-def test_type_merge_keeps_the_last_key_binding():
+def test_type_merge_keeps_the_first_key_before_binding():
     first = KeyDownEvent(timestamp=20.0, key_char="a", screenshot_timestamp=19.5)
     second = KeyDownEvent(timestamp=21.0, key_char="b", screenshot_timestamp=20.75)
     (merged,) = merge_consecutive_keyboard_events([first, second])
     assert isinstance(merged, KeyTypeEvent)
     assert merged.text == "ab"
-    assert merged.screenshot_timestamp == 20.75
+    assert merged.screenshot_timestamp == 19.5
 
 
 def test_merge_leaves_legacy_children_unbound():
@@ -417,6 +448,25 @@ def test_action_screenshot_uses_exact_binding():
     action = Action(event=up, _capture=stub)
     image = action.screenshot
     assert stub.exact_calls == [(10.0, None)]
+    assert stub.lenient_calls == []
+    assert image.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_action_after_screenshot_uses_exact_binding():
+    stub = _StubCapture()
+    event = MouseUpEvent(
+        timestamp=10.05,
+        x=1.0,
+        y=2.0,
+        button="left",
+        after_screenshot_timestamp=10.1,
+        after_screenshot_source_ordinal=5,
+    )
+
+    image = Action(event=event, _capture=stub).after_screenshot
+
+    assert image is not None
+    assert stub.exact_calls == [(10.1, 5)]
     assert stub.lenient_calls == []
     assert image.getpixel((0, 0)) == (255, 0, 0)
 

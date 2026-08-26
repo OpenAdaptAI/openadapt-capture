@@ -21,7 +21,6 @@ CAPTURE_TERMINAL_SCHEMA_VERSION = "openadapt.capture-terminal/v2"
 _MANIFEST_DOMAIN = b"openadapt.capture-artifact-manifest.v1\0"
 _TERMINAL_DOMAIN = b"openadapt.capture-terminal.v2\0"
 _EXCLUDED_ARTIFACTS = {
-    "capture-state.json",
     ARTIFACT_MANIFEST_FILENAME,
     CAPTURE_TERMINAL_FILENAME,
 }
@@ -50,7 +49,7 @@ class ArtifactRecord(BaseModel):
         ):
             raise ValueError("artifact paths must be safe POSIX-relative paths")
         if path.as_posix() in _EXCLUDED_ARTIFACTS:
-            raise ValueError("mutable or seal metadata cannot inventory itself")
+            raise ValueError("seal metadata cannot inventory itself")
         return self
 
 
@@ -332,7 +331,10 @@ def _hash_relative_regular_file(root: Path, relative_path: str) -> tuple[int, st
 
 def _read_regular_file(path: Path) -> bytes:
     """Read one stable regular file through the descriptor that was verified."""
-    fd, before = _open_stable_regular_file(path)
+    try:
+        fd, before = _open_stable_regular_file(path)
+    except FileNotFoundError as exc:
+        raise CaptureSealError(f"capture artifact is missing: {path.name}") from exc
     chunks: list[bytes] = []
     size = 0
     try:
@@ -485,7 +487,8 @@ def seal_capture(
     terminal = CaptureTerminal.model_validate(payload)
     terminal_raw = _canonical_json_bytes(terminal.model_dump(mode="json"), newline=True)
     _write_new_atomic(root / CAPTURE_TERMINAL_FILENAME, terminal_raw)
-    return terminal
+    verified_terminal, _ = verify_capture_artifacts(root)
+    return verified_terminal
 
 
 def verify_capture_artifacts(
@@ -559,3 +562,35 @@ def copy_verified_capture(
         temporary.cleanup()
         raise
     return temporary, destination, terminal
+
+
+def copy_verified_database(
+    capture_dir: str | os.PathLike[str],
+) -> tuple[
+    tempfile.TemporaryDirectory[str],
+    Path,
+    CaptureTerminal,
+    CaptureArtifactManifest,
+]:
+    """Copy only the sealed database for bounded-space semantic validation."""
+    terminal, manifest = verify_capture_artifacts(capture_dir)
+    database_record = next(
+        artifact for artifact in manifest.artifacts if artifact.path == "recording.db"
+    )
+    source = Path(capture_dir).resolve()
+    temporary = tempfile.TemporaryDirectory(prefix="openadapt-capture-database-")
+    database_path = Path(temporary.name) / "recording.db"
+    try:
+        _copy_verified_regular_file(
+            source,
+            database_record.path,
+            database_path,
+            database_record,
+        )
+        size, digest = _hash_regular_file(database_path)
+        if (size, digest) != (database_record.size_bytes, database_record.sha256):
+            raise CaptureSealError("capture database changed during snapshot")
+    except BaseException:
+        temporary.cleanup()
+        raise
+    return temporary, database_path, terminal, manifest

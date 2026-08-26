@@ -19,6 +19,7 @@ from openadapt_capture.capture import Capture, CaptureSession, InvalidCaptureEve
 from openadapt_capture.db import create_db, crud
 from openadapt_capture.platform import DisplayMetricsUnavailable
 from openadapt_capture.recorder import Recorder
+from openadapt_capture.terminal import CaptureSealError
 
 # Sessions/engines created by _create_test_recording, released by the
 # temp_capture_dir teardown BEFORE the TemporaryDirectory is removed. Both
@@ -201,6 +202,9 @@ class TestRecorder:
         rec._record_thread = SimpleNamespace(is_alive=lambda: True)
         rec._terminate_processing.set()
         assert rec.capture is None
+        capture_dir = tmp_path / "capture"
+        capture_dir.mkdir()
+        (capture_dir / "recording.db").touch()
 
         loaded = object()
         monkeypatch.setattr(
@@ -211,6 +215,16 @@ class TestRecorder:
         rec._finalized_event.set()
 
         assert rec.capture is loaded
+
+    def test_recorder_capture_does_not_hide_missing_seal_metadata(self, tmp_path):
+        capture_dir = tmp_path / "capture"
+        capture_dir.mkdir()
+        (capture_dir / "recording.db").touch()
+        rec = Recorder(str(capture_dir))
+        rec._finalized_event.set()
+
+        with pytest.raises(CaptureSealError, match="capture artifact is missing"):
+            _ = rec.capture
 
     def test_recorder_screen_count_property(self):
         """Test Recorder has screen_count property."""

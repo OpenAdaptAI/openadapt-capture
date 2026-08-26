@@ -128,9 +128,24 @@ def _convert_action_event(db_event) -> PydanticActionEvent:
         ),
         "screenshot_timestamp": getattr(db_event, "screenshot_timestamp", None),
         "screenshot_source_ordinal": getattr(db_event, "screenshot_source_ordinal", None),
+        "after_screenshot_timestamp": getattr(
+            db_event, "after_screenshot_timestamp", None
+        ),
+        "after_screenshot_source_ordinal": getattr(
+            db_event, "after_screenshot_source_ordinal", None
+        ),
         "window_event_timestamp": getattr(db_event, "window_event_timestamp", None),
         "window_event_source_ordinal": getattr(db_event, "window_event_source_ordinal", None),
+        "after_window_event_timestamp": getattr(
+            db_event, "after_window_event_timestamp", None
+        ),
+        "after_window_event_source_ordinal": getattr(
+            db_event, "after_window_event_source_ordinal", None
+        ),
         "window_geometry_generation": getattr(db_event, "window_geometry_generation", None),
+        "after_window_geometry_generation": getattr(
+            db_event, "after_window_geometry_generation", None
+        ),
     }
 
     if db_event.name == "move":
@@ -483,6 +498,16 @@ class Action:
         return self.event.screenshot_source_ordinal
 
     @property
+    def after_screenshot_timestamp(self) -> float | None:
+        """Exact retained after-frame timestamp bound to this action."""
+        return self.event.after_screenshot_timestamp
+
+    @property
+    def after_screenshot_source_ordinal(self) -> int | None:
+        """Return the source-journal position of the retained after frame."""
+        return self.event.after_screenshot_source_ordinal
+
+    @property
     def window_event_timestamp(self) -> float | None:
         """Exact atomic WindowEvent timestamp bound to this action."""
         return self.event.window_event_timestamp
@@ -493,9 +518,24 @@ class Action:
         return self.event.window_event_source_ordinal
 
     @property
+    def after_window_event_timestamp(self) -> float | None:
+        """Exact native geometry timestamp paired with the after frame."""
+        return self.event.after_window_event_timestamp
+
+    @property
+    def after_window_event_source_ordinal(self) -> int | None:
+        """Return the geometry source position paired with the after frame."""
+        return self.event.after_window_event_source_ordinal
+
+    @property
     def window_geometry_generation(self) -> int | None:
         """Exact native geometry generation bound to this action."""
         return self.event.window_geometry_generation
+
+    @property
+    def after_window_geometry_generation(self) -> int | None:
+        """Exact native geometry generation paired with the after frame."""
+        return self.event.after_window_geometry_generation
 
     @property
     def screenshot(self) -> "Image" | None:
@@ -519,6 +559,21 @@ class Action:
                 source_ordinal=getattr(self.event, "screenshot_source_ordinal", None),
             )
         return self._capture.get_frame_at(self.timestamp)
+
+    @property
+    def after_screenshot(self) -> "Image" | None:
+        """Get the exact first retained frame after this action."""
+        bound = getattr(self.event, "after_screenshot_timestamp", None)
+        if bound is None:
+            return None
+        return self._capture.get_exact_frame(
+            bound,
+            source_ordinal=getattr(
+                self.event,
+                "after_screenshot_source_ordinal",
+                None,
+            ),
+        )
 
 
 def _source_order(rows: list) -> list:
@@ -574,6 +629,12 @@ def _validate_database_contract(
     if calculated_last != last_source_ordinal:
         raise InvalidCaptureEvent("sealed last source ordinal differs from the immutable database")
 
+    screenshots_by_ordinal = {
+        row.source_ordinal: row for row in rows_by_kind["screen"]
+    }
+    windows_rows_by_ordinal = {
+        row.source_ordinal: row for row in rows_by_kind["window"]
+    }
     for event in rows_by_kind["action"]:
         _convert_action_event(event)
         if event.screenshot_id is None or event.screenshot is None:
@@ -592,11 +653,108 @@ def _validate_database_contract(
                 or event.window_event_timestamp != event.window_event.timestamp
             ):
                 raise InvalidCaptureEvent("sealed action window relationship is inconsistent")
+        if event.after_screenshot_source_ordinal is not None:
+            after_screenshot = screenshots_by_ordinal.get(
+                event.after_screenshot_source_ordinal
+            )
+            if (
+                after_screenshot is None
+                or event.after_screenshot_timestamp != after_screenshot.timestamp
+                or event.source_ordinal >= event.after_screenshot_source_ordinal
+            ):
+                raise InvalidCaptureEvent(
+                    "sealed action after-screenshot binding is inconsistent"
+                )
+        if event.after_window_event_source_ordinal is not None:
+            after_window = windows_rows_by_ordinal.get(
+                event.after_window_event_source_ordinal
+            )
+            if (
+                after_window is None
+                or event.after_window_event_timestamp != after_window.timestamp
+            ):
+                raise InvalidCaptureEvent(
+                    "sealed action after-window binding is inconsistent"
+                )
+    retained_frame_sizes: dict[int, tuple[int, int]] = {}
+    for screenshot in rows_by_kind["screen"]:
+        if screenshot.png_data:
+            from PIL import Image
+
+            retained_sha256 = hashlib.sha256(screenshot.png_data).hexdigest()
+            if screenshot.png_sha256 != retained_sha256:
+                raise InvalidCaptureEvent(
+                    "sealed frame PNG digest differs from its retained bytes"
+                )
+            try:
+                with Image.open(io.BytesIO(screenshot.png_data)) as retained:
+                    retained.load()
+                    retained_frame_sizes[int(screenshot.source_ordinal)] = retained.size
+            except Exception as exc:
+                raise InvalidCaptureEvent("sealed frame PNG is invalid") from exc
+        elif screenshot.png_sha256 is not None:
+            raise InvalidCaptureEvent(
+                "sealed frame has a PNG digest without retained PNG bytes"
+            )
+
     metadata = capture.window_capture
     is_v2 = (
         isinstance(metadata, dict)
         and metadata.get("schema_version") == "openadapt.capture.window-scoped/v2"
     )
+    desktop_metadata = capture.desktop_capture
+    is_desktop_v1 = (
+        isinstance(desktop_metadata, dict)
+        and desktop_metadata.get("schema_version")
+        == "openadapt.capture.display-topology/v1"
+        and desktop_metadata.get("coordinate_space") == "virtual_desktop_pixels"
+    )
+    is_native_scoped = is_v2 or is_desktop_v1
+    if is_native_scoped and not rows_by_kind["screen"]:
+        raise InvalidCaptureEvent("sealed native capture has no retained frames")
+    if is_desktop_v1:
+        viewport = desktop_metadata.get("viewport")
+        if (
+            not isinstance(viewport, list)
+            or len(viewport) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in viewport)
+            or any(value <= 0 for value in viewport)
+        ):
+            raise InvalidCaptureEvent("sealed desktop capture has an invalid viewport")
+        expected_size = tuple(viewport)
+        if any(size != expected_size for size in retained_frame_sizes.values()):
+            raise InvalidCaptureEvent(
+                "sealed desktop frame dimensions differ from its capture viewport"
+            )
+
+    if is_native_scoped:
+        frame_ordinals = set(screenshots_by_ordinal)
+        for action in rows_by_kind["action"]:
+            if action.after_screenshot_source_ordinal is None:
+                raise InvalidCaptureEvent(
+                    "sealed native action has an incomplete before/after frame binding"
+                )
+            before_candidates = [
+                ordinal for ordinal in frame_ordinals if ordinal < action.source_ordinal
+            ]
+            after_candidates = [
+                ordinal for ordinal in frame_ordinals if ordinal > action.source_ordinal
+            ]
+            if (
+                not before_candidates
+                or action.screenshot_source_ordinal != max(before_candidates)
+            ):
+                raise InvalidCaptureEvent(
+                    "sealed native action does not bind its nearest retained before frame"
+                )
+            if (
+                not after_candidates
+                or action.after_screenshot_source_ordinal != min(after_candidates)
+            ):
+                raise InvalidCaptureEvent(
+                    "sealed native action does not bind its first retained after frame"
+                )
+
     allowed_pair_ordinals: set[int] = set()
     if is_v2:
         window_events = capture.window_capture_events_v2()
@@ -616,27 +774,10 @@ def _validate_database_contract(
             screenshot = screenshots_by_ordinal[ordinal]
             if screenshot.timestamp != window_event.timestamp:
                 raise InvalidCaptureEvent("sealed v2 frame and geometry timestamps differ")
-            if screenshot.png_data:
-                from PIL import Image
-
-                retained_sha256 = hashlib.sha256(screenshot.png_data).hexdigest()
-                if screenshot.png_sha256 != retained_sha256:
-                    raise InvalidCaptureEvent(
-                        "sealed v2 frame PNG digest differs from its retained bytes"
-                    )
-                try:
-                    with Image.open(io.BytesIO(screenshot.png_data)) as retained:
-                        retained.load()
-                        retained_size = retained.size
-                except Exception as exc:
-                    raise InvalidCaptureEvent("sealed v2 frame PNG is invalid") from exc
-                if retained_size != state.viewport:
-                    raise InvalidCaptureEvent(
-                        "sealed v2 frame dimensions differ from its geometry viewport"
-                    )
-            elif screenshot.png_sha256 is not None:
+            retained_size = retained_frame_sizes.get(int(screenshot.source_ordinal))
+            if retained_size is not None and retained_size != state.viewport:
                 raise InvalidCaptureEvent(
-                    "sealed v2 frame has a PNG digest without retained PNG bytes"
+                    "sealed v2 frame dimensions differ from its geometry viewport"
                 )
             current_identity = (
                 state.window_id,
@@ -664,20 +805,32 @@ def _validate_database_contract(
             if (
                 action.window_geometry_generation is None
                 or action.screenshot_source_ordinal != action.window_event_source_ordinal
+                or action.after_screenshot_source_ordinal is None
+                or action.after_window_event_source_ordinal is None
+                or action.after_screenshot_source_ordinal
+                != action.after_window_event_source_ordinal
+                or action.after_screenshot_timestamp
+                != action.after_window_event_timestamp
+                or action.after_window_geometry_generation is None
             ):
-                raise InvalidCaptureEvent("sealed v2 action has an incomplete frame binding")
+                raise InvalidCaptureEvent(
+                    "sealed v2 action has an incomplete before/after frame binding"
+                )
             bound = windows_by_ordinal.get(action.window_event_source_ordinal)
             if bound is None or (
                 bound.window_capture_v2.geometry_generation != action.window_geometry_generation
             ):
                 raise InvalidCaptureEvent("sealed v2 action names the wrong geometry epoch")
-            if not any(
-                frame_ordinal > action.source_ordinal for frame_ordinal in allowed_pair_ordinals
+            after_bound = windows_by_ordinal.get(
+                action.after_window_event_source_ordinal
+            )
+            if after_bound is None or (
+                after_bound.window_capture_v2.geometry_generation
+                != action.after_window_geometry_generation
             ):
                 raise InvalidCaptureEvent(
-                    "sealed v2 action has no ordinal-later retained after frame"
+                    "sealed v2 action names the wrong after-frame geometry epoch"
                 )
-
     owners: dict[int, set[str]] = {}
     for kind, ordinals in ordinals_by_kind.items():
         for ordinal in ordinals:
@@ -687,12 +840,22 @@ def _validate_database_contract(
             ordinal in allowed_pair_ordinals and kinds == {"screen", "window"}
         ):
             raise InvalidCaptureEvent("sealed journal reuses a source ordinal across events")
-    if is_v2 and sorted(owners) != list(range(1, (last_source_ordinal or 0) + 1)):
-        raise InvalidCaptureEvent("sealed v2 source journal has a missing ordinal")
+    if is_native_scoped and sorted(owners) != list(
+        range(1, (last_source_ordinal or 0) + 1)
+    ):
+        raise InvalidCaptureEvent("sealed native source journal has a missing ordinal")
 
     expected_video_count = event_counts.get("video")
     if not isinstance(expected_video_count, int) or expected_video_count < 0:
         raise InvalidCaptureEvent("sealed video count is invalid")
+    if (
+        is_native_scoped
+        and not expected_video_count
+        and any(not screenshot.png_data for screenshot in rows_by_kind["screen"])
+    ):
+        raise InvalidCaptureEvent(
+            "sealed native frame has no retained PNG or exact MP4 carrier"
+        )
     if expected_video_count:
         from openadapt_capture.video import _read_timing_metadata
 
@@ -704,27 +867,30 @@ def _validate_database_contract(
             raise InvalidCaptureEvent("sealed MP4 has no source-ordinal frame bindings")
         if len(timing[3]) != expected_video_count:
             raise InvalidCaptureEvent("sealed video count differs from its MP4 bindings")
-        if is_v2:
+        if is_native_scoped:
             video_source_ordinals = [source_ordinal for _, source_ordinal in timing[3]]
             expected_source_ordinals = sorted(ordinals_by_kind["screen"])
             if video_source_ordinals != expected_source_ordinals:
                 raise InvalidCaptureEvent(
-                    "sealed v2 MP4 source bindings differ from retained frame ordinals"
+                    "sealed native MP4 source bindings differ from retained frame ordinals"
                 )
             capture_bindings = timing[2]
             if capture_bindings is None:
-                raise InvalidCaptureEvent("sealed v2 MP4 has no exact capture-time frame bindings")
-            capture_by_index = dict(capture_bindings)
+                raise InvalidCaptureEvent(
+                    "sealed native MP4 has no exact capture-time frame bindings"
+                )
             screenshots_by_ordinal = {
                 int(row.source_ordinal): row for row in rows_by_kind["screen"]
             }
-            for encoded_index, source_ordinal in timing[3]:
-                screenshot = screenshots_by_ordinal[source_ordinal]
-                if capture_by_index.get(encoded_index) != screenshot.timestamp:
-                    raise InvalidCaptureEvent(
-                        "sealed v2 MP4 source and capture-time bindings differ "
-                        "from the retained frame"
-                    )
+            expected_capture_bindings = [
+                (encoded_index, screenshots_by_ordinal[source_ordinal].timestamp)
+                for encoded_index, source_ordinal in timing[3]
+            ]
+            if capture_bindings != expected_capture_bindings:
+                raise InvalidCaptureEvent(
+                    "sealed native MP4 source and capture-time bindings differ "
+                    "from the retained frame"
+                )
     elif capture.video_path is not None:
         raise InvalidCaptureEvent("sealed capture inventories an MP4 but claims no video frames")
 
@@ -847,6 +1013,47 @@ class CaptureSession:
             result.close()
             raise
         return result
+
+    @classmethod
+    def validate_sealed(cls, capture_dir: str | Path) -> None:
+        """Validate one seal with a database-only temporary snapshot."""
+        from openadapt_capture.db import get_immutable_session_for_path
+        from openadapt_capture.db.models import Recording
+        from openadapt_capture.terminal import (
+            CaptureSealError,
+            copy_verified_database,
+            verify_capture_artifacts,
+        )
+
+        source = Path(capture_dir).resolve()
+        temporary, database_path, terminal, manifest = copy_verified_database(source)
+        session = None
+        try:
+            session = get_immutable_session_for_path(str(database_path))
+            recordings = session.query(Recording).all()
+            if len(recordings) != 1:
+                raise InvalidCaptureEvent(
+                    "verified capture must contain exactly one recording, "
+                    f"found {len(recordings)}"
+                )
+            capture = cls(source, session, recordings[0])
+            capture._verified_terminal = terminal
+            _validate_database_contract(
+                capture,
+                event_counts=terminal.event_counts.model_dump(mode="python"),
+                last_source_ordinal=terminal.last_source_ordinal,
+            )
+        finally:
+            if session is not None:
+                bind = session.get_bind()
+                session.close()
+                if bind is not None:
+                    bind.dispose()
+            temporary.cleanup()
+
+        final_terminal, final_manifest = verify_capture_artifacts(source)
+        if final_terminal != terminal or final_manifest != manifest:
+            raise CaptureSealError("capture seal changed during semantic validation")
 
     @property
     def terminal(self):

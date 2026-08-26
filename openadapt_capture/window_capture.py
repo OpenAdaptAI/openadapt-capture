@@ -520,6 +520,62 @@ class WindowCaptureScope:
         self._assert_display_topology()
         return window, scale_x, scale_y, content_rect, generation
 
+    def reserve_action_geometry(
+        self,
+    ) -> tuple[TargetWindow, float, float, tuple[int, int, int, int], int]:
+        """Snapshot published geometry without blocking a native input hook."""
+        with self._lock:
+            window = self._published_window
+            scale_x = self._published_scale_x
+            scale_y = self._published_scale_y
+            content_rect = self._published_content_rect
+            generation = self._published_generation
+        if window is None or scale_x is None or scale_y is None or content_rect is None:
+            raise WindowCaptureError(
+                "an action arrived before the first published frame; "
+                "capture_frame() must succeed before input can be scoped"
+            )
+        return window, scale_x, scale_y, content_rect, generation
+
+    def _assert_reserved_geometry_current(
+        self,
+        geometry: tuple[TargetWindow, float, float, tuple[int, int, int, int], int],
+    ) -> None:
+        """Refuse if delivery-time state no longer matches receipt-time state."""
+        reserved_window = geometry[0]
+        self._assert_display_topology()
+        live = self.resolve()
+        self._assert_bound_identity(live)
+        if live.bounds != reserved_window.bounds:
+            raise WindowCaptureError(
+                "the target moved or resized after native input receipt; "
+                "the delayed input cannot be bound to its reserved frame"
+            )
+        self._assert_display_topology()
+
+    def generation_for_reserved_geometry(
+        self,
+        geometry: tuple[TargetWindow, float, float, tuple[int, int, int, int], int],
+    ) -> int:
+        """Return one receipt-time generation after delivery-time revalidation."""
+        self._assert_reserved_geometry_current(geometry)
+        return geometry[4]
+
+    def translate_reserved_geometry(
+        self,
+        geometry: tuple[TargetWindow, float, float, tuple[int, int, int, int], int],
+        x: float,
+        y: float,
+    ) -> tuple[float, float, int]:
+        """Translate against receipt-time geometry after exact revalidation."""
+        self._assert_reserved_geometry_current(geometry)
+        window, scale_x, scale_y, content_rect, generation = geometry
+        return (
+            (x - window.bounds[0]) * scale_x + content_rect[0],
+            (y - window.bounds[1]) * scale_y + content_rect[1],
+            generation,
+        )
+
     def generation_for_action(self) -> int:
         """Bind a non-pointer action to the exact published frame epoch."""
         return self._geometry_for_action()[4]
