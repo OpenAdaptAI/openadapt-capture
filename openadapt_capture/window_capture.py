@@ -33,6 +33,9 @@ package's headless-import invariant (tests/test_headless_import.py).
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import sys
 import threading
 from dataclasses import dataclass
@@ -42,6 +45,44 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from PIL import Image
+
+WINDOW_CAPTURE_SCHEMA_VERSION = "openadapt.capture.window-scoped/v2"
+
+
+def window_geometry_epoch_sha256(state: dict) -> str:
+    """Hash the exact native coordinate contract for one published frame."""
+    payload = {
+        key: state.get(key)
+        for key in (
+            "schema_version",
+            "window_id",
+            "owner",
+            "pid",
+            "process_start_time",
+            "coordinate_source",
+            "geometry_generation",
+            "display_topology_sha256",
+            "bounds",
+            "scale",
+            "scale_x",
+            "scale_y",
+            "viewport",
+            "source_viewport",
+            "content_rect",
+            "fit_scale",
+        )
+    }
+    encoded = json.dumps(
+        {
+            "schema_domain": "openadapt.capture.window-geometry-epoch/v1",
+            **payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class WindowCaptureError(RuntimeError):
@@ -109,6 +150,18 @@ class TargetWindow:
     pid: int
     bounds: tuple[float, float, float, float]
     on_screen: bool = True
+    process_start_time: float | None = None
+    coordinate_source: str = "platform-screen"
+
+    @property
+    def identity(self) -> tuple[int, int, float | None, str]:
+        """Return the process-bound identity used for the whole session."""
+        return (
+            self.window_id,
+            self.pid,
+            self.process_start_time,
+            self.owner.casefold(),
+        )
 
 
 def translate_point(
@@ -167,12 +220,44 @@ class WindowCaptureScope:
         self._source_viewport: tuple[int, int] | None = None
         self._content_rect: tuple[int, int, int, int] | None = None
         self._fit_scale: float | None = None
-        self._bound_window_id: int | None = None
+        self._geometry_generation = 0
+        self._geometry_signature: tuple | None = None
+        self._published_generation = 0
+        self._published_window: TargetWindow | None = None
+        self._published_scale_x: float | None = None
+        self._published_scale_y: float | None = None
+        self._published_content_rect: tuple[int, int, int, int] | None = None
+        self._bound_identity: tuple[int, int, float | None, str] | None = None
+        self._display_topology: dict | None = None
+        self._display_topology_guard: Callable[..., None] | None = None
         # Window of the last CAPTURED frame (not merely resolved): the
         # bounds-timeline 'changed' flag compares frame to frame, so a bare
         # resolve() (e.g. a pre-flight existence check) never suppresses the
         # first frame's timeline entry.
         self._frame_window: TargetWindow | None = None
+
+    def bind_display_topology(
+        self,
+        snapshot: dict,
+        guard: Callable[..., None],
+    ) -> None:
+        """Bind the exact active-display inventory for this recording."""
+        if not isinstance(snapshot, dict) or not snapshot.get("topology_sha256"):
+            raise WindowCaptureError("window capture requires hashed display topology")
+        with self._lock:
+            if self._display_topology is not None:
+                raise WindowCaptureError("display topology is already bound")
+            self._display_topology = dict(snapshot)
+            self._display_topology_guard = guard
+
+    def _assert_display_topology(self) -> None:
+        with self._lock:
+            guard = self._display_topology_guard
+        if guard is None:
+            raise WindowCaptureError(
+                "window capture requires a bound display-topology guard"
+            )
+        guard(force=True)
 
     def resolve(self) -> TargetWindow:
         """Resolve the target window without changing captured-frame geometry.
@@ -187,9 +272,39 @@ class WindowCaptureScope:
                 f"title {self.target.title!r}; is the target application "
                 "running with a visible window?"
             )
+        if self.target.owner and self.target.owner.casefold() not in win.owner.casefold():
+            raise WindowCaptureError(
+                "the window resolver returned an owner outside the configured selector"
+            )
+        if self.target.title and self.target.title.casefold() not in win.title.casefold():
+            raise WindowCaptureError(
+                "the window resolver returned a title outside the configured selector"
+            )
+        if win.pid <= 0:
+            raise WindowCaptureError("the resolved target has no owning process identity")
+        if (
+            win.process_start_time is None
+            or not math.isfinite(win.process_start_time)
+            or win.process_start_time <= 0
+        ):
+            raise WindowCaptureError(
+                "the resolved target has no stable process start identity"
+            )
+        if not win.coordinate_source.strip():
+            raise WindowCaptureError("the resolved target has no coordinate source")
         return win
 
-    def capture_frame(self) -> tuple["Image.Image", bool]:
+    def _assert_bound_identity(self, win: TargetWindow) -> None:
+        """Reject a recycled window handle or a different owning process."""
+        with self._lock:
+            bound_identity = self._bound_identity
+        if bound_identity is not None and win.identity != bound_identity:
+            raise WindowCaptureError(
+                "the resolved target changed window identity or owning process "
+                "during recording"
+            )
+
+    def capture_frame(self, *, publish: bool = True) -> tuple["Image.Image", bool]:
         """Capture the target window's current pixels.
 
         Re-resolves the window first so bounds/scale can never disagree with
@@ -210,18 +325,29 @@ class WindowCaptureScope:
         """
         with self._lock:
             prev = self._frame_window
-            bound_window_id = self._bound_window_id
-        win = self.resolve()
-        if bound_window_id is not None and win.window_id != bound_window_id:
+            output_viewport = self._viewport
+
+        self._assert_display_topology()
+        pre = self.resolve()
+        self._assert_bound_identity(pre)
+        source_image = self._capturer(pre)
+        post = self.resolve()
+        self._assert_bound_identity(post)
+        self._assert_display_topology()
+        if pre.identity != post.identity:
             raise WindowCaptureError(
-                "the resolved target changed window identity during recording: "
-                f"expected {bound_window_id}, got {win.window_id}"
+                "the target process identity changed while a frame was captured"
             )
-        source_image = self._capturer(win)
+        if pre.bounds != post.bounds:
+            raise WindowCaptureError(
+                "the target moved or resized while a frame was captured; "
+                "no action can bind to mixed frame geometry"
+            )
+        win = post
         if source_image.width <= 0 or source_image.height <= 0:
             raise WindowCaptureError("window capture returned an empty frame")
         source_viewport = (source_image.width, source_image.height)
-        output_viewport = self._viewport or source_viewport
+        output_viewport = output_viewport or source_viewport
         output_width, output_height = output_viewport
         fit_scale = min(
             output_width / source_image.width,
@@ -244,6 +370,22 @@ class WindowCaptureScope:
         scale_x = fitted_width / bounds_w
         scale_y = fitted_height / bounds_h
         with self._lock:
+            topology = self._display_topology
+        topology_sha256 = (
+            str(topology["topology_sha256"]) if topology is not None else None
+        )
+        geometry_signature = (
+            win.identity,
+            win.bounds,
+            win.coordinate_source,
+            output_viewport,
+            source_viewport,
+            (offset_x, offset_y, fitted_width, fitted_height),
+            scale_x,
+            scale_y,
+            topology_sha256,
+        )
+        with self._lock:
             self._window = win
             # ``scale`` is the historical scalar field. Keep it as the x-axis
             # value for old readers. Current readers can use both exact axes.
@@ -255,8 +397,15 @@ class WindowCaptureScope:
             self._source_viewport = source_viewport
             self._content_rect = (offset_x, offset_y, fitted_width, fitted_height)
             self._fit_scale = fit_scale
-            self._bound_window_id = win.window_id
+            if self._bound_identity is None:
+                self._bound_identity = win.identity
+            if geometry_signature != self._geometry_signature:
+                self._geometry_generation += 1
+                self._geometry_signature = geometry_signature
             self._frame_window = win
+            generation = self._geometry_generation
+            if publish:
+                self._publish_locked(generation)
         changed = (
             prev is None
             or prev.window_id != win.window_id
@@ -264,6 +413,31 @@ class WindowCaptureScope:
             or prev.title != win.title
         )
         return image, changed
+
+    def _publish_locked(self, generation: int) -> None:
+        """Expose one queued frame geometry to action observers."""
+        if generation != self._geometry_generation or self._window is None:
+            raise WindowCaptureError(
+                f"cannot publish geometry generation {generation}; "
+                f"the current generation is {self._geometry_generation}"
+            )
+        self._published_generation = generation
+        self._published_window = self._window
+        self._published_scale_x = self._scale_x
+        self._published_scale_y = self._scale_y
+        self._published_content_rect = self._content_rect
+
+    def publish_frame(self, generation: int) -> None:
+        """Publish geometry after its pixels and metadata enter the queue."""
+        with self._lock:
+            self._publish_locked(generation)
+
+    def current_generation(self) -> int:
+        """Return the most recently captured, not necessarily published, epoch."""
+        with self._lock:
+            if self._geometry_generation < 1:
+                raise WindowCaptureError("no captured geometry generation is available")
+            return self._geometry_generation
 
     def translate(self, x: float, y: float) -> tuple[float, float]:
         """Translate a global screen point into window-relative pixels.
@@ -276,19 +450,52 @@ class WindowCaptureScope:
                 :meth:`capture_frame` (no bounds are known yet, and guessing
                 a coordinate space would be a silent wrong action).
         """
+        px, py, _generation = self.translate_with_generation(x, y)
+        return px, py
+
+    def _geometry_for_action(
+        self,
+    ) -> tuple[TargetWindow, float, float, tuple[int, int, int, int], int]:
+        """Return the published geometry after exact live revalidation."""
+        self._assert_display_topology()
         with self._lock:
-            window = self._window
-            scale_x = self._scale_x
-            scale_y = self._scale_y
-            content_rect = self._content_rect
+            window = self._published_window
+            scale_x = self._published_scale_x
+            scale_y = self._published_scale_y
+            content_rect = self._published_content_rect
+            generation = self._published_generation
         if window is None or scale_x is None or scale_y is None or content_rect is None:
             raise WindowCaptureError(
-                "translate() called before the first captured frame; "
+                "an action arrived before the first published frame; "
                 "capture_frame() must succeed before input can be scoped"
             )
+        live = self.resolve()
+        self._assert_bound_identity(live)
+        if not live.on_screen:
+            raise WindowCaptureError("the target window is not on screen at action time")
+        if live.bounds != window.bounds:
+            raise WindowCaptureError(
+                "the target moved or resized after the last published frame; "
+                "wait for a matching frame before recording input"
+            )
+        self._assert_display_topology()
+        return window, scale_x, scale_y, content_rect, generation
+
+    def generation_for_action(self) -> int:
+        """Bind a non-pointer action to the exact published frame epoch."""
+        return self._geometry_for_action()[4]
+
+    def assert_current(self) -> None:
+        """Revalidate the bound process, bounds, and display topology."""
+        self._geometry_for_action()
+
+    def translate_with_generation(self, x: float, y: float) -> tuple[float, float, int]:
+        """Translate against the exact published frame after revalidation."""
+        window, scale_x, scale_y, content_rect, generation = self._geometry_for_action()
         return (
             (x - window.bounds[0]) * scale_x + content_rect[0],
             (y - window.bounds[1]) * scale_y + content_rect[1],
+            generation,
         )
 
     def window_event_data(self) -> dict:
@@ -308,9 +515,34 @@ class WindowCaptureScope:
             source_viewport = self._source_viewport
             content_rect = self._content_rect
             fit_scale = self._fit_scale
+            generation = self._geometry_generation
+            topology = self._display_topology
         if window is None:
             raise WindowCaptureError("no resolved window; call capture_frame() first")
         x, y, w, h = window.bounds
+        state = {
+            "schema_version": WINDOW_CAPTURE_SCHEMA_VERSION,
+            "window_capture": True,
+            "window_id": str(window.window_id),
+            "owner": window.owner,
+            "pid": window.pid,
+            "process_start_time": window.process_start_time,
+            "coordinate_source": window.coordinate_source,
+            "geometry_generation": generation,
+            "display_topology_sha256": (
+                topology.get("topology_sha256") if topology else None
+            ),
+            "bounds": [x, y, w, h],
+            "scale": scale,
+            "scale_x": scale_x,
+            "scale_y": scale_y,
+            "viewport": list(viewport) if viewport else None,
+            "source_viewport": list(source_viewport) if source_viewport else None,
+            "content_rect": list(content_rect) if content_rect else None,
+            "fit_scale": fit_scale,
+            "on_screen": window.on_screen,
+        }
+        state["geometry_epoch_sha256"] = window_geometry_epoch_sha256(state)
         return {
             "title": window.title,
             "left": int(x),
@@ -318,20 +550,7 @@ class WindowCaptureScope:
             "width": int(w),
             "height": int(h),
             "window_id": str(window.window_id),
-            "state": {
-                "window_capture": True,
-                "owner": window.owner,
-                "pid": window.pid,
-                "bounds": [x, y, w, h],
-                "scale": scale,
-                "scale_x": scale_x,
-                "scale_y": scale_y,
-                "viewport": list(viewport) if viewport else None,
-                "source_viewport": (list(source_viewport) if source_viewport else None),
-                "content_rect": list(content_rect) if content_rect else None,
-                "fit_scale": fit_scale,
-                "on_screen": window.on_screen,
-            },
+            "state": state,
         }
 
     def snapshot(self) -> dict:
@@ -350,9 +569,13 @@ class WindowCaptureScope:
             source_viewport = self._source_viewport
             content_rect = self._content_rect
             fit_scale = self._fit_scale
+            generation = self._geometry_generation
+            topology = self._display_topology
         data: dict = {
+            "schema_version": WINDOW_CAPTURE_SCHEMA_VERSION,
             "target": {"owner": self.target.owner, "title": self.target.title},
             "coordinate_space": "window_pixels",
+            "display_topology": topology,
         }
         if window is not None:
             data.update(
@@ -361,6 +584,9 @@ class WindowCaptureScope:
                     "owner": window.owner,
                     "title": window.title,
                     "pid": window.pid,
+                    "process_start_time": window.process_start_time,
+                    "coordinate_source": window.coordinate_source,
+                    "geometry_generation": generation,
                     "initial_bounds": list(window.bounds),
                     "scale": scale,
                     "scale_x": scale_x,
@@ -401,6 +627,18 @@ def capture_window(window: TargetWindow) -> "Image.Image":
     )
 
 
+def _process_start_time(pid: int) -> float:
+    """Return a stable process creation identity or fail closed."""
+    import psutil
+
+    try:
+        return float(psutil.Process(pid).create_time())
+    except psutil.Error as exc:
+        raise WindowCaptureError(
+            f"could not bind window owner PID {pid} to its process start time"
+        ) from exc
+
+
 def _resolve_window_macos(target: WindowTarget) -> TargetWindow | None:
     """macOS: CGWindowList by owner/title substring.
 
@@ -435,13 +673,16 @@ def _resolve_window_macos(target: WindowTarget) -> TargetWindow | None:
         area = bounds[2] * bounds[3]
         if area > best_area:
             best_area = area
+            pid = int(w.get("kCGWindowOwnerPID", 0) or 0)
             best = TargetWindow(
                 window_id=int(w.get("kCGWindowNumber", 0) or 0),
                 owner=owner,
                 title=name,
-                pid=int(w.get("kCGWindowOwnerPID", 0) or 0),
+                pid=pid,
                 bounds=bounds,
                 on_screen=bool(w.get("kCGWindowIsOnscreen", False)),
+                process_start_time=_process_start_time(pid),
+                coordinate_source="quartz-screen-points",
             )
     return best
 
@@ -519,9 +760,11 @@ def _resolve_window_windows(target: WindowTarget) -> TargetWindow | None:
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         try:
-            proc_name = psutil.Process(pid.value).name()
+            process = psutil.Process(pid.value)
+            proc_name = process.name()
+            process_start_time = float(process.create_time())
         except psutil.Error:
-            proc_name = ""
+            return True
         if owner_l is not None and owner_l not in proc_name.lower():
             return True
         rect = _window_rect(hwnd)
@@ -541,6 +784,8 @@ def _resolve_window_windows(target: WindowTarget) -> TargetWindow | None:
                     float(bottom - top),
                 ),
                 on_screen=True,
+                process_start_time=process_start_time,
+                coordinate_source="dwm-physical-pixels",
             )
         )
         return True
@@ -552,24 +797,23 @@ def _resolve_window_windows(target: WindowTarget) -> TargetWindow | None:
 
 
 def _window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
-    """Window rectangle in screen coordinates (DWM extended frame preferred)."""
+    """Return DWM physical bounds; never mix DPI-virtualized coordinates."""
     import ctypes
     import ctypes.wintypes as wintypes
 
     rect = wintypes.RECT()
     try:
-        DWMWA_EXTENDED_FRAME_BOUNDS = 9
-        res = ctypes.windll.dwmapi.DwmGetWindowAttribute(
-            wintypes.HWND(hwnd),
-            ctypes.wintypes.DWORD(DWMWA_EXTENDED_FRAME_BOUNDS),
-            ctypes.byref(rect),
-            ctypes.sizeof(rect),
-        )
-        if res == 0:
-            return (rect.left, rect.top, rect.right, rect.bottom)
-    except (AttributeError, OSError):  # pragma: no cover - dwmapi always present
-        pass
-    if not ctypes.windll.user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+        dwmapi = ctypes.windll.dwmapi
+    except (AttributeError, OSError):  # pragma: no cover - supported Windows has DWM
+        return None
+    DWMWA_EXTENDED_FRAME_BOUNDS = 9
+    res = dwmapi.DwmGetWindowAttribute(
+        wintypes.HWND(hwnd),
+        ctypes.wintypes.DWORD(DWMWA_EXTENDED_FRAME_BOUNDS),
+        ctypes.byref(rect),
+        ctypes.sizeof(rect),
+    )
+    if res != 0:
         return None
     return (rect.left, rect.top, rect.right, rect.bottom)
 

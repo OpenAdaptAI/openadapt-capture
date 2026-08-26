@@ -58,7 +58,9 @@ def test_live_scope_rejects_same_size_origin_and_layout_change() -> None:
 
 
 def test_multiple_monitor_snapshot_is_privacy_safe_geometry() -> None:
-    assert _two_monitor_scope().snapshot() == {
+    snapshot = _two_monitor_scope().snapshot()
+    assert snapshot == {
+        "schema_version": "openadapt.capture.display-topology/v1",
         "coordinate_space": "virtual_desktop_pixels",
         "origin": [-1920, 0],
         "viewport": [4480, 1440],
@@ -67,7 +69,9 @@ def test_multiple_monitor_snapshot_is_privacy_safe_geometry() -> None:
             [-1920, 0, 1920, 1080],
             [0, 0, 2560, 1440],
         ],
+        "topology_sha256": snapshot["topology_sha256"],
     }
+    assert len(snapshot["topology_sha256"]) == 64
 
 
 def test_desktop_scope_rejects_missing_physical_monitor() -> None:
