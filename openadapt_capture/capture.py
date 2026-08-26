@@ -513,8 +513,189 @@ class Action:
         """
         bound = getattr(self.event, "screenshot_timestamp", None)
         if bound is not None:
-            return self._capture.get_exact_frame(bound)
+            return self._capture.get_exact_frame(
+                bound,
+                source_ordinal=getattr(self.event, "screenshot_source_ordinal", None),
+            )
         return self._capture.get_frame_at(self.timestamp)
+
+
+def _source_order(rows: list) -> list:
+    """Order current journal rows by ordinal and legacy rows by timestamp."""
+    return sorted(
+        rows,
+        key=lambda row: (
+            getattr(row, "source_ordinal", None) is None,
+            getattr(row, "source_ordinal", None)
+            if getattr(row, "source_ordinal", None) is not None
+            else row.timestamp,
+        ),
+    )
+
+
+def _validate_database_contract(
+    capture: "CaptureSession",
+    *,
+    event_counts: dict[str, int],
+    last_source_ordinal: int | None,
+) -> None:
+    """Validate the sealed terminal claims against one immutable database."""
+    recording = capture._recording
+    rows_by_kind = {
+        "action": list(recording.action_events),
+        "screen": list(recording.screenshots),
+        "window": list(recording.window_events),
+        "browser": list(recording.browser_events),
+    }
+    actual_counts = {kind: len(rows) for kind, rows in rows_by_kind.items()}
+    for kind, actual in actual_counts.items():
+        if event_counts.get(kind) != actual:
+            raise InvalidCaptureEvent(
+                f"sealed {kind} count {event_counts.get(kind)!r} differs from database {actual}"
+            )
+    for event in rows_by_kind["browser"]:
+        if _convert_browser_event(event) is None:
+            raise InvalidCaptureEvent("sealed capture has an invalid browser event")
+
+    ordinals_by_kind: dict[str, set[int]] = {}
+    all_ordinals: list[int] = []
+    for kind, rows in rows_by_kind.items():
+        ordinals = [getattr(row, "source_ordinal", None) for row in rows]
+        if any(ordinal is None or ordinal <= 0 for ordinal in ordinals):
+            raise InvalidCaptureEvent(f"sealed {kind} rows have missing source ordinals")
+        typed_ordinals = [int(ordinal) for ordinal in ordinals]
+        if len(typed_ordinals) != len(set(typed_ordinals)):
+            raise InvalidCaptureEvent(f"sealed {kind} rows reuse a source ordinal")
+        ordinals_by_kind[kind] = set(typed_ordinals)
+        all_ordinals.extend(typed_ordinals)
+
+    calculated_last = max(all_ordinals, default=None)
+    if calculated_last != last_source_ordinal:
+        raise InvalidCaptureEvent(
+            "sealed last source ordinal differs from the immutable database"
+        )
+
+    for event in rows_by_kind["action"]:
+        _convert_action_event(event)
+        if event.screenshot_id is None or event.screenshot is None:
+            raise InvalidCaptureEvent("sealed action has no retained screenshot relationship")
+        if (
+            event.screenshot_source_ordinal != event.screenshot.source_ordinal
+            or event.screenshot_timestamp != event.screenshot.timestamp
+            or event.source_ordinal <= event.screenshot_source_ordinal
+        ):
+            raise InvalidCaptureEvent("sealed action screenshot relationship is inconsistent")
+        if event.window_event_source_ordinal is not None:
+            if event.window_event_id is None or event.window_event is None:
+                raise InvalidCaptureEvent("sealed action has no retained window relationship")
+            if (
+                event.window_event_source_ordinal != event.window_event.source_ordinal
+                or event.window_event_timestamp != event.window_event.timestamp
+            ):
+                raise InvalidCaptureEvent("sealed action window relationship is inconsistent")
+    metadata = capture.window_capture
+    is_v2 = (
+        isinstance(metadata, dict)
+        and metadata.get("schema_version") == "openadapt.capture.window-scoped/v2"
+    )
+    allowed_pair_ordinals: set[int] = set()
+    if is_v2:
+        window_events = capture.window_capture_events_v2()
+        windows_by_ordinal = {event.source_ordinal: event for event in window_events}
+        screenshots_by_ordinal = {
+            row.source_ordinal: row for row in rows_by_kind["screen"]
+        }
+        if set(windows_by_ordinal) != set(screenshots_by_ordinal):
+            raise InvalidCaptureEvent("sealed v2 frame/window pairs are not a bijection")
+        allowed_pair_ordinals = set(windows_by_ordinal)
+        identity = None
+        topology_sha256 = None
+        generation_to_epoch: dict[int, str] = {}
+        previous_generation = 0
+        for ordinal in sorted(allowed_pair_ordinals):
+            window_event = windows_by_ordinal[ordinal]
+            state = window_event.window_capture_v2
+            assert state is not None
+            screenshot = screenshots_by_ordinal[ordinal]
+            if screenshot.timestamp != window_event.timestamp:
+                raise InvalidCaptureEvent("sealed v2 frame and geometry timestamps differ")
+            if screenshot.png_data:
+                from PIL import Image
+
+                try:
+                    with Image.open(io.BytesIO(screenshot.png_data)) as retained:
+                        retained.load()
+                        retained_size = retained.size
+                except Exception as exc:
+                    raise InvalidCaptureEvent("sealed v2 frame PNG is invalid") from exc
+                if retained_size != state.viewport:
+                    raise InvalidCaptureEvent(
+                        "sealed v2 frame dimensions differ from its geometry viewport"
+                    )
+            current_identity = (
+                state.window_id,
+                state.pid,
+                state.process_start_time,
+                state.owner.casefold(),
+            )
+            if identity is None:
+                identity = current_identity
+                topology_sha256 = state.display_topology_sha256
+            elif current_identity != identity:
+                raise InvalidCaptureEvent("sealed v2 capture changed window identity")
+            if state.display_topology_sha256 != topology_sha256:
+                raise InvalidCaptureEvent("sealed v2 capture changed display topology")
+            known_epoch = generation_to_epoch.setdefault(
+                state.geometry_generation,
+                state.geometry_epoch_sha256,
+            )
+            if known_epoch != state.geometry_epoch_sha256:
+                raise InvalidCaptureEvent("one v2 generation names different geometry epochs")
+            if state.geometry_generation < previous_generation:
+                raise InvalidCaptureEvent("sealed v2 geometry generations move backwards")
+            previous_generation = state.geometry_generation
+        for action in rows_by_kind["action"]:
+            if (
+                action.window_geometry_generation is None
+                or action.screenshot_source_ordinal
+                != action.window_event_source_ordinal
+            ):
+                raise InvalidCaptureEvent("sealed v2 action has an incomplete frame binding")
+            bound = windows_by_ordinal.get(action.window_event_source_ordinal)
+            if bound is None or (
+                bound.window_capture_v2.geometry_generation
+                != action.window_geometry_generation
+            ):
+                raise InvalidCaptureEvent("sealed v2 action names the wrong geometry epoch")
+
+    owners: dict[int, set[str]] = {}
+    for kind, ordinals in ordinals_by_kind.items():
+        for ordinal in ordinals:
+            owners.setdefault(ordinal, set()).add(kind)
+    for ordinal, kinds in owners.items():
+        if len(kinds) > 1 and not (
+            ordinal in allowed_pair_ordinals and kinds == {"screen", "window"}
+        ):
+            raise InvalidCaptureEvent("sealed journal reuses a source ordinal across events")
+
+    expected_video_count = event_counts.get("video")
+    if not isinstance(expected_video_count, int) or expected_video_count < 0:
+        raise InvalidCaptureEvent("sealed video count is invalid")
+    if expected_video_count:
+        from openadapt_capture.video import _read_timing_metadata
+
+        video_path = capture.video_path
+        if video_path is None:
+            raise InvalidCaptureEvent("sealed capture claims video frames without an MP4")
+        timing = _read_timing_metadata(video_path)
+        if timing is None or timing[3] is None:
+            raise InvalidCaptureEvent("sealed MP4 has no source-ordinal frame bindings")
+        if len(timing[3]) != expected_video_count:
+            raise InvalidCaptureEvent("sealed video count differs from its MP4 bindings")
+    elif capture.video_path is not None:
+        raise InvalidCaptureEvent("sealed capture inventories an MP4 but claims no video frames")
+
+    list(capture.actions(include_moves=True))
 
 
 class CaptureSession:
@@ -610,16 +791,28 @@ class CaptureSession:
             temporary.cleanup()
 
         try:
-            recording = session.query(Recording).first()
+            recordings = session.query(Recording).all()
         except Exception:
             _discard()
             raise
-        if recording is None:
+        if len(recordings) != 1:
             _discard()
-            raise FileNotFoundError(f"Invalid capture (no recording found): {capture_dir}")
+            raise InvalidCaptureEvent(
+                f"verified capture must contain exactly one recording, found {len(recordings)}"
+            )
+        recording = recordings[0]
         result = cls(snapshot_dir, session, recording)
         result._verified_tempdir = temporary
         result._verified_terminal = terminal
+        try:
+            _validate_database_contract(
+                result,
+                event_counts=terminal.event_counts.model_dump(mode="python"),
+                last_source_ordinal=terminal.last_source_ordinal,
+            )
+        except BaseException:
+            result.close()
+            raise
         return result
 
     @property
@@ -780,7 +973,7 @@ class CaptureSession:
             List of raw mouse and keyboard events.
         """
         events = []
-        for db_event in self._recording.action_events:
+        for db_event in _source_order(list(self._recording.action_events)):
             if getattr(db_event, "disabled", False):
                 continue
             events.append(_convert_action_event(db_event))
@@ -789,7 +982,7 @@ class CaptureSession:
     def window_events(self) -> list[CapturedWindowEvent]:
         """Return stored window rows through the public validated event view."""
         result: list[CapturedWindowEvent] = []
-        for row in self._recording.window_events:
+        for row in _source_order(list(self._recording.window_events)):
             state = getattr(row, "state", None)
             if not isinstance(state, dict):
                 raise InvalidCaptureEvent(
@@ -818,7 +1011,7 @@ class CaptureSession:
                 source_ordinal=getattr(row, "source_ordinal", None),
                 png_sha256=getattr(row, "png_sha256", None),
             )
-            for row in self._recording.screenshots
+            for row in _source_order(list(self._recording.screenshots))
         ]
 
     def window_capture_events_v2(self) -> list[CapturedWindowEvent]:
@@ -930,7 +1123,12 @@ class CaptureSession:
         except Exception:
             return None
 
-    def get_exact_frame(self, capture_timestamp: float) -> "Image":
+    def get_exact_frame(
+        self,
+        capture_timestamp: float,
+        *,
+        source_ordinal: int | None = None,
+    ) -> "Image":
         """Decode THE retained frame bound to this exact capture timestamp.
 
         Prefers the video's capture-timeline binding; for image-only captures
@@ -947,17 +1145,30 @@ class CaptureSession:
         if video_path is not None:
             from openadapt_capture.video import extract_exact_frame
 
-            return extract_exact_frame(video_path, capture_timestamp)
+            return extract_exact_frame(
+                video_path,
+                capture_timestamp,
+                source_ordinal=source_ordinal,
+            )
         for screenshot in self._recording.screenshots:
-            if screenshot.timestamp == capture_timestamp:
+            ordinal_matches = (
+                source_ordinal is None
+                or getattr(screenshot, "source_ordinal", None) == source_ordinal
+            )
+            if screenshot.timestamp == capture_timestamp and ordinal_matches:
                 if not screenshot.png_data:
                     raise LookupError(
                         f"the screenshot retained at {capture_timestamp!r} has no image data"
                     )
                 return Image.open(io.BytesIO(screenshot.png_data)).convert("RGB")
         raise LookupError(
-            f"no frame was retained at exactly {capture_timestamp!r} "
-            "(fail-closed; refusing a nearest-frame substitute)"
+            f"no frame was retained at exactly {capture_timestamp!r}"
+            + (
+                f" with source ordinal {source_ordinal} "
+                if source_ordinal is not None
+                else " "
+            )
+            + "(fail-closed; refusing a nearest-frame substitute)"
         )
 
     def close(self) -> None:

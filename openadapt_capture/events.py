@@ -147,6 +147,13 @@ class WindowCaptureStateV2(BaseModel):
         )
         if not math.isclose(self.fit_scale, expected_fit) or self.content_rect != expected_rect:
             raise ValueError("window capture normalization differs from its viewports")
+        expected_scale_x = width / self.bounds[2]
+        expected_scale_y = height / self.bounds[3]
+        if not math.isclose(self.scale_x, expected_scale_x) or not math.isclose(
+            self.scale_y,
+            expected_scale_y,
+        ):
+            raise ValueError("window capture axis scales differ from its content geometry")
         if not math.isclose(self.scale, self.scale_x):
             raise ValueError("legacy window scale differs from exact x scale")
         if self.geometry_epoch_sha256 != window_geometry_epoch_sha256(

@@ -24,10 +24,13 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
+import openadapt_capture.window_capture as window_capture_module
 from openadapt_capture.capture import CaptureSession
 from openadapt_capture.db import create_db, crud
 from openadapt_capture.desktop_capture import DesktopCaptureScope
+from openadapt_capture.events import WindowCaptureStateV2, window_geometry_epoch_sha256
 from openadapt_capture.recorder import (
+    Event,
     OrderedEventJournal,
     Recorder,
     WindowScopedFrame,
@@ -45,6 +48,160 @@ from openadapt_capture.window_capture import (
 # ---------------------------------------------------------------------------
 # translate_point: exact inverse of flow's replay mapping
 # ---------------------------------------------------------------------------
+
+
+def test_journal_orders_concurrent_observations_by_reservation_not_timestamp():
+    journal = OrderedEventJournal()
+    later_clock = journal.reserve(20.0)
+    earlier_clock = journal.reserve(10.0)
+
+    earlier_clock.complete(Event(10.0, "action", {}))
+    later_clock.complete(Event(20.0, "action", {}))
+
+    first = journal.get_nowait()
+    second = journal.get_nowait()
+    assert (first.timestamp, first.source_ordinal) == (20.0, 1)
+    assert (second.timestamp, second.source_ordinal) == (10.0, 2)
+
+
+def test_journal_accepts_a_frame_after_a_process_clock_reset(scope):
+    journal = OrderedEventJournal()
+    first_image, _ = scope.capture_frame(publish=False)
+    first_generation = scope.current_generation()
+    journal.commit_window_frame(
+        Event(
+            20.0,
+            "screen",
+            WindowScopedFrame(
+                image=first_image,
+                window_event_data=scope.window_event_data(),
+                geometry_generation=first_generation,
+            ),
+        ),
+        scope,
+        first_generation,
+    )
+
+    second_image, _ = scope.capture_frame(publish=False)
+    second_generation = scope.current_generation()
+    journal.commit_window_frame(
+        Event(
+            10.0,
+            "screen",
+            WindowScopedFrame(
+                image=second_image,
+                window_event_data=scope.window_event_data(),
+                geometry_generation=second_generation,
+            ),
+        ),
+        scope,
+        second_generation,
+    )
+
+    assert [journal.get_nowait().source_ordinal for _ in range(2)] == [1, 2]
+
+
+def test_action_reservation_cannot_bind_a_later_frame_generation(scope, fake, monkeypatch):
+    scope.capture_frame()
+    journal = OrderedEventJournal()
+    translation_entered = threading.Event()
+    allow_translation = threading.Event()
+    original_translate = scope.translate_with_generation
+
+    def blocked_translate(x, y):
+        binding = original_translate(x, y)
+        translation_entered.set()
+        assert allow_translation.wait(timeout=5)
+        return binding
+
+    monkeypatch.setattr(scope, "translate_with_generation", blocked_translate)
+    action_result = {}
+
+    def reserve_action():
+        reservation, binding = journal.reserve_window_action(1.0, scope, 310.0, 170.0)
+        action_result["binding"] = binding
+        reservation.complete(Event(1.0, "action", {"window_geometry_generation": binding[2]}))
+
+    action_thread = threading.Thread(target=reserve_action)
+    action_thread.start()
+    assert translation_entered.wait(timeout=5)
+
+    fake.bounds = (500.0, 250.0, 800.0, 600.0)
+    image, _ = scope.capture_frame(publish=False)
+    generation = scope.current_generation()
+    frame_thread = threading.Thread(
+        target=lambda: journal.commit_window_frame(
+            Event(
+                2.0,
+                "screen",
+                WindowScopedFrame(
+                    image=image,
+                    window_event_data=scope.window_event_data(),
+                    geometry_generation=generation,
+                ),
+            ),
+            scope,
+            generation,
+        )
+    )
+    frame_thread.start()
+    allow_translation.set()
+    action_thread.join(timeout=5)
+    frame_thread.join(timeout=5)
+
+    assert action_result["binding"][2] == 1
+    action = journal.get_nowait()
+    frame = journal.get_nowait()
+    assert (action.source_ordinal, frame.source_ordinal) == (1, 2)
+    assert frame.data.geometry_generation == 2
+
+
+def test_window_capture_state_rejects_scales_not_derived_from_content(scope):
+    scope.capture_frame()
+    state = scope.window_event_data()["state"]
+    state["scale"] = 999.0
+    state["scale_x"] = 999.0
+    state["scale_y"] = 999.0
+    state["geometry_epoch_sha256"] = window_geometry_epoch_sha256(
+        {key: value for key, value in state.items() if key != "geometry_epoch_sha256"}
+    )
+
+    with pytest.raises(ValueError, match="axis scales"):
+        WindowCaptureStateV2.model_validate(state)
+
+
+def test_macos_resolver_ignores_a_larger_hidden_matching_window(monkeypatch):
+    hidden = {
+        "kCGWindowOwnerName": "FakeApp",
+        "kCGWindowName": "Document",
+        "kCGWindowLayer": 0,
+        "kCGWindowIsOnscreen": False,
+        "kCGWindowBounds": {"X": 0, "Y": 0, "Width": 2000, "Height": 1200},
+        "kCGWindowOwnerPID": 100,
+        "kCGWindowNumber": 1,
+    }
+    visible = {
+        "kCGWindowOwnerName": "FakeApp",
+        "kCGWindowName": "Document",
+        "kCGWindowLayer": 0,
+        "kCGWindowIsOnscreen": True,
+        "kCGWindowBounds": {"X": 10, "Y": 10, "Width": 800, "Height": 600},
+        "kCGWindowOwnerPID": 100,
+        "kCGWindowNumber": 2,
+    }
+    quartz = SimpleNamespace(
+        kCGWindowListOptionAll=1,
+        kCGNullWindowID=0,
+        CGWindowListCopyWindowInfo=lambda *_args: [hidden, visible],
+    )
+    monkeypatch.setitem(sys.modules, "Quartz", quartz)
+    monkeypatch.setattr(window_capture_module, "_process_start_time", lambda _pid: 123.0)
+
+    resolved = window_capture_module._resolve_window_macos(WindowTarget(owner="FakeApp"))
+
+    assert resolved is not None
+    assert resolved.window_id == 2
+    assert resolved.on_screen is True
 
 
 class TestTranslatePoint:
@@ -884,6 +1041,8 @@ class TestWindowCaptureLive:
         # an owner-only selector from switching to another large window after
         # the target changes size.
         scope = WindowCaptureScope(WindowTarget(owner=target.owner, title=target.title))
+        desktop = DesktopCaptureScope.current()
+        scope.bind_display_topology(desktop.snapshot(), desktop.assert_current)
         initial_image, initial_changed = scope.capture_frame()
         assert initial_changed is True
         initial_data = scope.window_event_data()

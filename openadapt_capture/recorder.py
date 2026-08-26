@@ -188,7 +188,6 @@ class OrderedEventJournal:
     def __init__(self) -> None:
         self._condition = threading.Condition()
         self._entries: deque[_JournalEntry] = deque()
-        self._last_timestamp: float | None = None
         self._next_sequence = 1
 
     def reserve(self, timestamp: float) -> EventReservation:
@@ -196,16 +195,44 @@ class OrderedEventJournal:
         if not math.isfinite(timestamp):
             raise EventJournalOrderingError("event timestamps must be finite")
         with self._condition:
-            if self._last_timestamp is not None and timestamp < self._last_timestamp:
-                raise EventJournalOrderingError(
-                    "an event arrived behind a newer journal reservation"
-                )
-            entry = _JournalEntry(timestamp, self._next_sequence)
-            self._next_sequence += 1
-            self._last_timestamp = timestamp
-            self._entries.append(entry)
-            self._condition.notify_all()
+            entry = self._reserve_locked(timestamp)
         return EventReservation(self, entry)
+
+    def _reserve_locked(self, timestamp: float) -> _JournalEntry:
+        entry = _JournalEntry(timestamp, self._next_sequence)
+        self._next_sequence += 1
+        self._entries.append(entry)
+        self._condition.notify_all()
+        return entry
+
+    def reserve_window_action(
+        self,
+        timestamp: float,
+        window_scope: WindowCaptureScope,
+        x: float | None,
+        y: float | None,
+    ) -> tuple[EventReservation, tuple[float, float, int] | int]:
+        """Reserve an action and bind the last published frame atomically."""
+        timestamp = float(timestamp)
+        if not math.isfinite(timestamp):
+            raise EventJournalOrderingError("event timestamps must be finite")
+        with self._condition:
+            entry = self._reserve_locked(timestamp)
+            reservation = EventReservation(self, entry)
+            try:
+                if x is not None and y is not None:
+                    binding: tuple[float, float, int] | int = (
+                        window_scope.translate_with_generation(x, y)
+                    )
+                else:
+                    binding = window_scope.generation_for_action()
+            except BaseException as exc:
+                entry.error = exc
+                entry.ready = True
+                reservation._finished = True
+                self._condition.notify_all()
+                raise
+        return reservation, binding
 
     def put(self, event: Event, block: bool = True, timeout: float | None = None) -> None:
         del block, timeout
@@ -224,13 +251,8 @@ class OrderedEventJournal:
             raise EventJournalOrderingError("event timestamps must be finite")
         failure: BaseException | None = None
         with self._condition:
-            if self._last_timestamp is not None and timestamp < self._last_timestamp:
-                raise EventJournalOrderingError(
-                    "a frame arrived behind a newer journal reservation"
-                )
             entry = _JournalEntry(timestamp, self._next_sequence)
             self._next_sequence += 1
-            self._last_timestamp = timestamp
             self._entries.append(entry)
             try:
                 window_scope.publish_frame(generation)
@@ -634,7 +656,7 @@ def process_events(
                 num_video_events.value += 1
             if scoped_pair:
                 process_event(
-                    event,
+                    event if config.RECORD_IMAGES else event._replace(data=None),
                     screen_write_q,
                     write_screen_event,
                     recording,
@@ -726,7 +748,11 @@ def process_events(
             )
             if screen_is_new:
                 process_event(
-                    prev_screen_event,
+                    (
+                        prev_screen_event
+                        if config.RECORD_IMAGES
+                        else prev_screen_event._replace(data=None)
+                    ),
                     screen_write_q,
                     write_screen_event,
                     recording,
@@ -798,6 +824,8 @@ def write_screen_event(
     recording: Recording,
     event: Event,
     perf_q: sq.SynchronizedQueue,
+    *,
+    record_images: bool | None = None,
 ) -> None:
     """Write a screen event to the database and update the performance queue.
 
@@ -808,8 +836,11 @@ def write_screen_event(
         perf_q: A queue for collecting performance data.
     """
     assert event.type == "screen", event
+    retain_image = config.RECORD_IMAGES if record_images is None else record_images
     image = event.data
-    if config.RECORD_IMAGES:
+    if retain_image:
+        if image is None:
+            raise ValueError("the screen writer received no image while PNG retention is enabled")
         with io.BytesIO() as output:
             image.save(output, format="PNG")
             png_data = output.getvalue()
@@ -1075,7 +1106,8 @@ def write_video_event(
     # TODO: why isn't force_key_frame sufficient?
     if last_pts != 0:
         num_copies = 1
-    for _ in range(num_copies):
+    for copy_index in range(num_copies):
+        bind_evidence = copy_index == 0
         last_pts = video.write_video_frame(
             video_container,
             video_stream,
@@ -1084,6 +1116,8 @@ def write_video_event(
             video_start_timestamp,
             last_pts,
             force_key_frame,
+            source_ordinal=event.source_ordinal if bind_evidence else None,
+            bind_capture=bind_evidence,
         )
     perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
     return {
@@ -1124,20 +1158,43 @@ def trigger_action_event(
         None
     """
     event_timestamp = utils.get_timestamp() if timestamp is None else timestamp
-    reservation = (
-        event_q.reserve(event_timestamp) if isinstance(event_q, OrderedEventJournal) else None
-    )
     event_data = dict(action_event_args)
     x = event_data.get("mouse_x")
     y = event_data.get("mouse_y")
+    window_binding: tuple[float, float, int] | int | None = None
+    if isinstance(event_q, OrderedEventJournal) and isinstance(
+        coordinate_scope,
+        WindowCaptureScope,
+    ):
+        reservation, window_binding = event_q.reserve_window_action(
+            event_timestamp,
+            coordinate_scope,
+            x,
+            y,
+        )
+    else:
+        reservation = (
+            event_q.reserve(event_timestamp)
+            if isinstance(event_q, OrderedEventJournal)
+            else None
+        )
     try:
         if isinstance(coordinate_scope, WindowCaptureScope):
             if x is not None and y is not None:
-                wx, wy, generation = coordinate_scope.translate_with_generation(x, y)
+                if window_binding is None:
+                    wx, wy, generation = coordinate_scope.translate_with_generation(x, y)
+                else:
+                    assert isinstance(window_binding, tuple)
+                    wx, wy, generation = window_binding
                 event_data["mouse_x"] = wx
                 event_data["mouse_y"] = wy
             else:
-                generation = coordinate_scope.generation_for_action()
+                generation = (
+                    coordinate_scope.generation_for_action()
+                    if window_binding is None
+                    else window_binding
+                )
+                assert isinstance(generation, int)
             event_data["window_geometry_generation"] = generation
         elif coordinate_scope is not None and x is not None and y is not None:
             wx, wy = coordinate_scope.translate(x, y)
@@ -2201,7 +2258,7 @@ def record(
         target=utils.WrapStdout(write_events),
         args=(
             "screen",
-            write_screen_event,
+            partial(write_screen_event, record_images=bool(config.RECORD_IMAGES)),
             screen_write_q,
             num_screen_events,
             perf_q,
@@ -2734,8 +2791,8 @@ class Recorder:
 
         from openadapt_capture.capture import (
             CaptureSession,
-            _convert_action_event,
-            _convert_browser_event,
+            InvalidCaptureEvent,
+            _validate_database_contract,
         )
 
         db_path = Path(self.capture_dir) / "recording.db"
@@ -2792,109 +2849,34 @@ class Recorder:
             database.close()
         capture = CaptureSession.load(self.capture_dir)
         try:
-            for event in capture._recording.action_events:
-                _convert_action_event(event)
-            for event in capture._recording.browser_events:
-                if _convert_browser_event(event) is None:
-                    raise RuntimeError(
-                        "The finalized Capture database has an invalid browser event."
-                    )
-            metadata = capture.window_capture
-            if (
-                isinstance(metadata, dict)
-                and metadata.get("schema_version") == "openadapt.capture.window-scoped/v2"
-            ):
-                window_events = capture.window_capture_events_v2()
-                windows_by_ordinal = {event.source_ordinal: event for event in window_events}
-                screenshots_by_ordinal = {
-                    row.source_ordinal: row for row in capture._recording.screenshots
-                }
-                if None in windows_by_ordinal or None in screenshots_by_ordinal:
-                    raise RuntimeError("The finalized v2 capture has an unsequenced frame pair.")
-                if set(windows_by_ordinal) != set(screenshots_by_ordinal):
-                    raise RuntimeError(
-                        "The finalized v2 capture has an incomplete frame/window pair."
-                    )
-                if len(windows_by_ordinal) != len(window_events):
-                    raise RuntimeError("The finalized v2 capture reuses a window source ordinal.")
-                identity = None
-                topology_sha256 = None
-                generation_to_epoch: dict[int, str] = {}
-                previous_generation = 0
-                for ordinal in sorted(windows_by_ordinal):
-                    window_event = windows_by_ordinal[ordinal]
-                    window_state = window_event.window_capture_v2
-                    assert window_state is not None
-                    screenshot = screenshots_by_ordinal[ordinal]
-                    if screenshot.timestamp != window_event.timestamp:
-                        raise RuntimeError("The finalized v2 frame and geometry timestamps differ.")
-                    current_identity = (
-                        window_state.window_id,
-                        window_state.pid,
-                        window_state.process_start_time,
-                        window_state.owner.casefold(),
-                    )
-                    if identity is None:
-                        identity = current_identity
-                        topology_sha256 = window_state.display_topology_sha256
-                    elif current_identity != identity:
-                        raise RuntimeError(
-                            "The finalized v2 capture changed process-bound window identity."
-                        )
-                    if window_state.display_topology_sha256 != topology_sha256:
-                        raise RuntimeError("The finalized v2 capture changed display topology.")
-                    generation = window_state.geometry_generation
-                    known_epoch = generation_to_epoch.setdefault(
-                        generation, window_state.geometry_epoch_sha256
-                    )
-                    if known_epoch != window_state.geometry_epoch_sha256:
-                        raise RuntimeError("A v2 geometry generation names two different epochs.")
-                    if generation < previous_generation:
-                        raise RuntimeError("The finalized v2 geometry generations move backwards.")
-                    previous_generation = generation
-                action_ordinals: set[int] = set()
-                for action in capture._recording.action_events:
-                    if (
-                        action.source_ordinal is None
-                        or action.screenshot_source_ordinal is None
-                        or action.window_event_source_ordinal is None
-                        or action.window_geometry_generation is None
-                    ):
-                        raise RuntimeError(
-                            "The finalized v2 capture has an incomplete action binding."
-                        )
-                    if action.source_ordinal in action_ordinals:
-                        raise RuntimeError(
-                            "The finalized v2 capture reuses an action source ordinal."
-                        )
-                    action_ordinals.add(action.source_ordinal)
-                    if (
-                        action.screenshot_source_ordinal != action.window_event_source_ordinal
-                        or action.source_ordinal <= action.screenshot_source_ordinal
-                    ):
-                        raise RuntimeError(
-                            "The finalized v2 action does not bind one earlier frame pair."
-                        )
-                    bound_window = windows_by_ordinal.get(action.window_event_source_ordinal)
-                    bound_screen = screenshots_by_ordinal.get(action.screenshot_source_ordinal)
-                    if bound_window is None or bound_screen is None:
-                        raise RuntimeError("The finalized v2 action names a missing frame pair.")
-                    bound_state = bound_window.window_capture_v2
-                    assert bound_state is not None
-                    if (
-                        bound_state.geometry_generation != action.window_geometry_generation
-                        or action.screenshot_id != bound_screen.id
-                        or action.window_event_id
-                        != next(
-                            row.id
-                            for row in capture._recording.window_events
-                            if row.source_ordinal == action.window_event_source_ordinal
-                        )
-                    ):
-                        raise RuntimeError(
-                            "The finalized v2 action relationship differs from its epoch."
-                        )
-                list(capture.actions(include_moves=True))
+            database_rows = (
+                list(capture._recording.action_events)
+                + list(capture._recording.screenshots)
+                + list(capture._recording.window_events)
+                + list(capture._recording.browser_events)
+            )
+            last_source_ordinal = max(
+                (
+                    row.source_ordinal
+                    for row in database_rows
+                    if row.source_ordinal is not None
+                ),
+                default=None,
+            )
+            try:
+                _validate_database_contract(
+                    capture,
+                    event_counts={
+                        "action": self._num_action_events.value,
+                        "screen": self._num_screen_events.value,
+                        "window": self._num_window_events.value,
+                        "browser": self._num_browser_events.value,
+                        "video": self._num_video_events.value,
+                    },
+                    last_source_ordinal=last_source_ordinal,
+                )
+            except InvalidCaptureEvent as exc:
+                raise RuntimeError(str(exc)) from exc
         finally:
             capture.close()
 
@@ -3172,7 +3154,7 @@ class Recorder:
         return (
             self._record_thread is not None
             and self._record_thread.is_alive()
-            and not self._terminate_processing.is_set()
+            and not self._finalized_event.is_set()
         )
 
     @property
@@ -3213,12 +3195,14 @@ class Recorder:
 
         Returns None if recording has not finished yet.
         """
+        if not self._finalized_event.is_set():
+            return None
         self.check_health()
-        if self._capture is None and not self.is_recording:
+        if self._capture is None:
             try:
                 from openadapt_capture.capture import CaptureSession
 
-                self._capture = CaptureSession.load(self.capture_dir)
+                self._capture = CaptureSession.load_verified(self.capture_dir)
             except FileNotFoundError:
                 return None
         return self._capture

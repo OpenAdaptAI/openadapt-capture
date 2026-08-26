@@ -181,6 +181,82 @@ def _open_stable_regular_file(path: Path) -> tuple[int, os.stat_result]:
     return fd, before
 
 
+def _open_relative_regular_file(
+    root: Path,
+    relative_path: str,
+) -> tuple[int, os.stat_result]:
+    """Open one artifact without following any intermediate path component."""
+    record = ArtifactRecord(path=relative_path, size_bytes=0, sha256="0" * 64)
+    parts = PurePosixPath(record.path).parts
+    supports_descriptor_walk = (
+        os.open in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and hasattr(os, "O_DIRECTORY")
+    )
+    if not supports_descriptor_walk:
+        return _open_stable_regular_file(_safe_artifact_path(root, record.path))
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    directory_fd = os.open(root, directory_flags)
+    opened_directories = [directory_fd]
+    try:
+        try:
+            for part in parts[:-1]:
+                directory_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+                opened_directories.append(directory_fd)
+            before = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(before.st_mode):
+                raise CaptureSealError(
+                    f"capture artifact is not a regular file: {record.path}"
+                )
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(parts[-1], flags, dir_fd=directory_fd)
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode) or (
+                opened.st_dev,
+                opened.st_ino,
+            ) != (before.st_dev, before.st_ino):
+                os.close(fd)
+                raise CaptureSealError(
+                    f"capture artifact changed before reading: {record.path}"
+                )
+            return fd, before
+        except OSError as exc:
+            raise CaptureSealError(
+                f"capture artifact path changed before reading: {record.path}"
+            ) from exc
+    finally:
+        for opened_directory in reversed(opened_directories):
+            os.close(opened_directory)
+
+
+def _assert_relative_identity(
+    root: Path,
+    relative_path: str,
+    expected: os.stat_result,
+) -> None:
+    fd, current = _open_relative_regular_file(root, relative_path)
+    os.close(fd)
+    if (
+        expected.st_dev,
+        expected.st_ino,
+        expected.st_size,
+        expected.st_mtime_ns,
+    ) != (
+        current.st_dev,
+        current.st_ino,
+        current.st_size,
+        current.st_mtime_ns,
+    ):
+        raise CaptureSealError(
+            f"capture artifact changed while reading: {relative_path}"
+        )
+
+
 def _assert_stable_file(path: Path, before: os.stat_result, after: os.stat_result) -> None:
     current = path.lstat()
     identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
@@ -222,6 +298,38 @@ def _hash_regular_file(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
+def _hash_relative_regular_file(root: Path, relative_path: str) -> tuple[int, str]:
+    fd, before = _open_relative_regular_file(root, relative_path)
+    try:
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise CaptureSealError(f"capture artifact changed while reading: {relative_path}")
+    _assert_relative_identity(root, relative_path, before)
+    if size != before.st_size:
+        raise CaptureSealError(f"capture artifact size changed while hashing: {relative_path}")
+    return size, digest.hexdigest()
+
+
 def _read_regular_file(path: Path) -> bytes:
     """Read one stable regular file through the descriptor that was verified."""
     fd, before = _open_stable_regular_file(path)
@@ -244,12 +352,13 @@ def _read_regular_file(path: Path) -> bytes:
 
 
 def _copy_verified_regular_file(
-    source: Path,
+    source_root: Path,
+    relative_path: str,
     destination: Path,
     expected: ArtifactRecord,
 ) -> None:
     """Copy one exact source file without following a replacement symlink."""
-    source_fd, before = _open_stable_regular_file(source)
+    source_fd, before = _open_relative_regular_file(source_root, relative_path)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     try:
         destination_fd = os.open(destination, flags, 0o600)
@@ -278,7 +387,22 @@ def _copy_verified_regular_file(
     except BaseException:
         destination.unlink(missing_ok=True)
         raise
-    _assert_stable_file(source, before, after)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        destination.unlink(missing_ok=True)
+        raise CaptureSealError(
+            f"capture artifact changed during snapshot: {relative_path}"
+        )
+    _assert_relative_identity(source_root, relative_path, before)
     if (size, digest.hexdigest()) != (expected.size_bytes, expected.sha256):
         destination.unlink(missing_ok=True)
         raise CaptureSealError(f"capture artifact changed during snapshot: {expected.path}")
@@ -297,7 +421,7 @@ def build_artifact_manifest(capture_dir: str | os.PathLike[str]) -> CaptureArtif
             continue
         if not stat.S_ISREG(details.st_mode):
             raise CaptureSealError(f"capture artifact is not a regular file: {relative}")
-        size, digest = _hash_regular_file(path)
+        size, digest = _hash_relative_regular_file(root, relative)
         artifacts.append(ArtifactRecord(path=relative, size_bytes=size, sha256=digest))
     return CaptureArtifactManifest(
         schema_version=ARTIFACT_MANIFEST_SCHEMA_VERSION,
@@ -401,7 +525,7 @@ def verify_capture_artifacts(
     if actual_paths != expected_paths:
         raise CaptureSealError("capture artifacts differ from the sealed inventory")
     for artifact in manifest.artifacts:
-        size, digest = _hash_regular_file(_safe_artifact_path(root, artifact.path))
+        size, digest = _hash_relative_regular_file(root, artifact.path)
         if (size, digest) != (artifact.size_bytes, artifact.sha256):
             raise CaptureSealError(f"capture artifact differs from its seal: {artifact.path}")
     return terminal, manifest
@@ -417,10 +541,9 @@ def copy_verified_capture(
     destination = Path(temporary.name)
     try:
         for artifact in manifest.artifacts:
-            source_path = _safe_artifact_path(source, artifact.path)
             target_path = destination.joinpath(*PurePosixPath(artifact.path).parts)
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            _copy_verified_regular_file(source_path, target_path, artifact)
+            _copy_verified_regular_file(source, artifact.path, target_path, artifact)
             size, digest = _hash_regular_file(target_path)
             if (size, digest) != (artifact.size_bytes, artifact.sha256):
                 raise CaptureSealError(f"capture artifact changed during snapshot: {artifact.path}")

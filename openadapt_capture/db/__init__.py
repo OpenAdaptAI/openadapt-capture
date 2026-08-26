@@ -174,11 +174,11 @@ def get_session_for_path(db_path: str, echo: bool = False):
 def get_immutable_session_for_path(db_path: str, echo: bool = False):
     """Open an already-verified SQLite snapshot without schema migration."""
 
-    resolved = str(Path(db_path).resolve())
+    immutable_uri = f"{Path(db_path).resolve().as_uri()}?mode=ro&immutable=1"
 
     def _connect() -> sqlite3.Connection:
         return sqlite3.connect(
-            f"file:{resolved}?mode=ro&immutable=1",
+            immutable_uri,
             uri=True,
             check_same_thread=False,
         )

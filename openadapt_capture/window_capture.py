@@ -280,6 +280,8 @@ class WindowCaptureScope:
             raise WindowCaptureError(
                 "the window resolver returned a title outside the configured selector"
             )
+        if not win.on_screen:
+            raise WindowCaptureError("the resolved target window is not on screen")
         if win.pid <= 0:
             raise WindowCaptureError("the resolved target has no owning process identity")
         if (
@@ -642,10 +644,8 @@ def _process_start_time(pid: int) -> float:
 def _resolve_window_macos(target: WindowTarget) -> TargetWindow | None:
     """macOS: CGWindowList by owner/title substring.
 
-    Same selection semantics as flow's ``MacWindowClient.find_window``:
-    ``kCGWindowListOptionAll`` (a momentarily hidden client is still
-    resolvable/capturable), layer 0 only, case-insensitive substring match,
-    largest window wins.
+    Selects the largest visible layer-0 window that matches the configured
+    owner/title substrings.
     """
     import Quartz
 
@@ -663,6 +663,8 @@ def _resolve_window_macos(target: WindowTarget) -> TargetWindow | None:
             continue
         if int(w.get("kCGWindowLayer", 0) or 0) != 0:
             continue  # skip menubar/overlay layers; the app window is layer 0
+        if not bool(w.get("kCGWindowIsOnscreen", False)):
+            continue
         b = w.get("kCGWindowBounds", {}) or {}
         bounds = (
             float(b.get("X", 0.0)),
