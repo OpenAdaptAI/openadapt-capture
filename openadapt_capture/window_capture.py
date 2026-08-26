@@ -302,7 +302,36 @@ class WindowCaptureScope:
             )
         if not win.coordinate_source.strip():
             raise WindowCaptureError("the resolved target has no coordinate source")
+        self._assert_window_topology_compatibility(win)
         return win
+
+    def _assert_window_topology_compatibility(self, win: TargetWindow) -> None:
+        """Require an X11 root-pixel window to fit the retained monitor union."""
+        if win.coordinate_source != "x11-root-physical-pixels":
+            return
+        with self._lock:
+            topology = self._display_topology
+        # A preliminary resolve can run before the recorder binds topology.
+        # Every frame and action resolve runs after that binding.
+        if topology is None:
+            return
+        if topology.get("coordinate_space") != "virtual_desktop_pixels":
+            raise WindowCaptureError("X11 window capture requires virtual_desktop_pixels topology")
+        monitors = topology.get("monitors")
+        if not isinstance(monitors, list) or not monitors:
+            raise WindowCaptureError("X11 window capture requires physical monitor bounds")
+        try:
+            monitor_rects = [tuple(float(value) for value in monitor) for monitor in monitors]
+        except (TypeError, ValueError) as exc:
+            raise WindowCaptureError(
+                "X11 display topology contains invalid monitor bounds"
+            ) from exc
+        if any(len(monitor) != 4 for monitor in monitor_rects):
+            raise WindowCaptureError("X11 display topology contains invalid monitor bounds")
+        if not _rectangle_covered_by_monitors(win.bounds, monitor_rects):
+            raise WindowCaptureError(
+                "the X11 target window is not fully covered by the bound display topology"
+            )
 
     def _assert_bound_identity(self, win: TargetWindow) -> None:
         """Reject a recycled window handle or a different owning process."""
@@ -615,14 +644,71 @@ class WindowCaptureScope:
 # ---------------------------------------------------------------------------
 
 
+def _rectangle_covered_by_monitors(
+    rectangle: tuple[float, float, float, float],
+    monitors: list[tuple[float, float, float, float]],
+) -> bool:
+    """Return whether the union of monitor rectangles fully covers a window."""
+    x, y, width, height = rectangle
+    if width <= 0 or height <= 0:
+        return False
+    right = x + width
+    bottom = y + height
+    relevant = [
+        monitor
+        for monitor in monitors
+        if monitor[2] > 0
+        and monitor[3] > 0
+        and monitor[0] < right
+        and monitor[1] < bottom
+        and monitor[0] + monitor[2] > x
+        and monitor[1] + monitor[3] > y
+    ]
+    if not relevant:
+        return False
+    x_edges = {x, right}
+    y_edges = {y, bottom}
+    for left, top, monitor_width, monitor_height in relevant:
+        x_edges.update({max(x, left), min(right, left + monitor_width)})
+        y_edges.update({max(y, top), min(bottom, top + monitor_height)})
+    sorted_x = sorted(x_edges)
+    sorted_y = sorted(y_edges)
+    for left, cell_right in zip(sorted_x, sorted_x[1:]):
+        if cell_right <= left:
+            continue
+        midpoint_x = (left + cell_right) / 2
+        for top, cell_bottom in zip(sorted_y, sorted_y[1:]):
+            if cell_bottom <= top:
+                continue
+            midpoint_y = (top + cell_bottom) / 2
+            if not any(
+                monitor_left <= midpoint_x < monitor_left + monitor_width
+                and monitor_top <= midpoint_y < monitor_top + monitor_height
+                for monitor_left, monitor_top, monitor_width, monitor_height in relevant
+            ):
+                return False
+    return True
+
+
 def resolve_window(target: WindowTarget) -> TargetWindow | None:
     """Find the front-most/largest window matching ``target`` on this platform."""
     if sys.platform == "darwin":
         return _resolve_window_macos(target)
     if sys.platform == "win32":
         return _resolve_window_windows(target)
+    if sys.platform.startswith("linux"):
+        from openadapt_capture.window_capture_linux import (
+            LinuxWindowCaptureError,
+            resolve_window_linux,
+        )
+
+        try:
+            return resolve_window_linux(target)
+        except LinuxWindowCaptureError as exc:
+            raise WindowCaptureError(str(exc)) from exc
     raise WindowCaptureError(
-        f"window-scoped capture is not supported on {sys.platform} (supported: darwin, win32)"
+        f"window-scoped capture is not supported on {sys.platform} "
+        "(supported: darwin, win32, linux-x11)"
     )
 
 
@@ -632,8 +718,19 @@ def capture_window(window: TargetWindow) -> "Image.Image":
         return _capture_window_macos(window)
     if sys.platform == "win32":
         return _capture_window_windows(window)
+    if sys.platform.startswith("linux"):
+        from openadapt_capture.window_capture_linux import (
+            LinuxWindowCaptureError,
+            capture_window_linux,
+        )
+
+        try:
+            return capture_window_linux(window)
+        except LinuxWindowCaptureError as exc:
+            raise WindowCaptureError(str(exc)) from exc
     raise WindowCaptureError(
-        f"window-scoped capture is not supported on {sys.platform} (supported: darwin, win32)"
+        f"window-scoped capture is not supported on {sys.platform} "
+        "(supported: darwin, win32, linux-x11)"
     )
 
 
