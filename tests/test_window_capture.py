@@ -156,7 +156,7 @@ def test_action_reservation_cannot_bind_a_later_frame_generation(scope, fake, mo
     assert frame.data.geometry_generation == 2
 
 
-def test_input_observation_waits_for_an_in_flight_window_frame(fake):
+def test_input_observation_precedes_an_in_flight_window_frame(fake):
     capture_entered = threading.Event()
     release_capture = threading.Event()
     terminate = threading.Event()
@@ -213,6 +213,7 @@ def test_input_observation_waits_for_an_in_flight_window_frame(fake):
     assert capture_entered.wait(timeout=5)
 
     action_finished = threading.Event()
+    action_binding: dict[str, int] = {}
 
     def reserve_action():
         action_timestamp = time.time()
@@ -222,6 +223,7 @@ def test_input_observation_waits_for_an_in_flight_window_frame(fake):
             310.0,
             170.0,
         )
+        action_binding["generation"] = binding[2]
         reservation.complete(
             Event(
                 action_timestamp,
@@ -233,7 +235,15 @@ def test_input_observation_waits_for_an_in_flight_window_frame(fake):
 
     action_reader = threading.Thread(target=reserve_action)
     action_reader.start()
-    assert not action_finished.wait(timeout=0.1)
+    assert action_finished.wait(timeout=5)
+
+    # The in-flight frame can include the action's result. It must remain
+    # unpublished until after the action has bound the previous exact frame.
+    initial = journal.get_nowait()
+    action = journal.get_nowait()
+    assert [initial.type, action.type] == ["screen", "action"]
+    assert action_binding["generation"] == initial.data.geometry_generation
+    assert journal.empty()
 
     release_capture.set()
     screen_reader.join(timeout=5)
@@ -241,11 +251,7 @@ def test_input_observation_waits_for_an_in_flight_window_frame(fake):
 
     assert not screen_reader.is_alive()
     assert not action_reader.is_alive()
-    assert [journal.get_nowait().type for _ in range(3)] == [
-        "screen",
-        "screen",
-        "action",
-    ]
+    assert journal.get_nowait().type == "screen"
 
 
 def test_window_capture_state_rejects_scales_not_derived_from_content(scope):

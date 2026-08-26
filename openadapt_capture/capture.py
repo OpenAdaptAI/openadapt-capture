@@ -5,6 +5,7 @@ Provides time-aligned access to captured events with associated screenshots.
 
 from __future__ import annotations
 
+import hashlib
 import io
 from dataclasses import dataclass
 from pathlib import Path
@@ -571,9 +572,7 @@ def _validate_database_contract(
 
     calculated_last = max(all_ordinals, default=None)
     if calculated_last != last_source_ordinal:
-        raise InvalidCaptureEvent(
-            "sealed last source ordinal differs from the immutable database"
-        )
+        raise InvalidCaptureEvent("sealed last source ordinal differs from the immutable database")
 
     for event in rows_by_kind["action"]:
         _convert_action_event(event)
@@ -602,9 +601,7 @@ def _validate_database_contract(
     if is_v2:
         window_events = capture.window_capture_events_v2()
         windows_by_ordinal = {event.source_ordinal: event for event in window_events}
-        screenshots_by_ordinal = {
-            row.source_ordinal: row for row in rows_by_kind["screen"]
-        }
+        screenshots_by_ordinal = {row.source_ordinal: row for row in rows_by_kind["screen"]}
         if set(windows_by_ordinal) != set(screenshots_by_ordinal):
             raise InvalidCaptureEvent("sealed v2 frame/window pairs are not a bijection")
         allowed_pair_ordinals = set(windows_by_ordinal)
@@ -622,6 +619,11 @@ def _validate_database_contract(
             if screenshot.png_data:
                 from PIL import Image
 
+                retained_sha256 = hashlib.sha256(screenshot.png_data).hexdigest()
+                if screenshot.png_sha256 != retained_sha256:
+                    raise InvalidCaptureEvent(
+                        "sealed v2 frame PNG digest differs from its retained bytes"
+                    )
                 try:
                     with Image.open(io.BytesIO(screenshot.png_data)) as retained:
                         retained.load()
@@ -632,6 +634,10 @@ def _validate_database_contract(
                     raise InvalidCaptureEvent(
                         "sealed v2 frame dimensions differ from its geometry viewport"
                     )
+            elif screenshot.png_sha256 is not None:
+                raise InvalidCaptureEvent(
+                    "sealed v2 frame has a PNG digest without retained PNG bytes"
+                )
             current_identity = (
                 state.window_id,
                 state.pid,
@@ -657,16 +663,20 @@ def _validate_database_contract(
         for action in rows_by_kind["action"]:
             if (
                 action.window_geometry_generation is None
-                or action.screenshot_source_ordinal
-                != action.window_event_source_ordinal
+                or action.screenshot_source_ordinal != action.window_event_source_ordinal
             ):
                 raise InvalidCaptureEvent("sealed v2 action has an incomplete frame binding")
             bound = windows_by_ordinal.get(action.window_event_source_ordinal)
             if bound is None or (
-                bound.window_capture_v2.geometry_generation
-                != action.window_geometry_generation
+                bound.window_capture_v2.geometry_generation != action.window_geometry_generation
             ):
                 raise InvalidCaptureEvent("sealed v2 action names the wrong geometry epoch")
+            if not any(
+                frame_ordinal > action.source_ordinal for frame_ordinal in allowed_pair_ordinals
+            ):
+                raise InvalidCaptureEvent(
+                    "sealed v2 action has no ordinal-later retained after frame"
+                )
 
     owners: dict[int, set[str]] = {}
     for kind, ordinals in ordinals_by_kind.items():
@@ -677,6 +687,8 @@ def _validate_database_contract(
             ordinal in allowed_pair_ordinals and kinds == {"screen", "window"}
         ):
             raise InvalidCaptureEvent("sealed journal reuses a source ordinal across events")
+    if is_v2 and sorted(owners) != list(range(1, (last_source_ordinal or 0) + 1)):
+        raise InvalidCaptureEvent("sealed v2 source journal has a missing ordinal")
 
     expected_video_count = event_counts.get("video")
     if not isinstance(expected_video_count, int) or expected_video_count < 0:
@@ -692,6 +704,27 @@ def _validate_database_contract(
             raise InvalidCaptureEvent("sealed MP4 has no source-ordinal frame bindings")
         if len(timing[3]) != expected_video_count:
             raise InvalidCaptureEvent("sealed video count differs from its MP4 bindings")
+        if is_v2:
+            video_source_ordinals = [source_ordinal for _, source_ordinal in timing[3]]
+            expected_source_ordinals = sorted(ordinals_by_kind["screen"])
+            if video_source_ordinals != expected_source_ordinals:
+                raise InvalidCaptureEvent(
+                    "sealed v2 MP4 source bindings differ from retained frame ordinals"
+                )
+            capture_bindings = timing[2]
+            if capture_bindings is None:
+                raise InvalidCaptureEvent("sealed v2 MP4 has no exact capture-time frame bindings")
+            capture_by_index = dict(capture_bindings)
+            screenshots_by_ordinal = {
+                int(row.source_ordinal): row for row in rows_by_kind["screen"]
+            }
+            for encoded_index, source_ordinal in timing[3]:
+                screenshot = screenshots_by_ordinal[source_ordinal]
+                if capture_by_index.get(encoded_index) != screenshot.timestamp:
+                    raise InvalidCaptureEvent(
+                        "sealed v2 MP4 source and capture-time bindings differ "
+                        "from the retained frame"
+                    )
     elif capture.video_path is not None:
         raise InvalidCaptureEvent("sealed capture inventories an MP4 but claims no video frames")
 
@@ -865,13 +898,16 @@ class CaptureSession:
 
     @property
     def video_path(self) -> Path | None:
-        """Path to video file if exists."""
-        # Legacy format: oa_recording-{timestamp}.mp4
-        for p in self.capture_dir.glob("oa_recording-*.mp4"):
-            return p
-        # Fallback: video.mp4
-        video_path = self.capture_dir / "video.mp4"
-        return video_path if video_path.exists() else None
+        """Return the only recognized video file, or refuse ambiguity."""
+        candidates = sorted(self.capture_dir.glob("oa_recording-*.mp4"))
+        fallback = self.capture_dir / "video.mp4"
+        if fallback.exists():
+            candidates.append(fallback)
+        if len(candidates) > 1:
+            raise InvalidCaptureEvent(
+                "capture has multiple recognized MP4 artifacts; exact frame bindings are ambiguous"
+            )
+        return candidates[0] if candidates else None
 
     @property
     def audio_path(self) -> Path | None:
@@ -1163,11 +1199,7 @@ class CaptureSession:
                 return Image.open(io.BytesIO(screenshot.png_data)).convert("RGB")
         raise LookupError(
             f"no frame was retained at exactly {capture_timestamp!r}"
-            + (
-                f" with source ordinal {source_ordinal} "
-                if source_ordinal is not None
-                else " "
-            )
+            + (f" with source ordinal {source_ordinal} " if source_ordinal is not None else " ")
             + "(fail-closed; refusing a nearest-frame substitute)"
         )
 

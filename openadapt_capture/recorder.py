@@ -198,6 +198,12 @@ class OrderedEventJournal:
             entry = self._reserve_locked(timestamp)
         return EventReservation(self, entry)
 
+    @property
+    def last_source_ordinal(self) -> int | None:
+        """Return the last ordinal reserved by any source observer."""
+        with self._condition:
+            return self._next_sequence - 1 or None
+
     def _reserve_locked(self, timestamp: float) -> _JournalEntry:
         entry = _JournalEntry(timestamp, self._next_sequence)
         self._next_sequence += 1
@@ -1176,9 +1182,7 @@ def trigger_action_event(
         )
     else:
         reservation = (
-            event_q.reserve(event_timestamp)
-            if isinstance(event_q, OrderedEventJournal)
-            else None
+            event_q.reserve(event_timestamp) if isinstance(event_q, OrderedEventJournal) else None
         )
     try:
         if isinstance(coordinate_scope, WindowCaptureScope):
@@ -1429,33 +1433,37 @@ def read_screen_events(
         nonlocal started
         t_start = time.perf_counter()
         if window_scope is not None:
-            with window_scope.observation_boundary():
-                # Any failed capture terminates the session. Retrying would omit a
-                # frame while input continues and could produce complete-looking
-                # evidence with a missing interval.
-                screenshot, _window_changed = window_scope.capture_frame(publish=False)
-                t_screenshot = time.perf_counter()
-                if screenshot is None:
-                    raise WindowCaptureError("the captured screenshot was empty")
-                if not started:
-                    started_event.set()
-                    started = True
-                frame_timestamp = utils.get_timestamp()
-                if not isinstance(event_q, OrderedEventJournal):
-                    raise WindowCaptureError(
-                        "window-scoped capture requires the ordered event journal"
-                    )
-                generation = window_scope.current_generation()
-                scoped_frame = WindowScopedFrame(
-                    image=screenshot,
-                    window_event_data=window_scope.window_event_data(),
-                    geometry_generation=generation,
-                )
-                event_q.commit_window_frame(
-                    Event(frame_timestamp, "screen", scoped_frame),
-                    window_scope,
-                    generation,
-                )
+            # Do not hold the observation boundary during pixel acquisition.
+            # An OS input callback that arrives while the grab is in flight must
+            # reserve and bind the previously published frame before this new
+            # frame enters the journal. The frame can contain pixels rendered
+            # after that input, so publishing it first would make a post-action
+            # image look like the action's before evidence.
+            #
+            # Any failed capture terminates the session. Retrying would omit a
+            # frame while input continues and could produce complete-looking
+            # evidence with a missing interval.
+            screenshot, _window_changed = window_scope.capture_frame(publish=False)
+            t_screenshot = time.perf_counter()
+            if screenshot is None:
+                raise WindowCaptureError("the captured screenshot was empty")
+            if not started:
+                started_event.set()
+                started = True
+            frame_timestamp = utils.get_timestamp()
+            if not isinstance(event_q, OrderedEventJournal):
+                raise WindowCaptureError("window-scoped capture requires the ordered event journal")
+            generation = window_scope.current_generation()
+            scoped_frame = WindowScopedFrame(
+                image=screenshot,
+                window_event_data=window_scope.window_event_data(),
+                geometry_generation=generation,
+            )
+            event_q.commit_window_frame(
+                Event(frame_timestamp, "screen", scoped_frame),
+                window_scope,
+                generation,
+            )
             return t_start, t_screenshot
         if desktop_scope is not None:
             # A monitor can move or change scale while the combined frame keeps
@@ -2016,7 +2024,7 @@ def record(
     window_owner: str | None = None,
     window_title: str | None = None,
     structural_observer: StructuralObserver | None = None,
-) -> None:
+) -> int | None:
     """Record native screenshots, action events, and window events.
 
     Args:
@@ -2578,6 +2586,7 @@ def record(
     # TODO: consolidate terminate_recording and status_pipe
     if status_pipe:
         status_pipe.send({"type": "record.stopped"})
+    return event_q.last_source_ordinal if window_scope is not None else None
 
 
 class Recorder:
@@ -2696,6 +2705,7 @@ class Recorder:
         self._record_thread: threading.Thread | None = None
         self._status_thread: threading.Thread | None = None
         self._capture = None  # lazy CaptureSession
+        self._last_source_ordinal: int | None = None
         self._worker_error: BaseException | None = None
         self._worker_error_lock = threading.Lock()
         self._structural_observer = structural_observer
@@ -2866,12 +2876,8 @@ class Recorder:
                 + list(capture._recording.window_events)
                 + list(capture._recording.browser_events)
             )
-            last_source_ordinal = max(
-                (
-                    row.source_ordinal
-                    for row in database_rows
-                    if row.source_ordinal is not None
-                ),
+            last_source_ordinal = self._last_source_ordinal or max(
+                (row.source_ordinal for row in database_rows if row.source_ordinal is not None),
                 default=None,
             )
             try:
@@ -2900,7 +2906,7 @@ class Recorder:
         db_path = Path(self.capture_dir) / "recording.db"
         database = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
-            last_source_ordinal = max(
+            last_source_ordinal = self._last_source_ordinal or max(
                 (database.execute(f"SELECT MAX(source_ordinal) FROM {table}").fetchone()[0] or 0)
                 for table in (
                     "action_event",
@@ -3004,7 +3010,7 @@ class Recorder:
 
         try:
             with config_override(self._recording_config):
-                record(
+                last_source_ordinal = record(
                     task_description=self.task_description,
                     capture_dir=self.capture_dir,
                     terminate_processing=self._terminate_processing,
@@ -3018,6 +3024,8 @@ class Recorder:
                     send_profile=self._send_profile,
                     structural_observer=self._structural_observer,
                 )
+            if last_source_ordinal is not None:
+                self._last_source_ordinal = last_source_ordinal
             self.check_health()
             if self._ready_event.is_set():
                 self._verify_completed_capture()
