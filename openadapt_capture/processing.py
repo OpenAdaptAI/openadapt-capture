@@ -90,21 +90,6 @@ def _first_structural_observation(
     return None
 
 
-def _bound_screenshot_timestamp(events: list[ActionEvent]) -> float | None:
-    """Keep the frame bound where the merged action completed.
-
-    The recorder binds an action to the screen frame retained when the action
-    was emitted (a click at button-up, a typed run at its last key), so the
-    merged event carries the LAST child's binding, not the first's.
-    """
-
-    bound: float | None = None
-    for event in events:
-        if event.screenshot_timestamp is not None:
-            bound = event.screenshot_timestamp
-    return bound
-
-
 def _merged_frame_binding(events: list[ActionEvent]) -> dict[str, float | int | None]:
     """Return the terminal child binding and reject a mixed native epoch."""
     if not events:

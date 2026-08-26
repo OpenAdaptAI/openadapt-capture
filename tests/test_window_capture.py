@@ -156,6 +156,98 @@ def test_action_reservation_cannot_bind_a_later_frame_generation(scope, fake, mo
     assert frame.data.geometry_generation == 2
 
 
+def test_input_observation_waits_for_an_in_flight_window_frame(fake):
+    capture_entered = threading.Event()
+    release_capture = threading.Event()
+    terminate = threading.Event()
+    block_capture = threading.Event()
+
+    def capturer(window):
+        if block_capture.is_set():
+            capture_entered.set()
+            assert release_capture.wait(timeout=5)
+            terminate.set()
+        return fake.capturer(window)
+
+    scope = WindowCaptureScope(
+        WindowTarget(owner="FakeApp"),
+        resolver=fake.resolver,
+        capturer=capturer,
+    )
+    scope.bind_display_topology(
+        {
+            "schema_version": "openadapt.capture.display-topology/v1",
+            "topology_sha256": "a" * 64,
+        },
+        lambda **_kwargs: None,
+    )
+    journal = OrderedEventJournal()
+    image, _ = scope.capture_frame(publish=False)
+    generation = scope.current_generation()
+    journal.commit_window_frame(
+        Event(
+            time.time(),
+            "screen",
+            WindowScopedFrame(
+                image=image,
+                window_event_data=scope.window_event_data(),
+                geometry_generation=generation,
+            ),
+        ),
+        scope,
+        generation,
+    )
+
+    block_capture.set()
+    screen_reader = threading.Thread(
+        target=read_screen_events,
+        args=(
+            journal,
+            terminate,
+            SimpleNamespace(timestamp=time.time()),
+            threading.Event(),
+        ),
+        kwargs={"window_scope": scope},
+    )
+    screen_reader.start()
+    assert capture_entered.wait(timeout=5)
+
+    action_finished = threading.Event()
+
+    def reserve_action():
+        action_timestamp = time.time()
+        reservation, binding = journal.reserve_window_action(
+            action_timestamp,
+            scope,
+            310.0,
+            170.0,
+        )
+        reservation.complete(
+            Event(
+                action_timestamp,
+                "action",
+                {"window_geometry_generation": binding[2]},
+            )
+        )
+        action_finished.set()
+
+    action_reader = threading.Thread(target=reserve_action)
+    action_reader.start()
+    assert not action_finished.wait(timeout=0.1)
+
+    release_capture.set()
+    screen_reader.join(timeout=5)
+    action_reader.join(timeout=5)
+
+    assert not screen_reader.is_alive()
+    assert not action_reader.is_alive()
+    assert [journal.get_nowait().type for _ in range(3)] == [
+        "screen",
+        "screen",
+        "action",
+    ]
+
+
 def test_window_capture_state_rejects_scales_not_derived_from_content(scope):
     scope.capture_frame()
     state = scope.window_event_data()["state"]

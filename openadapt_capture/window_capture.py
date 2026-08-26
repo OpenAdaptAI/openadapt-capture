@@ -38,8 +38,9 @@ import json
 import math
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 from loguru import logger
 
@@ -212,6 +213,7 @@ class WindowCaptureScope:
         self._resolver = resolver or resolve_window
         self._capturer = capturer or capture_window
         self._lock = threading.Lock()
+        self._observation_lock = threading.RLock()
         self._window: TargetWindow | None = None
         self._scale: float | None = None
         self._scale_x: float | None = None
@@ -235,6 +237,12 @@ class WindowCaptureScope:
         # resolve() (e.g. a pre-flight existence check) never suppresses the
         # first frame's timeline entry.
         self._frame_window: TargetWindow | None = None
+
+    @contextmanager
+    def observation_boundary(self) -> Iterator[None]:
+        """Serialize a frame acquisition with native input observation."""
+        with self._observation_lock:
+            yield
 
     def bind_display_topology(
         self,

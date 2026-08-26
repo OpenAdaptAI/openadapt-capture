@@ -216,22 +216,23 @@ class OrderedEventJournal:
         timestamp = float(timestamp)
         if not math.isfinite(timestamp):
             raise EventJournalOrderingError("event timestamps must be finite")
-        with self._condition:
-            entry = self._reserve_locked(timestamp)
-            reservation = EventReservation(self, entry)
-            try:
-                if x is not None and y is not None:
-                    binding: tuple[float, float, int] | int = (
-                        window_scope.translate_with_generation(x, y)
-                    )
-                else:
-                    binding = window_scope.generation_for_action()
-            except BaseException as exc:
-                entry.error = exc
-                entry.ready = True
-                reservation._finished = True
-                self._condition.notify_all()
-                raise
+        with window_scope.observation_boundary():
+            with self._condition:
+                entry = self._reserve_locked(timestamp)
+                reservation = EventReservation(self, entry)
+                try:
+                    if x is not None and y is not None:
+                        binding: tuple[float, float, int] | int = (
+                            window_scope.translate_with_generation(x, y)
+                        )
+                    else:
+                        binding = window_scope.generation_for_action()
+                except BaseException as exc:
+                    entry.error = exc
+                    entry.ready = True
+                    reservation._finished = True
+                    self._condition.notify_all()
+                    raise
         return reservation, binding
 
     def put(self, event: Event, block: bool = True, timeout: float | None = None) -> None:
@@ -250,19 +251,20 @@ class OrderedEventJournal:
         if not math.isfinite(timestamp):
             raise EventJournalOrderingError("event timestamps must be finite")
         failure: BaseException | None = None
-        with self._condition:
-            entry = _JournalEntry(timestamp, self._next_sequence)
-            self._next_sequence += 1
-            self._entries.append(entry)
-            try:
-                window_scope.publish_frame(generation)
-            except BaseException as exc:
-                entry.error = exc
-                failure = exc
-            else:
-                entry.event = event._replace(source_ordinal=entry.sequence)
-            entry.ready = True
-            self._condition.notify_all()
+        with window_scope.observation_boundary():
+            with self._condition:
+                entry = _JournalEntry(timestamp, self._next_sequence)
+                self._next_sequence += 1
+                self._entries.append(entry)
+                try:
+                    window_scope.publish_frame(generation)
+                except BaseException as exc:
+                    entry.error = exc
+                    failure = exc
+                else:
+                    entry.event = event._replace(source_ordinal=entry.sequence)
+                entry.ready = True
+                self._condition.notify_all()
         if failure is not None:
             raise failure
 
@@ -1427,11 +1429,35 @@ def read_screen_events(
         nonlocal started
         t_start = time.perf_counter()
         if window_scope is not None:
-            # Any failed capture terminates the session. Retrying would omit a
-            # frame while input continues and could produce complete-looking
-            # evidence with a missing interval.
-            screenshot, _window_changed = window_scope.capture_frame(publish=False)
-        elif desktop_scope is not None:
+            with window_scope.observation_boundary():
+                # Any failed capture terminates the session. Retrying would omit a
+                # frame while input continues and could produce complete-looking
+                # evidence with a missing interval.
+                screenshot, _window_changed = window_scope.capture_frame(publish=False)
+                t_screenshot = time.perf_counter()
+                if screenshot is None:
+                    raise WindowCaptureError("the captured screenshot was empty")
+                if not started:
+                    started_event.set()
+                    started = True
+                frame_timestamp = utils.get_timestamp()
+                if not isinstance(event_q, OrderedEventJournal):
+                    raise WindowCaptureError(
+                        "window-scoped capture requires the ordered event journal"
+                    )
+                generation = window_scope.current_generation()
+                scoped_frame = WindowScopedFrame(
+                    image=screenshot,
+                    window_event_data=window_scope.window_event_data(),
+                    geometry_generation=generation,
+                )
+                event_q.commit_window_frame(
+                    Event(frame_timestamp, "screen", scoped_frame),
+                    window_scope,
+                    generation,
+                )
+            return t_start, t_screenshot
+        if desktop_scope is not None:
             # A monitor can move or change scale while the combined frame keeps
             # the same dimensions. Check both sides of the grab so neither the
             # frame nor later input uses stale origin or monitor geometry.
@@ -1447,22 +1473,7 @@ def read_screen_events(
             started_event.set()
             started = True
         frame_timestamp = utils.get_timestamp()
-        if window_scope is not None:
-            if not isinstance(event_q, OrderedEventJournal):
-                raise WindowCaptureError("window-scoped capture requires the ordered event journal")
-            generation = window_scope.current_generation()
-            scoped_frame = WindowScopedFrame(
-                image=screenshot,
-                window_event_data=window_scope.window_event_data(),
-                geometry_generation=generation,
-            )
-            event_q.commit_window_frame(
-                Event(frame_timestamp, "screen", scoped_frame),
-                window_scope,
-                generation,
-            )
-        else:
-            event_q.put(Event(frame_timestamp, "screen", screenshot))
+        event_q.put(Event(frame_timestamp, "screen", screenshot))
         return t_start, t_screenshot
 
     while not terminate_processing.is_set():
