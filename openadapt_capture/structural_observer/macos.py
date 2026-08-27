@@ -51,6 +51,7 @@ class _AXRuntime:
     """Small PyObjC adapter for the native AX API."""
 
     def __init__(self) -> None:
+        import AppKit
         import ApplicationServices as ax
 
         if not bool(ax.AXIsProcessTrusted()):
@@ -59,6 +60,11 @@ class _AXRuntime:
             )
         self.ax = ax
         self.system = ax.AXUIElementCreateSystemWide()
+        self.frontmost_process_id = lambda: int(
+            AppKit.NSWorkspace.sharedWorkspace()
+            .frontmostApplication()
+            .processIdentifier()
+        )
 
     def attribute(self, element: Any, name: str) -> Any:
         error, value = self.ax.AXUIElementCopyAttributeValue(element, name, None)
@@ -75,7 +81,17 @@ class _AXRuntime:
         return element
 
     def focused_element(self) -> Any:
-        return self.attribute(self.system, "AXFocusedUIElement")
+        element = self.attribute(self.system, "AXFocusedUIElement")
+        if element is not None:
+            return element
+        try:
+            process_id = self.frontmost_process_id()
+        except Exception:
+            return None
+        if process_id <= 0:
+            return None
+        application = self.ax.AXUIElementCreateApplication(process_id)
+        return self.attribute(application, "AXFocusedUIElement")
 
     def actions(self, element: Any) -> list[Any] | None:
         error, values = self.ax.AXUIElementCopyActionNames(element, None)

@@ -32,7 +32,10 @@ from openadapt_capture.structural_observer.linux import (
 from openadapt_capture.structural_observer.linux import (
     _fields as _atspi_fields,
 )
-from openadapt_capture.structural_observer.macos import MacOSAXStructuralObserver
+from openadapt_capture.structural_observer.macos import (
+    MacOSAXStructuralObserver,
+    _AXRuntime,
+)
 from openadapt_capture.structural_observer.windows import (
     WindowsUIAStructuralObserver,
     _PywinautoRuntime,
@@ -342,6 +345,33 @@ def test_macos_ax_observer_returns_action_time_evidence() -> None:
     assert [item.role for item in observed.ancestry or []] == [
         "AXGroup",
         "AXWindow",
+    ]
+
+
+def test_macos_ax_runtime_falls_back_to_the_frontmost_application() -> None:
+    system = object()
+    application = object()
+    focused = object()
+    calls: list[tuple[object, str]] = []
+
+    runtime = _AXRuntime.__new__(_AXRuntime)
+    runtime.system = system
+    runtime.frontmost_process_id = lambda: 42
+    runtime.ax = SimpleNamespace(
+        kAXErrorSuccess=0,
+        AXUIElementCreateApplication=lambda process_id: (
+            application if process_id == 42 else None
+        ),
+        AXUIElementCopyAttributeValue=lambda element, name, _output: (
+            calls.append((element, name))
+            or (0, focused if element is application else None)
+        ),
+    )
+
+    assert runtime.focused_element() is focused
+    assert calls == [
+        (system, "AXFocusedUIElement"),
+        (application, "AXFocusedUIElement"),
     ]
 
 
