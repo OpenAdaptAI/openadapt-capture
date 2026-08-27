@@ -12,10 +12,41 @@ from pathlib import Path, PurePath
 from typing import Any
 
 INVENTORY_SCHEMA_VERSION = "openadapt.production-release-artifact-inventory/v1"
+TAG_BINDING_SCHEMA_VERSION = "openadapt.production-release-tag-binding/v1"
 TARGET = "capture"
 CLAIM_SCOPE = "production_capture"
 ARTIFACT_FIELDS = frozenset({"name", "kind", "sha256", "size_bytes", "media_type"})
 INVENTORY_FIELDS = frozenset({"schema_version", "target", "claim_scope", "artifacts"})
+REFERENCE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "repository",
+        "repository_id",
+        "repository_owner_id",
+        "registry_source_commit",
+        "registry_revision",
+        "registry_head_sha256",
+        "registry_entry_sha256",
+        "kind",
+        "object_schema_version",
+        "object_path",
+        "object_sha256",
+        "size_bytes",
+        "object_media_type",
+        "semantic_identity_sha256",
+        "subject_sha256",
+    }
+)
+TAG_BINDING_FIELDS = frozenset(
+    {
+        "schema_version",
+        "admission_reference",
+        "admission_reference_sha256",
+        "artifact_inventory_sha256",
+    }
+)
+REFERENCE_DIGEST_DOMAIN = b"OpenAdapt production release tag admission reference v1\0"
+INVENTORY_DIGEST_DOMAIN = b"OpenAdapt production release artifact inventory v1\0"
 SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 
 
@@ -99,17 +130,21 @@ def build_inventory(dist: Path) -> dict[str, Any]:
     }
 
 
-def _load_inventory(path: Path) -> dict[str, Any]:
+def _load_canonical_object(path: Path, *, label: str) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
         value = json.loads(raw)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise CandidateInventoryError(f"release inventory is unreadable: {exc}") from exc
+        raise CandidateInventoryError(f"{label} is unreadable: {exc}") from exc
     if not isinstance(value, dict):
-        raise CandidateInventoryError("release inventory must be a JSON object")
+        raise CandidateInventoryError(f"{label} must be a JSON object")
     if raw != _canonical_json_bytes(value) + b"\n":
-        raise CandidateInventoryError("release inventory is not canonical JSON")
+        raise CandidateInventoryError(f"{label} is not canonical JSON")
     return value
+
+
+def _load_inventory(path: Path) -> dict[str, Any]:
+    return _load_canonical_object(path, label="release inventory")
 
 
 def verify_inventory(dist: Path, inventory_path: Path) -> dict[str, Any]:
@@ -141,6 +176,62 @@ def verify_inventory(dist: Path, inventory_path: Path) -> dict[str, Any]:
     return inventory
 
 
+def _prefixed_digest(domain: bytes, value: object) -> str:
+    return f"sha256:{hashlib.sha256(domain + _canonical_json_bytes(value)).hexdigest()}"
+
+
+def build_tag_binding(
+    admission_reference_path: Path,
+    inventory_path: Path,
+) -> dict[str, Any]:
+    """Bind the parsed admission reference and exact inventory into a tag message."""
+    reference = _load_canonical_object(
+        admission_reference_path,
+        label="admission reference",
+    )
+    if set(reference) != REFERENCE_FIELDS:
+        raise CandidateInventoryError("admission reference has an unexpected field set")
+    inventory = _load_inventory(inventory_path)
+    if set(inventory) != INVENTORY_FIELDS:
+        raise CandidateInventoryError("release inventory has an unexpected field set")
+    if inventory.get("schema_version") != INVENTORY_SCHEMA_VERSION:
+        raise CandidateInventoryError("release inventory schema is not supported")
+    if inventory.get("target") != TARGET or inventory.get("claim_scope") != CLAIM_SCOPE:
+        raise CandidateInventoryError("release inventory names a different target or claim scope")
+    inventory_projection = {
+        "target": inventory["target"],
+        "claim_scope": inventory["claim_scope"],
+        "artifacts": inventory["artifacts"],
+    }
+    return {
+        "schema_version": TAG_BINDING_SCHEMA_VERSION,
+        "admission_reference": reference,
+        "admission_reference_sha256": _prefixed_digest(
+            REFERENCE_DIGEST_DOMAIN,
+            reference,
+        ),
+        "artifact_inventory_sha256": _prefixed_digest(
+            INVENTORY_DIGEST_DOMAIN,
+            inventory_projection,
+        ),
+    }
+
+
+def verify_tag_binding(
+    tag_message_path: Path,
+    admission_reference_path: Path,
+    inventory_path: Path,
+) -> dict[str, Any]:
+    """Require the exact canonical tag message for the reference and inventory."""
+    actual = _load_canonical_object(tag_message_path, label="release tag binding")
+    if set(actual) != TAG_BINDING_FIELDS:
+        raise CandidateInventoryError("release tag binding has an unexpected field set")
+    expected = build_tag_binding(admission_reference_path, inventory_path)
+    if actual != expected:
+        raise CandidateInventoryError("release tag binding differs from the expected binding")
+    return actual
+
+
 def _write_inventory(path: Path, inventory: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(_canonical_json_bytes(inventory) + b"\n")
@@ -156,6 +247,14 @@ def main() -> int:
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--dist", type=Path, required=True)
     verify_parser.add_argument("--inventory", type=Path, required=True)
+    binding_parser = subparsers.add_parser("tag-binding")
+    binding_parser.add_argument("--admission-reference", type=Path, required=True)
+    binding_parser.add_argument("--inventory", type=Path, required=True)
+    binding_parser.add_argument("--output", type=Path, required=True)
+    verify_binding_parser = subparsers.add_parser("verify-tag-binding")
+    verify_binding_parser.add_argument("--tag-message", type=Path, required=True)
+    verify_binding_parser.add_argument("--admission-reference", type=Path, required=True)
+    verify_binding_parser.add_argument("--inventory", type=Path, required=True)
     args = parser.parse_args()
 
     try:
@@ -170,9 +269,20 @@ def main() -> int:
                         + "\n"
                     )
             print(_canonical_json_bytes(inventory).decode("utf-8"))
-        else:
+        elif args.command == "verify":
             verify_inventory(args.dist, args.inventory)
             print(f"verified release candidate against {args.inventory}")
+        elif args.command == "tag-binding":
+            binding = build_tag_binding(args.admission_reference, args.inventory)
+            _write_inventory(args.output, binding)
+            print(_canonical_json_bytes(binding).decode("utf-8"))
+        else:
+            verify_tag_binding(
+                args.tag_message,
+                args.admission_reference,
+                args.inventory,
+            )
+            print(f"verified release tag binding in {args.tag_message}")
     except CandidateInventoryError as exc:
         parser.error(str(exc))
     return 0
