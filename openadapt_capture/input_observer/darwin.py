@@ -11,6 +11,7 @@ from .base import (
     InputObserverError,
     InputObserverPermissionError,
     InputObserverUnavailableError,
+    NativeReceiptHint,
     ObservedKey,
     ObservedMouseButton,
     ObservedMouseMove,
@@ -397,7 +398,25 @@ class DarwinInputObserver(ThreadedInputObserver):
             self._mark_native_activity()
             receipt = None
         elif observed_type:
-            receipt = self._reserve_receipt(observed_at)
+            if bool(
+                getattr(
+                    self.callback,
+                    "_openadapt_input_receipt_accepts_hint",
+                    False,
+                )
+            ):
+                receipt_monotonic_ns = time.monotonic_ns()
+                receipt = self._reserve_receipt(
+                    observed_at,
+                    self._receipt_hint(
+                        event_type,
+                        event,
+                        receipt_timestamp=float(observed_at),
+                        receipt_monotonic_ns=receipt_monotonic_ns,
+                    ),
+                )
+            else:
+                receipt = self._reserve_receipt(observed_at)
         else:
             receipt = None
 
@@ -480,6 +499,80 @@ class DarwinInputObserver(ThreadedInputObserver):
                 ),
                 receipt=receipt,
             )
+
+    def _receipt_hint(
+        self,
+        event_type: int,
+        event: Any,
+        *,
+        receipt_timestamp: float,
+        receipt_monotonic_ns: int,
+    ) -> NativeReceiptHint:
+        """Freeze value-free action identity before Quartz can deliver it."""
+        quartz = self._quartz
+        if event_type in self._mouse_move_event_types():
+            x, y = self._location(event)
+            return NativeReceiptHint(
+                action_kind="mouse_move",
+                action_name="move",
+                x=x,
+                y=y,
+                observer_phase="pre_action",
+                receipt_timestamp=receipt_timestamp,
+                receipt_monotonic_ns=receipt_monotonic_ns,
+            )
+        button_transitions = {
+            quartz.kCGEventLeftMouseDown: True,
+            quartz.kCGEventLeftMouseUp: False,
+            quartz.kCGEventRightMouseDown: True,
+            quartz.kCGEventRightMouseUp: False,
+            quartz.kCGEventOtherMouseDown: True,
+            quartz.kCGEventOtherMouseUp: False,
+        }
+        if event_type in button_transitions:
+            x, y = self._location(event)
+            return NativeReceiptHint(
+                action_kind="mouse_button",
+                action_name="click",
+                pressed=button_transitions[event_type],
+                x=x,
+                y=y,
+                observer_phase="pre_action",
+                receipt_timestamp=receipt_timestamp,
+                receipt_monotonic_ns=receipt_monotonic_ns,
+            )
+        if event_type == quartz.kCGEventScrollWheel:
+            x, y = self._location(event)
+            return NativeReceiptHint(
+                action_kind="mouse_scroll",
+                action_name="scroll",
+                x=x,
+                y=y,
+                observer_phase="pre_action",
+                receipt_timestamp=receipt_timestamp,
+                receipt_monotonic_ns=receipt_monotonic_ns,
+            )
+        if event_type in (quartz.kCGEventKeyDown, quartz.kCGEventKeyUp):
+            pressed = event_type == quartz.kCGEventKeyDown
+            return NativeReceiptHint(
+                action_kind="key",
+                action_name="press" if pressed else "release",
+                pressed=pressed,
+                observer_phase="pre_action",
+                receipt_timestamp=receipt_timestamp,
+                receipt_monotonic_ns=receipt_monotonic_ns,
+            )
+        if event_type == quartz.kCGEventFlagsChanged:
+            pressed = self._modifier_pressed(event, self._keycode(event))
+            return NativeReceiptHint(
+                action_kind="key",
+                action_name="press" if pressed else "release",
+                pressed=pressed,
+                observer_phase="pre_action",
+                receipt_timestamp=receipt_timestamp,
+                receipt_monotonic_ns=receipt_monotonic_ns,
+            )
+        raise InputObserverError("macOS could not classify an observed receipt")
 
     def _modifier_pressed(self, event: Any, keycode: int) -> bool:
         quartz = self._quartz

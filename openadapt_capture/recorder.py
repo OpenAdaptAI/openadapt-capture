@@ -53,6 +53,7 @@ from openadapt_capture.extensions import synchronized_queue as sq
 from openadapt_capture.input_observer import (
     InputObserver,
     InputObserverError,
+    NativeReceiptHint,
     ObservedInput,
     ObservedKey,
     ObservedMouseButton,
@@ -62,6 +63,9 @@ from openadapt_capture.input_observer import (
     create_input_observer,
 )
 from openadapt_capture.structural import (
+    BoundedStructuralObserver,
+    StructuralCaptureWindowBinding,
+    StructuralObservation,
     StructuralObservationRequest,
     StructuralObserver,
     create_structural_observer,
@@ -239,6 +243,8 @@ class EventReservation:
         self._journal = journal
         self._entry = entry
         self._finished = False
+        self._structural_receipt_prepared = False
+        self._structural_observation: StructuralObservation | None = None
 
     @property
     def source_ordinal(self) -> int:
@@ -248,6 +254,26 @@ class EventReservation:
     def finished(self) -> bool:
         """Return whether this producer has completed or failed its position."""
         return self._finished
+
+    @property
+    def structural_receipt_prepared(self) -> bool:
+        """Return whether optional structure was decided at native receipt."""
+        return self._structural_receipt_prepared
+
+    @property
+    def structural_observation(self) -> StructuralObservation | None:
+        """Return the immutable receipt-time provider result, when available."""
+        return self._structural_observation
+
+    def set_structural_observation(
+        self,
+        observation: StructuralObservation | None,
+    ) -> None:
+        """Store the optional result before the native callback returns."""
+        if self._structural_receipt_prepared:
+            raise RuntimeError("structural receipt evidence was already prepared")
+        self._structural_observation = observation
+        self._structural_receipt_prepared = True
 
     def complete(self, event: Event) -> None:
         if self._finished:
@@ -296,6 +322,28 @@ class WindowActionReservation:
     @property
     def finished(self) -> bool:
         return self._reservation.finished
+
+    @property
+    def structural_receipt_prepared(self) -> bool:
+        return self._reservation.structural_receipt_prepared
+
+    @property
+    def structural_observation(self) -> StructuralObservation | None:
+        return self._reservation.structural_observation
+
+    def set_structural_observation(
+        self,
+        observation: StructuralObservation | None,
+    ) -> None:
+        self._reservation.set_structural_observation(observation)
+
+    def structural_capture_window(self) -> StructuralCaptureWindowBinding:
+        """Return the exact capture identity frozen with this reservation."""
+        return StructuralCaptureWindowBinding.model_validate(
+            self._window_scope.structural_binding_for_reserved_geometry(
+                self._geometry,
+            )
+        )
 
     def bind(
         self,
@@ -1465,15 +1513,54 @@ def trigger_action_event(
                 element_state = {}
             event_data["element_state"] = element_state
 
-        observation = observe_structural_action(
-            structural_observer,
-            StructuralObservationRequest(
-                event_timestamp=event_timestamp,
-                action_name=str(event_data.get("name") or "unknown"),
-                x=x,
-                y=y,
-            ),
+        observation = _structural_observation_for_delivery(
+            reservation,
+            event_timestamp=event_timestamp,
+            event_data=event_data,
+            raw_x=x,
+            raw_y=y,
+            coordinate_scope=coordinate_scope,
         )
+        if (
+            reservation is None
+            or not reservation.structural_receipt_prepared
+        ):
+            # Direct callers do not have a native receipt boundary. Preserve
+            # the injectable helper for tests and authoring tools, but the
+            # production input path always decides structure on its receipt.
+            direct_kind = (
+                "mouse_scroll"
+                if event_data.get("name") == "scroll"
+                else "mouse_button"
+                if event_data.get("name") == "click"
+                else "key"
+            )
+            direct_pressed = (
+                event_data.get("mouse_pressed")
+                if direct_kind == "mouse_button"
+                else event_data.get("name") == "press"
+                if direct_kind == "key"
+                else None
+            )
+            observation = observe_structural_action(
+                structural_observer,
+                StructuralObservationRequest(
+                    event_timestamp=event_timestamp,
+                    receipt_monotonic_ns=time.monotonic_ns(),
+                    action_kind=direct_kind,
+                    action_name=str(event_data.get("name") or "unknown"),
+                    action_pressed=direct_pressed,
+                    x=x,
+                    y=y,
+                    observer_phase="post_action_unverified",
+                ),
+            )
+            if (
+                observation is not None
+                and direct_kind == "key"
+                and (event_data.get("canonical_key_name") or "").casefold() == "tab"
+            ):
+                observation = None
         if observation is not None:
             event_data["structural_observation"] = observation.model_dump(
                 mode="json",
@@ -1488,6 +1575,97 @@ def trigger_action_event(
         if reservation is not None:
             reservation.fail(exc)
         raise
+
+
+def _structural_observation_for_delivery(
+    reservation: EventReservation | WindowActionReservation | None,
+    *,
+    event_timestamp: float,
+    event_data: dict[str, Any],
+    raw_x: float | None,
+    raw_y: float | None,
+    coordinate_scope: CoordinateScope | None,
+) -> StructuralObservation | None:
+    """Select only an exact, still-current receipt-time observation."""
+    if reservation is None or not reservation.structural_receipt_prepared:
+        return None
+    observation = reservation.structural_observation
+    if observation is None:
+        return None
+    action_name = str(event_data.get("name") or "unknown")
+    action_kind = (
+        "mouse_scroll"
+        if action_name == "scroll"
+        else "mouse_button"
+        if action_name == "click"
+        else "key"
+    )
+    action_pressed = (
+        bool(event_data.get("mouse_pressed"))
+        if action_kind == "mouse_button"
+        else action_name == "press"
+        if action_kind == "key"
+        else None
+    )
+    if (
+        observation.event_timestamp != event_timestamp
+        or observation.action_kind != action_kind
+        or observation.action_name != action_name
+        or observation.action_pressed is not action_pressed
+        or observation.action_x != raw_x
+        or observation.action_y != raw_y
+    ):
+        logger.warning("Structural observation omitted after action-binding mismatch")
+        return None
+    if (
+        observation.observer_phase == "post_action_unverified"
+        and action_kind == "key"
+        and (event_data.get("canonical_key_name") or "").casefold() == "tab"
+    ):
+        logger.warning("Post-action focus evidence omitted for Tab")
+        return None
+
+    expected_capture_window = None
+    expected_topology = None
+    if isinstance(reservation, WindowActionReservation):
+        expected_capture_window = reservation.structural_capture_window()
+        expected_topology = expected_capture_window.display_topology_sha256
+    elif isinstance(coordinate_scope, DesktopCaptureScope):
+        expected_topology = str(coordinate_scope.snapshot()["topology_sha256"])
+    if (
+        observation.capture_window != expected_capture_window
+        or observation.display_topology_sha256 != expected_topology
+    ):
+        logger.warning("Structural observation omitted after geometry-binding mismatch")
+        return None
+
+    if expected_capture_window is not None:
+        process = observation.process
+        provider_window = observation.window
+        if process is None or process.process_id != expected_capture_window.process_id:
+            logger.warning("Structural observation omitted after process mismatch")
+            return None
+        if observation.action_target_eligible:
+            try:
+                expected_handle = int(expected_capture_window.window_id)
+            except ValueError:
+                logger.warning("Structural observation omitted for a non-numeric window identity")
+                return None
+            if (
+                provider_window is None
+                or provider_window.native_window_handle != expected_handle
+            ):
+                logger.warning("Structural observation omitted after native-window mismatch")
+                return None
+        elif (
+            provider_window is not None
+            and provider_window.native_window_handle is not None
+            and provider_window.native_window_handle
+            != int(expected_capture_window.window_id)
+        ):
+            logger.warning("Structural context omitted after native-window mismatch")
+            return None
+    return observation
 
 
 def on_move(
@@ -2093,6 +2271,11 @@ def read_input_events(
     """Read globally ordered keyboard and mouse events from one native observer."""
     stop_sequences = [sequence for sequence in config.STOP_SEQUENCES if sequence]
     stop_sequence_indices = [0 for _ in stop_sequences]
+    bounded_structural = (
+        BoundedStructuralObserver(structural_observer)
+        if structural_observer is not None
+        else None
+    )
 
     def on_observed(
         event: ObservedInput,
@@ -2169,23 +2352,61 @@ def read_input_events(
                 logger.info("Stop sequence entered! Stopping recording now.")
                 stop_sequence_detected = True
 
-    if structural_observer is not None:
-        start_hook = getattr(structural_observer, "open_current_thread", None)
-        stop_hook = getattr(structural_observer, "close_current_thread", None)
-        if callable(start_hook):
-            setattr(on_observed, "_openadapt_delivery_thread_start", start_hook)
-        if callable(stop_hook):
-            setattr(on_observed, "_openadapt_delivery_thread_stop", stop_hook)
-
     if isinstance(event_q, OrderedEventJournal):
 
-        def reserve_observed(timestamp: float):
+        def reserve_observed(
+            timestamp: float,
+            hint: NativeReceiptHint | None = None,
+        ):
             if isinstance(coordinate_scope, WindowCaptureScope):
-                return event_q.reserve_window_action_receipt(
-                    timestamp,
-                    coordinate_scope,
+                reservation: EventReservation | WindowActionReservation = (
+                    event_q.reserve_window_action_receipt(
+                        timestamp,
+                        coordinate_scope,
+                    )
                 )
-            return event_q.reserve(timestamp)
+            else:
+                reservation = event_q.reserve(timestamp)
+            observation = None
+            if bounded_structural is not None and hint is not None:
+                if hint.receipt_timestamp != timestamp:
+                    raise EventJournalOrderingError(
+                        "native receipt wall time differs from its source reservation"
+                    )
+                is_candidate = (
+                    hint.action_kind in {"key", "mouse_button", "mouse_scroll"}
+                    and hint.action_name in {"press", "click", "scroll"}
+                    and hint.pressed is not False
+                )
+                if is_candidate:
+                    capture_window = (
+                        reservation.structural_capture_window()
+                        if isinstance(reservation, WindowActionReservation)
+                        else None
+                    )
+                    topology_sha256 = (
+                        capture_window.display_topology_sha256
+                        if capture_window is not None
+                        else str(coordinate_scope.snapshot()["topology_sha256"])
+                        if isinstance(coordinate_scope, DesktopCaptureScope)
+                        else None
+                    )
+                    observation = bounded_structural.capture(
+                        StructuralObservationRequest(
+                            event_timestamp=hint.receipt_timestamp,
+                            receipt_monotonic_ns=hint.receipt_monotonic_ns,
+                            action_kind=hint.action_kind,
+                            action_name=hint.action_name,
+                            action_pressed=hint.pressed,
+                            x=hint.x,
+                            y=hint.y,
+                            observer_phase=hint.observer_phase,
+                            capture_window=capture_window,
+                            display_topology_sha256=topology_sha256,
+                        )
+                    )
+            reservation.set_structural_observation(observation)
+            return reservation
 
         def deliver_observed(event: ObservedInput, reservation: object) -> None:
             if not isinstance(
@@ -2198,12 +2419,15 @@ def read_input_events(
             on_observed(event, reservation)
 
         setattr(on_observed, "_openadapt_input_receipt", reserve_observed)
+        setattr(on_observed, "_openadapt_input_receipt_accepts_hint", True)
         setattr(on_observed, "_openadapt_input_delivery", deliver_observed)
 
     observer = None
     started = False
     observer_failed = False
     try:
+        if bounded_structural is not None:
+            bounded_structural.start()
         observer = create_input_observer(
             on_observed,
             observe_keyboard=True,
@@ -2224,52 +2448,56 @@ def read_input_events(
         terminate_processing.set()
         raise
     finally:
-        if started and observer is not None:
-            terminal_error = None
-            terminal_cancelled = (
-                terminal_frame_cancelled is not None
-                and terminal_frame_cancelled.is_set()
-            )
-            if (
-                terminal_frame_finished is not None
-                and not observer_failed
-                and not terminal_cancelled
-            ):
-                terminal_timeout = max(
-                    10.0,
-                    float(getattr(observer, "shutdown_timeout", 5.0)) * 2,
+        try:
+            if started and observer is not None:
+                terminal_error = None
+                terminal_cancelled = (
+                    terminal_frame_cancelled is not None
+                    and terminal_frame_cancelled.is_set()
                 )
-                terminal_deadline = time.monotonic() + terminal_timeout
-                while not terminal_frame_finished.wait(timeout=0.1):
-                    if (
-                        terminal_frame_cancelled is not None
-                        and terminal_frame_cancelled.is_set()
-                    ):
-                        terminal_cancelled = True
-                        break
-                    if time.monotonic() >= terminal_deadline:
-                        break
-                if not terminal_frame_finished.is_set() and not terminal_cancelled:
-                    terminal_error = InputObserverError(
-                        "the terminal frame did not seal before native input shutdown"
+                if (
+                    terminal_frame_finished is not None
+                    and not observer_failed
+                    and not terminal_cancelled
+                ):
+                    terminal_timeout = max(
+                        10.0,
+                        float(getattr(observer, "shutdown_timeout", 5.0)) * 2,
                     )
+                    terminal_deadline = time.monotonic() + terminal_timeout
+                    while not terminal_frame_finished.wait(timeout=0.1):
+                        if (
+                            terminal_frame_cancelled is not None
+                            and terminal_frame_cancelled.is_set()
+                        ):
+                            terminal_cancelled = True
+                            break
+                        if time.monotonic() >= terminal_deadline:
+                            break
+                    if not terminal_frame_finished.is_set() and not terminal_cancelled:
+                        terminal_error = InputObserverError(
+                            "the terminal frame did not seal before native input shutdown"
+                        )
+                        if input_frame_boundary is not None:
+                            input_frame_boundary.fail(terminal_error)
+                if input_frame_boundary is not None:
+                    input_frame_boundary.begin_close()
+                try:
+                    observer.stop()
+                except BaseException as exc:
                     if input_frame_boundary is not None:
-                        input_frame_boundary.fail(terminal_error)
-            if input_frame_boundary is not None:
-                input_frame_boundary.begin_close()
-            try:
-                observer.stop()
-            except BaseException as exc:
-                if input_frame_boundary is not None:
-                    input_frame_boundary.fail(exc)
-                raise
-            else:
-                if input_frame_boundary is not None:
-                    input_frame_boundary.close()
-            if terminal_error is not None:
-                raise terminal_error
-        if finished_event is not None:
-            finished_event.set()
+                        input_frame_boundary.fail(exc)
+                    raise
+                else:
+                    if input_frame_boundary is not None:
+                        input_frame_boundary.close()
+                if terminal_error is not None:
+                    raise terminal_error
+        finally:
+            if bounded_structural is not None:
+                bounded_structural.stop()
+            if finished_event is not None:
+                finished_event.set()
 
 
 def record_audio(

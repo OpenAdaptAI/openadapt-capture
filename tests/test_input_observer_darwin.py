@@ -632,6 +632,56 @@ def test_move_filter_does_not_disable_buttons() -> None:
     assert quartz.kCGEventMouseMoved not in observer._observed_event_types()
 
 
+def test_event_tap_freezes_value_free_key_hint_before_async_delivery() -> None:
+    quartz = FakeQuartz()
+    hints = []
+    events = []
+
+    class Receipt:
+        finished = False
+
+        def fail(self, _error) -> None:
+            self.finished = True
+
+    def consume(_event) -> None:
+        raise AssertionError("reserved input must use the receipt consumer")
+
+    def reserve(timestamp, hint):
+        assert timestamp == 111.25
+        hints.append(hint)
+        return Receipt()
+
+    def deliver(event, receipt) -> None:
+        events.append(event)
+        receipt.finished = True
+
+    setattr(consume, "_openadapt_input_receipt", reserve)
+    setattr(consume, "_openadapt_input_receipt_accepts_hint", True)
+    setattr(consume, "_openadapt_input_delivery", deliver)
+    observer = make_observer(quartz, consume)
+    observer.start()
+    observer._handle_event(
+        quartz.kCGEventKeyDown,
+        FakeEvent(fields={quartz.kCGEventSourceUnixProcessID: 0}),
+        timestamp=111.25,
+    )
+
+    deadline = time.monotonic() + 1
+    while not events:
+        if time.monotonic() >= deadline:
+            pytest.fail("reserved macOS key was not delivered")
+        time.sleep(0.001)
+    observer.stop()
+    assert hints[0].action_kind == "key"
+    assert hints[0].action_name == "press"
+    assert hints[0].pressed is True
+    assert hints[0].observer_phase == "pre_action"
+    assert hints[0].receipt_timestamp == 111.25
+    assert hints[0].receipt_monotonic_ns > 0
+    assert not hasattr(hints[0], "key_char")
+    assert not hasattr(hints[0], "key_name")
+
+
 def test_event_callback_stamps_native_receipt_time_before_async_delivery() -> None:
     quartz = FakeQuartz()
     events = []

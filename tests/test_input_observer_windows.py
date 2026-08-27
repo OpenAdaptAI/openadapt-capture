@@ -789,6 +789,7 @@ def test_keyboard_hook_reserves_receipt_before_translation_queue() -> None:
         translation_release=translation_release,
     )
     reserved_timestamps = []
+    receipt_hints = []
     events = []
 
     class Receipt:
@@ -800,8 +801,9 @@ def test_keyboard_hook_reserves_receipt_before_translation_queue() -> None:
     def consume(_event) -> None:
         raise AssertionError("reserved input must use the receipt consumer")
 
-    def reserve(timestamp):
+    def reserve(timestamp, hint):
         reserved_timestamps.append(timestamp)
+        receipt_hints.append(hint)
         return Receipt()
 
     def deliver(event, receipt) -> None:
@@ -809,6 +811,7 @@ def test_keyboard_hook_reserves_receipt_before_translation_queue() -> None:
         receipt.finished = True
 
     setattr(consume, "_openadapt_input_receipt", reserve)
+    setattr(consume, "_openadapt_input_receipt_accepts_hint", True)
     setattr(consume, "_openadapt_input_delivery", deliver)
     observer = make_observer(
         consume,
@@ -828,6 +831,15 @@ def test_keyboard_hook_reserves_receipt_before_translation_queue() -> None:
     )
     assert translation_entered.wait(timeout=1)
     assert reserved_timestamps == [111.25]
+    assert receipt_hints[0].action_kind == "key"
+    assert receipt_hints[0].action_name == "press"
+    assert receipt_hints[0].pressed is True
+    assert receipt_hints[0].observer_phase == "pre_action"
+    assert receipt_hints[0].receipt_timestamp == 111.25
+    assert receipt_hints[0].receipt_monotonic_ns > 0
+    assert not hasattr(receipt_hints[0], "key_char")
+    assert not hasattr(receipt_hints[0], "key_name")
+    assert not hasattr(receipt_hints[0], "key_vk")
     assert events == []
 
     translation_release.set()

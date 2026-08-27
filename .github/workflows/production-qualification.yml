@@ -190,11 +190,33 @@ jobs:
           cd "${RUNNER_TEMP}"
           for trial in 1 2 3; do
             echo "::group::Linux trial ${trial}"
+            OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID="$(python -c 'import uuid; print(uuid.uuid4())')"
+            OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+            export OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID
+            export OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT
+            export OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN
+            fixture_output="${RUNNER_TEMP}/capture-structural-${OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID}.out"
+            python -m runner.linux.structural_qualification_fixture prepare \
+              --trial-uuid "${OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID}" \
+              --trial-started-at "${OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT}" \
+              --output-owner-token-env OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN \
+              --output-root "${RUNNER_TEMP}/openadapt-capture-qualification" \
+              --github-output "${fixture_output}"
+            OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH="$(python "${GITHUB_WORKSPACE}/scripts/read_structural_fixture_output.py" "${fixture_output}" --field structural_fixture_path)"
+            OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_INSTANCE_UUID="$(python "${GITHUB_WORKSPACE}/scripts/read_structural_fixture_output.py" "${fixture_output}" --field structural_fixture_instance_uuid)"
+            export OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH
+            export OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_INSTANCE_UUID
             "${QUALIFICATION_PYTHON}" -m pytest \
               "${GITHUB_WORKSPACE}/tests/test_performance.py" \
               "${GITHUB_WORKSPACE}/tests/test_structural_observation.py" \
-              -m slow -v --timeout=300 --import-mode=importlib \
+              -m "slow or structural_qualification_contract" -v --timeout=300 --import-mode=importlib \
               "--junitxml=${GITHUB_WORKSPACE}/evidence/trial-${trial}-linux.xml"
+            cp "${OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH}" \
+              "${GITHUB_WORKSPACE}/evidence/trial-${trial}-linux-structural-fixture.json"
+            cp "$(dirname "${OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH}")/structural-qualification-fixture.claim.json" \
+              "${GITHUB_WORKSPACE}/evidence/trial-${trial}-linux-structural-fixture-claim.json"
+            unset OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN
             echo "::endgroup::"
           done
 
@@ -292,12 +314,34 @@ jobs:
           cd "${RUNNER_TEMP}"
           for trial in 1 2 3; do
             echo "::group::macOS trial ${trial}"
+            OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID="$(python -c 'import uuid; print(uuid.uuid4())')"
+            OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+            export OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID
+            export OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT
+            export OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN
+            fixture_output="${RUNNER_TEMP}/capture-structural-${OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID}.out"
+            python -m runner.macos.structural_qualification_fixture prepare \
+              --trial-uuid "${OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID}" \
+              --trial-started-at "${OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT}" \
+              --output-owner-token-env OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN \
+              --output-root "${RUNNER_TEMP}/openadapt-capture-qualification" \
+              --github-output "${fixture_output}"
+            OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH="$(python "${GITHUB_WORKSPACE}/scripts/read_structural_fixture_output.py" "${fixture_output}" --field structural_fixture_path)"
+            OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_INSTANCE_UUID="$(python "${GITHUB_WORKSPACE}/scripts/read_structural_fixture_output.py" "${fixture_output}" --field structural_fixture_instance_uuid)"
+            export OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH
+            export OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_INSTANCE_UUID
             "${QUALIFICATION_PYTHON}" -m pytest \
               "${GITHUB_WORKSPACE}/tests/test_performance.py" \
               "${GITHUB_WORKSPACE}/tests/test_structural_observation.py" \
               "${GITHUB_WORKSPACE}/tests/test_window_capture.py" \
-              -m slow -v --timeout=300 --import-mode=importlib \
+              -m "slow or structural_qualification_contract" -v --timeout=300 --import-mode=importlib \
               "--junitxml=${GITHUB_WORKSPACE}/evidence/trial-${trial}-macos.xml"
+            cp "${OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH}" \
+              "${GITHUB_WORKSPACE}/evidence/trial-${trial}-macos-structural-fixture.json"
+            cp "$(dirname "${OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH}")/structural-qualification-fixture.claim.json" \
+              "${GITHUB_WORKSPACE}/evidence/trial-${trial}-macos-structural-fixture-claim.json"
+            unset OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN
             echo "::endgroup::"
           done
 
@@ -400,13 +444,49 @@ jobs:
           try {
             foreach ($trial in 1..3) {
               Write-Host "::group::Windows trial $trial"
+              $env:OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID = [guid]::NewGuid().ToString()
+              $env:OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT = [DateTime]::UtcNow.ToString(
+                "yyyy-MM-ddTHH:mm:ssZ",
+                [Globalization.CultureInfo]::InvariantCulture
+              )
+              $tokenBytes = New-Object byte[] 32
+              [Security.Cryptography.RandomNumberGenerator]::Fill($tokenBytes)
+              $env:OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN = [Convert]::ToHexString(
+                $tokenBytes
+              ).ToLowerInvariant()
+              $fixtureOutput = Join-Path $env:RUNNER_TEMP (
+                "capture-structural-$env:OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID.out"
+              )
+              python -m runner.windows.structural_qualification_fixture prepare `
+                --trial-uuid $env:OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID `
+                --trial-started-at $env:OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT `
+                --output-owner-token-env OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN `
+                --output-root "$env:RUNNER_TEMP\openadapt-capture-qualification" `
+                --github-output $fixtureOutput
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              $env:OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH = python `
+                "$env:GITHUB_WORKSPACE\scripts\read_structural_fixture_output.py" `
+                $fixtureOutput --field structural_fixture_path
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              $env:OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_INSTANCE_UUID = python `
+                "$env:GITHUB_WORKSPACE\scripts\read_structural_fixture_output.py" `
+                $fixtureOutput --field structural_fixture_instance_uuid
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
               & $env:QUALIFICATION_PYTHON -m pytest `
                 "$env:GITHUB_WORKSPACE/tests/test_performance.py" `
                 "$env:GITHUB_WORKSPACE/tests/test_structural_observation.py" `
                 "$env:GITHUB_WORKSPACE/tests/test_window_capture.py" `
-                -m slow -v --timeout=300 --import-mode=importlib `
+                -m "slow or structural_qualification_contract" -v --timeout=300 --import-mode=importlib `
                 "--junitxml=$env:GITHUB_WORKSPACE/evidence/trial-$trial-windows.xml"
               if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              Copy-Item $env:OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH `
+                "$env:GITHUB_WORKSPACE\evidence\trial-$trial-windows-structural-fixture.json"
+              $claimPath = Join-Path `
+                (Split-Path $env:OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH) `
+                "structural-qualification-fixture.claim.json"
+              Copy-Item $claimPath `
+                "$env:GITHUB_WORKSPACE\evidence\trial-$trial-windows-structural-fixture-claim.json"
+              Remove-Item Env:OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN
               Write-Host "::endgroup::"
             }
           } finally {

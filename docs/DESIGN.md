@@ -42,20 +42,31 @@ One recording has these stages:
 2. Resolve the initial native-window or virtual-desktop coordinate scope.
 3. Create the per-capture SQLite database and media staging path.
 4. Observe native input and screen frames on separate workers.
-5. Reserve each observation in one ordered source journal before any optional
-   structural lookup. A failed reservation fails the session; later events
-   cannot pass it.
-6. For a native window, enqueue each frame and its window geometry as one
+5. Reserve each observation in one ordered source journal at the first native
+   receipt boundary. Freeze only its action family, pressed state, global
+   coordinates, wall time, monotonic time, and platform causal phase. Do not
+   put key text in this receipt hint.
+6. For Windows and macOS, run one structural lookup on an isolated provider
+   worker before the native hook returns. Wait for no more than 75
+   milliseconds. Store the result in the reservation. A timeout or provider
+   error omits this optional result and cannot stop input, frame, or shutdown
+   progress. Linux labels its later AT-SPI result `post_action_unverified` and
+   cannot use it as action-target identity.
+7. For a native window, enqueue each frame and its window geometry as one
    source-ordinal pair. Publish that geometry to input observers only after the
    pair enters the journal.
-7. Bind each actionable input to the last published frame pair and optional
-   structural observation. Retain one ordinal-later frame after input stops.
-8. Stream RGB frames to a separately provisioned FFmpeg process.
-9. Close, verify, and atomically promote the MP4. Retain an incomplete partial
+8. Revalidate the structural result against the delivered action, provider
+   process and window, capture-window identity, geometry generation, and
+   display-topology digest. Omit a stale or mismatched result. Never attach an
+   unproved post-action focus result to Tab.
+9. Bind each actionable input to the last published frame pair and retained
+   structural result. Retain one ordinal-later frame after input stops.
+10. Stream RGB frames to a separately provisioned FFmpeg process.
+11. Close, verify, and atomically promote the MP4. Retain an incomplete partial
    file on an encoder failure and never report it as complete media.
-10. Post-process raw input into the public action view. A merged action keeps
+12. Post-process raw input into the public action view. A merged action keeps
     its terminal primitive's source binding and refuses mixed geometry epochs.
-11. Reconcile committed rows with producer counts, verify the v2 frame/action
+13. Reconcile committed rows with producer counts, verify the v2 frame/action
     relations, inventory every immutable artifact, and write the completion
     seal.
 
@@ -238,6 +249,17 @@ commit. It must:
 - run interactive native qualification on labeled Linux, macOS, and Windows
   hosts with real display and input permissions;
 - require at least two real monitors on each interactive host;
+- require a reviewed native accessibility fixture on a negative-origin monitor
+  for each host. Its closed contract names the exact provider, process and
+  window identities, display scale, geometry generation, topology digest,
+  normal control, focused control, and protected control;
+- launch a new fixture instance for each counted trial. The runner writes one
+  private canonical fixture contract, and the test binds it to the trial UUID,
+  fixture UUID, creation time, and a random owner token. An exclusive claim
+  file prevents a second trial from using the same contract;
+- prove point lookup, receipt/action association, focus and window mismatch
+  refusal, negative coordinates and scale binding, protected-name exclusion,
+  provider deadline, failure, and recovery in each counted trial;
 - run the complete slow native capture tests with no skip;
 - verify live window movement and resize where the operating system supports
   window-scoped capture; and

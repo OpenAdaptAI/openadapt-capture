@@ -30,6 +30,7 @@ from .base import (
     InputObserverError,
     InputObserverPermissionError,
     InputObserverUnavailableError,
+    NativeReceiptHint,
     ObservedInput,
     ObservedKey,
     ObservedMouseButton,
@@ -931,6 +932,7 @@ class LinuxXInputObserver(ThreadedInputObserver):
             self._device_event_count += 1
         self._finalize_pending()
         observed_at = time.time()
+        receipt_monotonic_ns = time.monotonic_ns()
         if event.event_type == _MOTION_NOTIFY:
             if not self.observe_mouse:
                 return
@@ -940,7 +942,18 @@ class LinuxXInputObserver(ThreadedInputObserver):
                 receipt = (
                     None
                     if event.injected
-                    else self._reserve_receipt(observed_at)
+                    else self._reserve_receipt(
+                        observed_at,
+                        NativeReceiptHint(
+                            action_kind="mouse_move",
+                            action_name="move",
+                            x=position[0],
+                            y=position[1],
+                            observer_phase="post_action_unverified",
+                            receipt_timestamp=observed_at,
+                            receipt_monotonic_ns=receipt_monotonic_ns,
+                        ),
+                    )
                 )
                 observed = ObservedMouseMove(
                     x=position[0],
@@ -964,15 +977,46 @@ class LinuxXInputObserver(ThreadedInputObserver):
             event.event_type in {_BUTTON_PRESS, _BUTTON_RELEASE}
             and event.detail <= 0
         )
-        receipt = (
-            self._reserve_receipt(observed_at)
-            if not event.injected
-            and (
-                event.event_type in {_KEY_PRESS, _KEY_RELEASE}
-                or recordable_button
-            )
-            else None
-        )
+        receipt = None
+        if not event.injected and (
+            event.event_type in {_KEY_PRESS, _KEY_RELEASE} or recordable_button
+        ):
+            hint = None
+            if event.event_type in {_KEY_PRESS, _KEY_RELEASE}:
+                pressed = event.event_type == _KEY_PRESS
+                hint = NativeReceiptHint(
+                    action_kind="key",
+                    action_name="press" if pressed else "release",
+                    pressed=pressed,
+                    observer_phase="post_action_unverified",
+                    receipt_timestamp=observed_at,
+                    receipt_monotonic_ns=receipt_monotonic_ns,
+                )
+            elif self._last_pointer is not None:
+                x, y = self._last_pointer
+                if event.detail in {4, 5, 6, 7}:
+                    hint = NativeReceiptHint(
+                        action_kind="mouse_scroll",
+                        action_name="scroll",
+                        x=x,
+                        y=y,
+                        observer_phase="post_action_unverified",
+                        receipt_timestamp=observed_at,
+                        receipt_monotonic_ns=receipt_monotonic_ns,
+                    )
+                else:
+                    pressed = event.event_type == _BUTTON_PRESS
+                    hint = NativeReceiptHint(
+                        action_kind="mouse_button",
+                        action_name="click",
+                        pressed=pressed,
+                        x=x,
+                        y=y,
+                        observer_phase="post_action_unverified",
+                        receipt_timestamp=observed_at,
+                        receipt_monotonic_ns=receipt_monotonic_ns,
+                    )
+            receipt = self._reserve_receipt(observed_at, hint)
         self._pending = _PendingDeviceEvent(
             event_type=event.event_type,
             detail=event.detail,

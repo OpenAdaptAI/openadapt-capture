@@ -2,28 +2,46 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import queue
+import re
 import sqlite3
+import stat
 import sys
 import threading
+import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import psutil
 import pytest
 
 from openadapt_capture.capture import CaptureSession
 from openadapt_capture.db import create_db, crud
-from openadapt_capture.recorder import on_click, write_action_event
+from openadapt_capture.desktop_capture import DesktopCaptureScope
+from openadapt_capture.recorder import (
+    OrderedEventJournal,
+    WindowActionReservation,
+    _structural_observation_for_delivery,
+    on_click,
+    write_action_event,
+)
 from openadapt_capture.structural import (
     MAX_STRUCTURAL_ANCESTRY_DEPTH,
     MAX_STRUCTURAL_TEXT_LENGTH,
+    BoundedStructuralObserver,
     StructuralBounds,
+    StructuralCaptureWindowBinding,
     StructuralElement,
     StructuralObservation,
     StructuralObservationRequest,
+    StructuralProcessIdentity,
+    StructuralWindowIdentity,
     create_structural_observer,
-    observe_structural_action,
 )
 from openadapt_capture.structural_observer.linux import (
     LinuxATSpiStructuralObserver,
@@ -41,6 +59,162 @@ from openadapt_capture.structural_observer.windows import (
     _PywinautoRuntime,
 )
 
+_QUALIFICATION_FIXTURE_SCHEMA = (
+    "openadapt.capture.structural-qualification-fixture/v1"
+)
+_QUALIFICATION_CLAIM_SCHEMA = (
+    "openadapt.capture.structural-qualification-fixture-claim/v1"
+)
+_QUALIFICATION_FIXTURE_FIELDS = {
+    "schema_version",
+    "trial_uuid",
+    "fixture_instance_uuid",
+    "created_at",
+    "output_owner_sha256",
+    "provider",
+    "process_id",
+    "process_start_time",
+    "native_window_handle",
+    "window_bounds",
+    "scale_x",
+    "scale_y",
+    "geometry_generation",
+    "display_topology_sha256",
+    "point",
+    "focused_automation_id",
+    "protected_point",
+}
+_LOWER_SHA256 = re.compile(r"[0-9a-f]{64}")
+_LOWER_HEX_TOKEN = re.compile(r"[0-9a-f]{64}")
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _canonical_uuid(value: object, *, label: str) -> str:
+    assert isinstance(value, str), f"{label} must be a UUID string"
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as exc:
+        raise AssertionError(f"{label} must be a canonical UUID") from exc
+    assert str(parsed) == value, f"{label} must be a canonical lowercase UUID"
+    return value
+
+
+def _utc_timestamp(value: object, *, label: str) -> datetime:
+    assert isinstance(value, str), f"{label} must be an RFC 3339 timestamp"
+    assert value.endswith("Z"), f"{label} must use UTC Z form"
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise AssertionError(f"{label} must be an RFC 3339 timestamp") from exc
+    assert parsed.tzinfo is not None, f"{label} must include a timezone"
+    return parsed.astimezone(timezone.utc)
+
+
+def _load_and_claim_qualification_fixture() -> dict:
+    """Read one fresh runner-owned fixture and claim it exactly once."""
+    path_value = os.environ.get("OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH")
+    trial_uuid = _canonical_uuid(
+        os.environ.get("OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID"),
+        label="qualification trial UUID",
+    )
+    fixture_instance_uuid = _canonical_uuid(
+        os.environ.get("OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_INSTANCE_UUID"),
+        label="qualification fixture instance UUID",
+    )
+    trial_started_at = _utc_timestamp(
+        os.environ.get("OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT"),
+        label="qualification trial start",
+    )
+    owner_token = os.environ.get("OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN")
+    runner_temp_value = os.environ.get("RUNNER_TEMP")
+    assert path_value, "production qualification requires a fixture path"
+    assert runner_temp_value, "production qualification requires RUNNER_TEMP"
+    assert owner_token and _LOWER_HEX_TOKEN.fullmatch(owner_token), (
+        "qualification output owner token must encode 32 random bytes"
+    )
+
+    path = Path(path_value)
+    assert path.is_absolute(), "qualification fixture path must be absolute"
+    expected_parent = (
+        Path(runner_temp_value).resolve(strict=True)
+        / "openadapt-capture-qualification"
+        / trial_uuid
+    )
+    assert path.name == "structural-qualification-fixture.json"
+    assert path.parent.resolve(strict=True) == expected_parent.resolve(strict=True), (
+        "qualification fixture path is outside its exact private trial directory"
+    )
+    metadata = path.lstat()
+    assert stat.S_ISREG(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode), (
+        "qualification fixture must be a non-symlink regular file"
+    )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened_metadata = os.fstat(descriptor)
+        assert stat.S_ISREG(opened_metadata.st_mode), (
+            "qualification fixture descriptor is not a regular file"
+        )
+        with os.fdopen(descriptor, "rb", closefd=False) as fixture_file:
+            raw = fixture_file.read()
+    finally:
+        os.close(descriptor)
+    try:
+        fixture = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise AssertionError("qualification fixture is not valid UTF-8 JSON") from exc
+    assert isinstance(fixture, dict) and set(fixture) == _QUALIFICATION_FIXTURE_FIELDS
+    assert raw == _canonical_json_bytes(fixture) + b"\n", (
+        "qualification fixture must be exact canonical JSON plus LF"
+    )
+    assert fixture["schema_version"] == _QUALIFICATION_FIXTURE_SCHEMA
+    assert fixture["trial_uuid"] == trial_uuid
+    assert fixture["fixture_instance_uuid"] == fixture_instance_uuid
+    expected_owner = hashlib.sha256(owner_token.encode("ascii")).hexdigest()
+    assert fixture["output_owner_sha256"] == expected_owner
+    assert _LOWER_SHA256.fullmatch(str(fixture["output_owner_sha256"]))
+    created_at = _utc_timestamp(
+        fixture["created_at"],
+        label="qualification fixture creation time",
+    )
+    now = datetime.now(timezone.utc)
+    assert trial_started_at <= created_at <= now, (
+        "qualification fixture is stale or from the future"
+    )
+
+    fixture_sha256 = hashlib.sha256(raw).hexdigest()
+    claim = {
+        "schema_version": _QUALIFICATION_CLAIM_SCHEMA,
+        "trial_uuid": trial_uuid,
+        "fixture_instance_uuid": fixture_instance_uuid,
+        "fixture_sha256": fixture_sha256,
+        "claimed_at": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    claim_path = path.with_name("structural-qualification-fixture.claim.json")
+    claim_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        claim_descriptor = os.open(claim_path, claim_flags, 0o600)
+    except FileExistsError as exc:
+        raise AssertionError("qualification fixture was already claimed") from exc
+    try:
+        claim_raw = _canonical_json_bytes(claim) + b"\n"
+        with os.fdopen(claim_descriptor, "wb", closefd=False) as claim_file:
+            claim_file.write(claim_raw)
+            claim_file.flush()
+            os.fsync(claim_file.fileno())
+    finally:
+        os.close(claim_descriptor)
+    return fixture
+
 
 class _Wrapper:
     def __init__(
@@ -56,6 +230,7 @@ class _Wrapper:
         descendants: list["_Wrapper"] | None = None,
         title: str | None = None,
         patterns: tuple[str, ...] = (),
+        is_password: bool = False,
     ) -> None:
         self.element_info = SimpleNamespace(
             automation_id=automation_id,
@@ -66,6 +241,7 @@ class _Wrapper:
             handle=None,
             process_id=process_id,
             rectangle=SimpleNamespace(left=10, top=20, right=110, bottom=60),
+            is_password=is_password,
         )
         self._role = role
         self._parent = parent
@@ -93,12 +269,25 @@ class _Wrapper:
         return self._title
 
 
-def _observation(event_timestamp: float) -> StructuralObservation:
+def _observation(request: StructuralObservationRequest) -> StructuralObservation:
+    completed = request.receipt_monotonic_ns + 1_000_000
     return StructuralObservation(
         provider="windows_uia",
-        event_timestamp=event_timestamp,
-        observed_at=event_timestamp + 0.001,
-        query_kind="point",
+        event_timestamp=request.event_timestamp,
+        receipt_monotonic_ns=request.receipt_monotonic_ns,
+        completed_monotonic_ns=completed,
+        completion_latency_ms=1.0,
+        action_kind=request.action_kind,
+        action_name=request.action_name,
+        action_pressed=request.action_pressed,
+        action_x=request.x,
+        action_y=request.y,
+        observer_phase=request.observer_phase,
+        action_target_eligible=request.observer_phase == "pre_action",
+        capture_window=request.capture_window,
+        display_topology_sha256=request.display_topology_sha256,
+        observed_at=request.event_timestamp + 0.001,
+        query_kind="point" if request.x is not None else "focused",
         element=StructuralElement(
             automation_id="submit-order",
             role="Button",
@@ -113,7 +302,7 @@ class _Observer:
         self,
         request: StructuralObservationRequest,
     ) -> StructuralObservation:
-        return _observation(request.event_timestamp)
+        return _observation(request)
 
 
 def _recording(capture_dir: Path):
@@ -250,6 +439,14 @@ def test_structural_contract_accepts_namespaced_extension_provider() -> None:
     observation = StructuralObservation(
         provider="example_macos_ax",
         event_timestamp=101.0,
+        receipt_monotonic_ns=1_000_000,
+        completed_monotonic_ns=2_000_000,
+        completion_latency_ms=1.0,
+        action_kind="key",
+        action_name="press",
+        action_pressed=True,
+        observer_phase="pre_action",
+        action_target_eligible=True,
         observed_at=101.1,
         query_kind="focused",
         element=StructuralElement(role="AXTextField"),
@@ -796,6 +993,8 @@ def test_structural_evidence_persists_through_capture_session(
 
         assert raw[0].structural_observation is not None
         assert raw[0].structural_observation.element.automation_id == "submit-order"
+        assert raw[0].structural_observation.observer_phase == "post_action_unverified"
+        assert raw[0].structural_observation.action_target_eligible is False
         assert raw[1].structural_observation is None
         assert len(actions) == 1
         assert actions[0].structural_observation is not None
@@ -902,12 +1101,370 @@ def test_lazy_uia_start_failure_does_not_abort_native_capture() -> None:
     assert attempts == 1
 
 
+def _receipt_request(
+    *,
+    phase: str = "pre_action",
+    action_name: str = "click",
+    x: float | None = 25.0,
+    y: float | None = 35.0,
+    capture_window: StructuralCaptureWindowBinding | None = None,
+) -> StructuralObservationRequest:
+    return StructuralObservationRequest(
+        event_timestamp=101.0,
+        receipt_monotonic_ns=time.monotonic_ns(),
+        action_kind="mouse_button" if x is not None else "key",
+        action_name=action_name,
+        action_pressed=True,
+        x=x,
+        y=y,
+        observer_phase=phase,
+        capture_window=capture_window,
+        display_topology_sha256=(
+            capture_window.display_topology_sha256 if capture_window else None
+        ),
+    )
+
+
+def _write_qualification_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    created_at: str | None = None,
+) -> tuple[Path, dict]:
+    trial_uuid = "91ad0469-7282-474a-83ca-f68ad061f5aa"
+    fixture_instance_uuid = "a77fcf06-9821-4d62-a538-b6f6cd2c62bf"
+    owner_token = "ab" * 32
+    timestamp = created_at or datetime.now(timezone.utc).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z")
+    fixture = {
+        "schema_version": _QUALIFICATION_FIXTURE_SCHEMA,
+        "trial_uuid": trial_uuid,
+        "fixture_instance_uuid": fixture_instance_uuid,
+        "created_at": timestamp,
+        "output_owner_sha256": hashlib.sha256(owner_token.encode("ascii")).hexdigest(),
+        "provider": "windows_uia",
+        "process_id": os.getpid(),
+        "process_start_time": psutil.Process().create_time(),
+        "native_window_handle": 42,
+        "window_bounds": {"left": -900, "top": 10, "right": -100, "bottom": 700},
+        "scale_x": 1.25,
+        "scale_y": 1.25,
+        "geometry_generation": 3,
+        "display_topology_sha256": "a" * 64,
+        "point": {"x": -700, "y": 200, "automation_id": "normal"},
+        "focused_automation_id": "focused",
+        "protected_point": {
+            "x": -700,
+            "y": 300,
+            "automation_id": "protected",
+        },
+    }
+    fixture_dir = tmp_path / "openadapt-capture-qualification" / trial_uuid
+    fixture_dir.mkdir(parents=True)
+    fixture_path = fixture_dir / "structural-qualification-fixture.json"
+    fixture_path.write_bytes(_canonical_json_bytes(fixture) + b"\n")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setenv("OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_PATH", str(fixture_path))
+    monkeypatch.setenv("OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_UUID", trial_uuid)
+    monkeypatch.setenv(
+        "OPENADAPT_CAPTURE_STRUCTURAL_FIXTURE_INSTANCE_UUID",
+        fixture_instance_uuid,
+    )
+    monkeypatch.setenv(
+        "OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT",
+        timestamp,
+    )
+    monkeypatch.setenv(
+        "OPENADAPT_CAPTURE_STRUCTURAL_OUTPUT_OWNER_TOKEN",
+        owner_token,
+    )
+    return fixture_path, fixture
+
+
+@pytest.mark.structural_qualification_contract
+def test_qualification_fixture_is_canonical_private_fresh_and_one_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_path, fixture = _write_qualification_fixture(tmp_path, monkeypatch)
+    assert _load_and_claim_qualification_fixture() == fixture
+    claim_path = fixture_path.with_name("structural-qualification-fixture.claim.json")
+    claim_raw = claim_path.read_bytes()
+    claim = json.loads(claim_raw)
+    assert set(claim) == {
+        "schema_version",
+        "trial_uuid",
+        "fixture_instance_uuid",
+        "fixture_sha256",
+        "claimed_at",
+    }
+    assert claim["schema_version"] == _QUALIFICATION_CLAIM_SCHEMA
+    assert claim["fixture_sha256"] == hashlib.sha256(fixture_path.read_bytes()).hexdigest()
+    assert claim_raw == _canonical_json_bytes(claim) + b"\n"
+    assert stat.S_IMODE(claim_path.stat().st_mode) & 0o077 == 0
+    with pytest.raises(AssertionError, match="already claimed"):
+        _load_and_claim_qualification_fixture()
+
+
+@pytest.mark.structural_qualification_contract
+def test_qualification_fixture_refuses_stale_owner_and_noncanonical_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_path, fixture = _write_qualification_fixture(
+        tmp_path,
+        monkeypatch,
+        created_at="2026-08-27T12:00:00Z",
+    )
+    monkeypatch.setenv(
+        "OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT",
+        "2026-08-27T12:00:01Z",
+    )
+    with pytest.raises(AssertionError, match="stale"):
+        _load_and_claim_qualification_fixture()
+
+    monkeypatch.setenv(
+        "OPENADAPT_CAPTURE_STRUCTURAL_TRIAL_STARTED_AT",
+        "2026-08-27T12:00:00Z",
+    )
+    fixture["output_owner_sha256"] = "b" * 64
+    fixture_path.write_bytes(_canonical_json_bytes(fixture) + b"\n")
+    with pytest.raises(AssertionError):
+        _load_and_claim_qualification_fixture()
+
+    fixture["output_owner_sha256"] = hashlib.sha256(
+        ("ab" * 32).encode("ascii")
+    ).hexdigest()
+    fixture_path.write_bytes(json.dumps(fixture).encode("utf-8"))
+    with pytest.raises(AssertionError, match="canonical"):
+        _load_and_claim_qualification_fixture()
+
+
+@pytest.mark.structural_qualification_contract
+def test_qualification_fixture_refuses_a_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_path, _fixture = _write_qualification_fixture(tmp_path, monkeypatch)
+    target = tmp_path / "outside.json"
+    target.write_bytes(fixture_path.read_bytes())
+    fixture_path.unlink()
+    try:
+        fixture_path.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"this host cannot create a test symlink: {exc}")
+    with pytest.raises(AssertionError, match="non-symlink"):
+        _load_and_claim_qualification_fixture()
+
+
+@pytest.mark.structural_qualification_contract
+def test_bounded_observer_timeout_cannot_stall_receipt_or_shutdown() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class HungObserver:
+        def observe(self, _request):
+            entered.set()
+            release.wait()
+            return None
+
+    controller = BoundedStructuralObserver(
+        HungObserver(),
+        deadline_seconds=0.01,
+        startup_timeout_seconds=0.01,
+    )
+    started = time.monotonic()
+    assert controller.capture(_receipt_request()) is None
+    assert entered.wait(timeout=0.1)
+    assert time.monotonic() - started < 0.1
+    assert controller.quarantined is True
+
+    stopped = time.monotonic()
+    controller.stop()
+    assert time.monotonic() - stopped < 0.1
+    release.set()
+
+
+@pytest.mark.structural_qualification_contract
+def test_bounded_observer_recovers_after_provider_failure() -> None:
+    calls = 0
+
+    class RecoveringObserver:
+        def observe(self, request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("provider restarted")
+            return _observation(request)
+
+    controller = BoundedStructuralObserver(
+        RecoveringObserver(),
+        deadline_seconds=0.1,
+        startup_timeout_seconds=0.1,
+    )
+    try:
+        assert controller.capture(_receipt_request()) is None
+        observed = controller.capture(_receipt_request())
+        assert observed is not None
+        assert observed.element.automation_id == "submit-order"
+    finally:
+        controller.stop()
+    assert calls == 2
+
+
+@pytest.mark.structural_qualification_contract
+def test_delivery_uses_the_reserved_snapshot_after_queue_delay_and_refuses_tab() -> None:
+    journal = OrderedEventJournal()
+    request = _receipt_request(
+        phase="post_action_unverified",
+        action_name="press",
+        x=None,
+        y=None,
+    )
+    reservation = journal.reserve(request.event_timestamp)
+    reservation.set_structural_observation(_observation(request))
+    time.sleep(0.01)
+
+    event_data = {
+        "name": "press",
+        "canonical_key_name": "a",
+    }
+    observed = _structural_observation_for_delivery(
+        reservation,
+        event_timestamp=request.event_timestamp,
+        event_data=event_data,
+        raw_x=None,
+        raw_y=None,
+        coordinate_scope=None,
+    )
+    assert observed is not None
+    assert observed.observer_phase == "post_action_unverified"
+    assert observed.action_target_eligible is False
+
+    event_data["canonical_key_name"] = "tab"
+    assert (
+        _structural_observation_for_delivery(
+            reservation,
+            event_timestamp=request.event_timestamp,
+            event_data=event_data,
+            raw_x=None,
+            raw_y=None,
+            coordinate_scope=None,
+        )
+        is None
+    )
+
+
+@pytest.mark.structural_qualification_contract
+def test_delivery_refuses_action_coordinate_and_capture_window_mismatch() -> None:
+    capture_window = StructuralCaptureWindowBinding(
+        window_id="44",
+        process_id=42,
+        process_start_time=100.0,
+        bounds=StructuralBounds(left=-1920, top=0, right=-920, bottom=800),
+        scale_x=1.5,
+        scale_y=1.5,
+        geometry_generation=3,
+        display_topology_sha256="a" * 64,
+    )
+    request = _receipt_request(
+        x=-1500.5,
+        y=200.25,
+        capture_window=capture_window,
+    )
+    observation = _observation(request).model_copy(
+        update={
+            "process": StructuralProcessIdentity(process_id=99),
+            "window": StructuralWindowIdentity(native_window_handle=45),
+        }
+    )
+    journal = OrderedEventJournal()
+    event_reservation = journal.reserve(request.event_timestamp)
+
+    class Scope:
+        def structural_binding_for_reserved_geometry(self, _geometry):
+            return capture_window.model_dump(mode="json")
+
+    reservation = WindowActionReservation(event_reservation, Scope(), ())
+    reservation.set_structural_observation(observation)
+    event_data = {"name": "click", "mouse_pressed": True}
+    assert (
+        _structural_observation_for_delivery(
+            reservation,
+            event_timestamp=request.event_timestamp,
+            event_data=event_data,
+            raw_x=request.x,
+            raw_y=request.y,
+            coordinate_scope=None,
+        )
+        is None
+    )
+    assert (
+        _structural_observation_for_delivery(
+            reservation,
+            event_timestamp=request.event_timestamp,
+            event_data=event_data,
+            raw_x=request.x + 1,
+            raw_y=request.y,
+            coordinate_scope=None,
+        )
+        is None
+    )
+
+
+@pytest.mark.structural_qualification_contract
+def test_protected_values_are_excluded_by_each_provider() -> None:
+    secret = "correct horse battery staple"
+    windows_target = _Wrapper(
+        automation_id="password",
+        control_type="Edit",
+        name=secret,
+        role="Edit",
+        process_id=42,
+        is_password=True,
+    )
+    windows_target._top = windows_target
+    windows = WindowsUIAStructuralObserver(
+        runtime=SimpleNamespace(
+            from_point=lambda _x, _y: windows_target,
+            focused_element=lambda: windows_target,
+        )
+    ).observe(_receipt_request())
+
+    mac_runtime = _AXFakeRuntime()
+    mac_runtime.attributes[(mac_runtime.target, "AXProtectedContent")] = True
+    mac_runtime.attributes[(mac_runtime.target, "AXTitle")] = secret
+    macos = MacOSAXStructuralObserver(runtime=mac_runtime).observe(_receipt_request())
+
+    linux_runtime = _ATSpiFakeRuntime()
+    linux_runtime.target.name = secret
+    linux_runtime.is_protected = lambda element: element is linux_runtime.target
+    linux = LinuxATSpiStructuralObserver(runtime=linux_runtime).observe(_receipt_request())
+
+    for observation in (windows, macos, linux):
+        assert observation is not None
+        assert observation.element.protected_value is True
+        assert observation.element.name is None
+        assert secret not in observation.model_dump_json()
+
+
+@pytest.mark.structural_qualification_contract
+def test_post_action_observation_cannot_claim_action_target_identity() -> None:
+    request = _receipt_request(phase="post_action_unverified")
+    data = _observation(request).model_dump(mode="json")
+    data["action_target_eligible"] = True
+    with pytest.raises(ValueError, match="eligibility"):
+        StructuralObservation.model_validate(data)
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(
     os.environ.get("OPENADAPT_CAPTURE_PRODUCTION_QUALIFICATION") != "1",
     reason="requires the explicit interactive production qualification rig",
 )
-def test_live_native_structural_provider_returns_exact_focused_evidence() -> None:
+def test_live_native_structural_provider_matches_the_reviewed_fixture() -> None:
+    fixture = _load_and_claim_qualification_fixture()
     observer = create_structural_observer()
     assert observer is not None, "the native structural provider is required"
     expected_provider = {
@@ -915,18 +1472,115 @@ def test_live_native_structural_provider_returns_exact_focused_evidence() -> Non
         "darwin": "macos_ax",
         "linux": "linux_atspi",
     }["linux" if sys.platform.startswith("linux") else sys.platform]
-    observation = observe_structural_action(
-        observer,
-        StructuralObservationRequest(
-            event_timestamp=101.0,
-            action_name="press",
-        ),
+    assert fixture["provider"] == expected_provider
+    phase = "post_action_unverified" if sys.platform.startswith("linux") else "pre_action"
+    window_bounds = StructuralBounds.model_validate(fixture["window_bounds"])
+    capture_window = StructuralCaptureWindowBinding(
+        window_id=str(fixture["native_window_handle"]),
+        process_id=int(fixture["process_id"]),
+        process_start_time=float(fixture["process_start_time"]),
+        bounds=window_bounds,
+        scale_x=float(fixture["scale_x"]),
+        scale_y=float(fixture["scale_y"]),
+        geometry_generation=int(fixture["geometry_generation"]),
+        display_topology_sha256=str(fixture["display_topology_sha256"]),
     )
-    assert observation is not None
-    assert observation.provider == expected_provider
-    assert observation.query_kind == "focused"
-    assert observation.event_timestamp == 101.0
-    assert observation.element.model_dump(exclude_none=True)
-    assert observation.process is not None
-    assert observation.process.process_id is not None
-    assert observation.window is not None
+    assert psutil.Process(capture_window.process_id).create_time() == (
+        capture_window.process_start_time
+    )
+    live_topology = DesktopCaptureScope.current().snapshot()
+    assert live_topology["topology_sha256"] == (
+        capture_window.display_topology_sha256
+    )
+    point = fixture["point"]
+    protected_point = fixture["protected_point"]
+    assert set(point) == {"x", "y", "automation_id"}
+    assert set(protected_point) == {"x", "y", "automation_id"}
+    assert min(float(point["x"]), float(point["y"])) < 0, (
+        "the reviewed fixture must be on a negative-origin monitor"
+    )
+    assert capture_window.scale_x > 0 and capture_window.scale_y > 0
+
+    controller = BoundedStructuralObserver(observer)
+    try:
+        requests = [
+            StructuralObservationRequest(
+                event_timestamp=101.0,
+                receipt_monotonic_ns=time.monotonic_ns(),
+                action_kind="mouse_button",
+                action_name="click",
+                action_pressed=True,
+                x=float(point["x"]),
+                y=float(point["y"]),
+                observer_phase=phase,
+                capture_window=capture_window,
+                display_topology_sha256=capture_window.display_topology_sha256,
+            ),
+            StructuralObservationRequest(
+                event_timestamp=102.0,
+                receipt_monotonic_ns=time.monotonic_ns(),
+                action_kind="key",
+                action_name="press",
+                action_pressed=True,
+                observer_phase=phase,
+                capture_window=capture_window,
+                display_topology_sha256=capture_window.display_topology_sha256,
+            ),
+            StructuralObservationRequest(
+                event_timestamp=103.0,
+                receipt_monotonic_ns=time.monotonic_ns(),
+                action_kind="mouse_button",
+                action_name="click",
+                action_pressed=True,
+                x=float(protected_point["x"]),
+                y=float(protected_point["y"]),
+                observer_phase=phase,
+                capture_window=capture_window,
+                display_topology_sha256=capture_window.display_topology_sha256,
+            ),
+        ]
+        point_observation, focused_observation, protected_observation = [
+            controller.capture(request) for request in requests
+        ]
+    finally:
+        controller.stop()
+
+    assert point_observation is not None
+    assert point_observation.provider == expected_provider
+    assert point_observation.query_kind == "point"
+    assert point_observation.element.automation_id == point["automation_id"]
+    assert point_observation.process is not None
+    assert point_observation.process.process_id == capture_window.process_id
+    assert point_observation.window is not None
+    assert point_observation.window.bounds == window_bounds
+    if expected_provider != "linux_atspi":
+        assert (
+            point_observation.window.native_window_handle
+            == int(capture_window.window_id)
+        )
+    assert point_observation.element.bounds is not None
+    assert (
+        point_observation.element.bounds.left
+        <= float(point["x"])
+        < point_observation.element.bounds.right
+    )
+    assert (
+        point_observation.element.bounds.top
+        <= float(point["y"])
+        < point_observation.element.bounds.bottom
+    )
+    assert point_observation.completion_latency_ms <= 75
+
+    assert focused_observation is not None
+    assert focused_observation.query_kind == "focused"
+    assert (
+        focused_observation.element.automation_id
+        == fixture["focused_automation_id"]
+    )
+    assert focused_observation.completion_latency_ms <= 75
+
+    assert protected_observation is not None
+    assert protected_observation.element.automation_id == protected_point["automation_id"]
+    assert protected_observation.element.protected_value is True
+    assert protected_observation.element.name is None
+    assert protected_observation.completion_latency_ms <= 75

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import queue
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, TypeAlias
+from typing import Callable, Literal, TypeAlias
 
 
 class InputObserverError(RuntimeError):
@@ -78,6 +80,53 @@ ObservedInput: TypeAlias = (
     ObservedMouseMove | ObservedMouseButton | ObservedMouseScroll | ObservedKey
 )
 InputCallback: TypeAlias = Callable[[ObservedInput], None]
+
+
+@dataclass(frozen=True, slots=True)
+class NativeReceiptHint:
+    """Value-free action identity frozen inside one native OS callback."""
+
+    action_kind: Literal["key", "mouse_button", "mouse_scroll", "mouse_move"]
+    action_name: Literal["press", "release", "click", "scroll", "move"]
+    receipt_timestamp: float
+    receipt_monotonic_ns: int
+    pressed: bool | None = None
+    x: float | None = None
+    y: float | None = None
+    observer_phase: Literal["pre_action", "post_action_unverified"] = "pre_action"
+
+    def __post_init__(self) -> None:
+        if (self.x is None) != (self.y is None):
+            raise ValueError("native receipt coordinates must be complete or absent")
+        if self.action_kind == "key" and self.x is not None:
+            raise ValueError("native key receipts must not contain pointer coordinates")
+        if self.action_kind in {"mouse_button", "mouse_scroll", "mouse_move"}:
+            if self.x is None:
+                raise ValueError("native mouse receipts require pointer coordinates")
+        if self.action_kind in {"key", "mouse_button"} and self.pressed is None:
+            raise ValueError("native key/button receipts require a pressed state")
+        if self.action_kind in {"mouse_scroll", "mouse_move"} and self.pressed is not None:
+            raise ValueError("native move/scroll receipts must not claim a pressed state")
+        if not math.isfinite(self.receipt_timestamp) or self.receipt_timestamp < 0:
+            raise ValueError("native receipt wall time must be finite and non-negative")
+        if self.receipt_monotonic_ns < 0:
+            raise ValueError("native receipt monotonic time must be non-negative")
+
+    @classmethod
+    def now(
+        cls,
+        *,
+        receipt_timestamp: float | None = None,
+        **values: object,
+    ) -> "NativeReceiptHint":
+        """Build a receipt hint with both clocks from the callback thread."""
+        return cls(
+            receipt_timestamp=(
+                time.time() if receipt_timestamp is None else receipt_timestamp
+            ),
+            receipt_monotonic_ns=time.monotonic_ns(),
+            **values,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +262,11 @@ class ThreadedInputObserver(InputObserver):
     def _wake(self) -> None:
         """Wake a blocked event loop during shutdown, when needed."""
 
-    def _reserve_receipt(self, timestamp: float | None) -> object | None:
+    def _reserve_receipt(
+        self,
+        timestamp: float | None,
+        hint: NativeReceiptHint | None = None,
+    ) -> object | None:
         """Reserve source order at the first native receipt boundary."""
         reserve = getattr(self.callback, "_openadapt_input_receipt", None)
         with self._receipt_lock:
@@ -226,7 +279,18 @@ class ThreadedInputObserver(InputObserver):
                 raise InputObserverError(
                     "native input has no receipt timestamp for source-order reservation"
                 )
-            receipt = reserve(timestamp)
+            accepts_hint = bool(
+                getattr(
+                    self.callback,
+                    "_openadapt_input_receipt_accepts_hint",
+                    False,
+                )
+            )
+            receipt = (
+                reserve(timestamp, hint)
+                if hint is not None and accepts_hint
+                else reserve(timestamp)
+            )
             if receipt is not None:
                 self._unqueued_receipts.append(receipt)
         return receipt

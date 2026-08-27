@@ -27,11 +27,16 @@ from PIL import Image
 
 import openadapt_capture.recorder as recorder_module
 import openadapt_capture.window_capture as window_capture_module
+from openadapt_capture import utils
 from openadapt_capture.capture import CaptureSession
 from openadapt_capture.db import create_db, crud
 from openadapt_capture.desktop_capture import DesktopCaptureScope
 from openadapt_capture.events import WindowCaptureStateV2, window_geometry_epoch_sha256
-from openadapt_capture.input_observer import ObservedMouseButton, ThreadedInputObserver
+from openadapt_capture.input_observer import (
+    NativeReceiptHint,
+    ObservedMouseButton,
+    ThreadedInputObserver,
+)
 from openadapt_capture.recorder import (
     Event,
     NativeInputFrameBoundary,
@@ -49,6 +54,12 @@ from openadapt_capture.window_capture import (
     build_window_scope,
     translate_point,
 )
+
+
+@pytest.fixture
+def initialized_capture_clock() -> None:
+    """Initialize the authoritative clock for direct producer unit tests."""
+    utils.set_start_time()
 
 # ---------------------------------------------------------------------------
 # translate_point: exact inverse of flow's replay mapping
@@ -159,6 +170,7 @@ def test_native_receipt_snapshot_does_not_call_window_or_topology_apis(
 def test_screen_reader_discards_a_frame_with_concurrent_native_input(
     scope,
     monkeypatch,
+    initialized_capture_clock,
 ):
     boundary = NativeInputFrameBoundary()
     clean_results = iter((False, True))
@@ -214,7 +226,11 @@ def test_screen_reader_discards_a_frame_with_concurrent_native_input(
         journal.get_nowait()
 
 
-def test_terminal_frame_seals_native_input_before_commit(scope, monkeypatch):
+def test_terminal_frame_seals_native_input_before_commit(
+    scope,
+    monkeypatch,
+    initialized_capture_clock,
+):
     terminate = threading.Event()
     terminate.set()
     input_finished = threading.Event()
@@ -267,6 +283,7 @@ def test_terminal_frame_seals_native_input_before_commit(scope, monkeypatch):
 def test_terminal_frame_retries_an_input_dirty_capture_before_signaling(
     scope,
     monkeypatch,
+    initialized_capture_clock,
 ):
     monkeypatch.setattr(recorder_module.config, "SCREEN_CAPTURE_FPS", 0)
     terminate = threading.Event()
@@ -316,6 +333,7 @@ def test_terminal_frame_retries_an_input_dirty_capture_before_signaling(
 def test_terminal_frame_deadline_does_not_signal_without_a_clean_cut(
     scope,
     monkeypatch,
+    initialized_capture_clock,
 ):
     monkeypatch.setattr(recorder_module.config, "SCREEN_CAPTURE_FPS", 0)
     monkeypatch.setattr(recorder_module, "TERMINAL_FRAME_SEAL_TIMEOUT_SECONDS", 0.0)
@@ -664,7 +682,10 @@ def test_processor_refuses_a_native_action_without_a_terminal_after_frame(scope)
         )
 
 
-def test_input_observation_precedes_an_in_flight_window_frame(fake):
+def test_input_observation_precedes_an_in_flight_window_frame(
+    fake,
+    initialized_capture_clock,
+):
     capture_entered = threading.Event()
     release_capture = threading.Event()
     terminate = threading.Event()
@@ -853,7 +874,18 @@ def test_native_receipt_reserves_before_async_input_delivery(scope, monkeypatch)
         pressed=True,
         timestamp=1.5,
     )
-    receipt = observer._reserve_receipt(native_event.timestamp)
+    receipt = observer._reserve_receipt(
+        native_event.timestamp,
+            NativeReceiptHint.now(
+                receipt_timestamp=native_event.timestamp,
+                action_kind="mouse_button",
+            action_name="click",
+            pressed=True,
+            x=native_event.x,
+            y=native_event.y,
+            observer_phase="pre_action",
+        ),
+    )
     observer._emit(
         native_event,
         receipt=receipt,
@@ -1212,7 +1244,11 @@ class TestWindowCaptureScope:
                 window_scope=scope,
             )
 
-    def test_screen_reader_retains_terminal_frame_after_input_finishes(self, scope):
+    def test_screen_reader_retains_terminal_frame_after_input_finishes(
+        self,
+        scope,
+        initialized_capture_clock,
+    ):
         journal = OrderedEventJournal()
         terminate = threading.Event()
         terminate.set()

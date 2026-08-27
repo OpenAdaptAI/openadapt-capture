@@ -23,6 +23,7 @@ from openadapt_capture.structural import (
     StructuralObservationRequest,
     StructuralProcessIdentity,
     StructuralWindowIdentity,
+    structural_observation_receipt_fields,
 )
 
 _logger = logging.getLogger(__name__)
@@ -151,6 +152,10 @@ def _process_name(pid: int) -> str | None:
 
 def _element_fields(runtime: Any, element: Any) -> dict[str, Any]:
     role = _text(runtime.attribute(element, "AXRole"))
+    subrole = _text(runtime.attribute(element, "AXSubrole"))
+    protected = bool(runtime.attribute(element, "AXProtectedContent")) or (
+        (subrole or role or "").casefold() in {"axsecuretextfield", "secure text field"}
+    )
     title = _text(runtime.attribute(element, "AXTitle"))
     description = _text(runtime.attribute(element, "AXDescription"))
     action_reader = getattr(runtime, "actions", None)
@@ -164,12 +169,13 @@ def _element_fields(runtime: Any, element: Any) -> dict[str, Any]:
         "automation_id": _text(runtime.attribute(element, "AXIdentifier")),
         "role": role,
         "role_source": "macos_ax_role" if role else None,
-        "control_type": _text(runtime.attribute(element, "AXSubrole")) or role,
-        "name": title or description,
-        "class_name": _text(runtime.attribute(element, "AXSubrole")),
+        "control_type": subrole or role,
+        "name": None if protected else title or description,
+        "class_name": subrole,
         "native_window_handle": _integer(runtime.attribute(element, "AXWindowNumber")),
         "bounds": runtime.bounds(element),
         "supported_patterns": supported_patterns,
+        "protected_value": protected,
     }
 
 
@@ -177,6 +183,7 @@ def _ancestor(runtime: Any, element: Any) -> StructuralAncestor | None:
     fields = _element_fields(runtime, element)
     fields.pop("native_window_handle", None)
     fields.pop("supported_patterns", None)
+    fields.pop("protected_value", None)
     ancestor = StructuralAncestor(**fields)
     return ancestor if ancestor.model_dump(exclude_none=True) else None
 
@@ -284,7 +291,6 @@ class MacOSAXStructuralObserver:
             )
         return StructuralObservation(
             provider="macos_ax",
-            event_timestamp=request.event_timestamp,
             observed_at=self.clock(),
             query_kind=query_kind,
             element=observed_element,
@@ -295,6 +301,7 @@ class MacOSAXStructuralObserver:
                 element,
                 self.maximum_ancestry_depth,
             ),
+            **structural_observation_receipt_fields(request),
         )
 
 

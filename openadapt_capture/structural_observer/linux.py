@@ -23,6 +23,7 @@ from openadapt_capture.structural import (
     StructuralObservationRequest,
     StructuralProcessIdentity,
     StructuralWindowIdentity,
+    structural_observation_receipt_fields,
 )
 
 _logger = logging.getLogger(__name__)
@@ -102,6 +103,10 @@ class _GIAtspiRuntime:
             return bool(state_set.contains(state))
         except Exception:
             return False
+
+    def is_protected(self, element: Any) -> bool:
+        """Return whether AT-SPI marks this element as protected content."""
+        return self._state_contains(element, "PROTECTED")
 
     def children(self, element: Any) -> list[Any]:
         count = _integer(_call(element, "get_child_count", "getChildCount"))
@@ -318,7 +323,13 @@ def _process_name(pid: int) -> str | None:
 def _fields(runtime: Any, element: Any) -> dict[str, Any]:
     attributes = runtime.attributes(element)
     role = runtime.role_name(element)
-    name = _text(getattr(element, "name", None)) or _text(_call(element, "get_name", "getName"))
+    protected_reader = getattr(runtime, "is_protected", None)
+    protected = bool(protected_reader(element)) if callable(protected_reader) else False
+    name = None
+    if not protected:
+        name = _text(getattr(element, "name", None)) or _text(
+            _call(element, "get_name", "getName")
+        )
     return {
         "automation_id": _text(
             _call(element, "get_accessible_id", "get_id")
@@ -332,6 +343,7 @@ def _fields(runtime: Any, element: Any) -> dict[str, Any]:
         "class_name": _text(attributes.get("class") or attributes.get("toolkit")),
         "bounds": runtime.bounds(element),
         "supported_patterns": runtime.action_names(element),
+        "protected_value": protected,
     }
 
 
@@ -344,6 +356,7 @@ def _ancestry(runtime: Any, element: Any, maximum_depth: int):
             break
         fields = _fields(runtime, current)
         fields.pop("supported_patterns", None)
+        fields.pop("protected_value", None)
         ancestor = StructuralAncestor(**fields)
         if ancestor.model_dump(exclude_none=True):
             result.append(ancestor)
@@ -453,7 +466,6 @@ class LinuxATSpiStructuralObserver:
             )
         return StructuralObservation(
             provider="linux_atspi",
-            event_timestamp=request.event_timestamp,
             observed_at=self.clock(),
             query_kind=query_kind,
             element=observed_element,
@@ -464,6 +476,7 @@ class LinuxATSpiStructuralObserver:
                 element,
                 self.maximum_ancestry_depth,
             ),
+            **structural_observation_receipt_fields(request),
         )
 
 

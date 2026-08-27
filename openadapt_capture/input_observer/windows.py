@@ -20,6 +20,7 @@ from .base import (
     InputObserverError,
     InputObserverPermissionError,
     InputObserverUnavailableError,
+    NativeReceiptHint,
     ObservedInput,
     ObservedKey,
     ObservedMouseButton,
@@ -928,6 +929,7 @@ class WindowsInputObserver(ThreadedInputObserver):
                 self._begin_native_callback()
                 callback_entered = True
                 timestamp = self._clock()
+                receipt_monotonic_ns = time.monotonic_ns()
                 payload = ctypes.cast(
                     lparam,
                     ctypes.POINTER(KBDLLHOOKSTRUCT),
@@ -936,7 +938,21 @@ class WindowsInputObserver(ThreadedInputObserver):
                 if injected:
                     self._mark_native_activity()
                 else:
-                    receipt = self._reserve_receipt(timestamp)
+                    receipt = self._reserve_receipt(
+                        timestamp,
+                        NativeReceiptHint(
+                            action_kind="key",
+                            action_name=(
+                                "press"
+                                if wparam in {WM_KEYDOWN, WM_SYSKEYDOWN}
+                                else "release"
+                            ),
+                            pressed=wparam in {WM_KEYDOWN, WM_SYSKEYDOWN},
+                            observer_phase="pre_action",
+                            receipt_timestamp=timestamp,
+                            receipt_monotonic_ns=receipt_monotonic_ns,
+                        ),
+                    )
                     keyboard_layout = self._foreground_keyboard_layout()
                     self._enqueue_input(
                         _RawKeyboardTransition(
@@ -985,6 +1001,7 @@ class WindowsInputObserver(ThreadedInputObserver):
                     self._begin_native_callback()
                     callback_entered = True
                     timestamp = self._clock()
+                    receipt_monotonic_ns = time.monotonic_ns()
                     payload = ctypes.cast(
                         lparam,
                         ctypes.POINTER(MSLLHOOKSTRUCT),
@@ -996,7 +1013,51 @@ class WindowsInputObserver(ThreadedInputObserver):
                     if injected:
                         self._mark_native_activity()
                     else:
-                        receipt = self._reserve_receipt(timestamp)
+                        if wparam in _BUTTON_MESSAGES:
+                            _button, pressed = _BUTTON_MESSAGES[wparam]
+                            hint = NativeReceiptHint(
+                                action_kind="mouse_button",
+                                action_name="click",
+                                pressed=pressed,
+                                x=float(payload.pt.x),
+                                y=float(payload.pt.y),
+                                observer_phase="pre_action",
+                                receipt_timestamp=timestamp,
+                                receipt_monotonic_ns=receipt_monotonic_ns,
+                            )
+                        elif wparam in {WM_XBUTTONDOWN, WM_XBUTTONUP}:
+                            pressed = wparam == WM_XBUTTONDOWN
+                            hint = NativeReceiptHint(
+                                action_kind="mouse_button",
+                                action_name="click",
+                                pressed=pressed,
+                                x=float(payload.pt.x),
+                                y=float(payload.pt.y),
+                                observer_phase="pre_action",
+                                receipt_timestamp=timestamp,
+                                receipt_monotonic_ns=receipt_monotonic_ns,
+                            )
+                        elif wparam in {WM_MOUSEWHEEL, WM_MOUSEHWHEEL}:
+                            hint = NativeReceiptHint(
+                                action_kind="mouse_scroll",
+                                action_name="scroll",
+                                x=float(payload.pt.x),
+                                y=float(payload.pt.y),
+                                observer_phase="pre_action",
+                                receipt_timestamp=timestamp,
+                                receipt_monotonic_ns=receipt_monotonic_ns,
+                            )
+                        else:
+                            hint = NativeReceiptHint(
+                                action_kind="mouse_move",
+                                action_name="move",
+                                x=float(payload.pt.x),
+                                y=float(payload.pt.y),
+                                observer_phase="pre_action",
+                                receipt_timestamp=timestamp,
+                                receipt_monotonic_ns=receipt_monotonic_ns,
+                            )
+                        receipt = self._reserve_receipt(timestamp, hint)
                         self._enqueue_input(
                             _RawMouseTransition(
                                 message=wparam,

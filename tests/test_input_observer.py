@@ -733,8 +733,6 @@ def test_recorder_uses_one_observer_and_preserves_cross_device_receipt_order(
 
     def create(callback, **kwargs):
         factory_calls.append(kwargs)
-        callback._openadapt_delivery_thread_start()
-        callback._openadapt_delivery_thread_stop()
         return FakeObserver(callback)
 
     monkeypatch.setattr(recorder_module, "create_input_observer", create)

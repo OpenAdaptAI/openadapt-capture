@@ -136,6 +136,7 @@ python_files = ["test_*.py"]
 asyncio_mode = "auto"
 markers = [
     "slow: marks tests as slow / integration (deselect with '-m \"not slow\"')",
+    "structural_qualification_contract: receipt-time structural safety contract",
 ]
 
 [tool.semantic_release]

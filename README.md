@@ -196,6 +196,17 @@ and ancestry. Windows UIA also records exact candidate cardinality within the
 top-level window. Unavailable values remain absent. Capture never infers a
 structural field from coordinates or pixels.
 
+Windows and macOS take the optional lookup before the native hook returns.
+The bounded lookup can add at most 75 milliseconds to a captured action. A
+timeout, provider failure, or process, window, action, coordinate, geometry,
+or topology mismatch omits the optional observation. It cannot stop later
+input, frame capture, or shutdown. Linux X RECORD reports input after server
+dispatch. Capture labels its AT-SPI evidence
+`post_action_unverified`, prevents it from becoming action-target identity, and
+omits it for focus-changing Tab actions. Password and protected controls keep
+their structural role and stable identifier, but Capture excludes their
+accessible name.
+
 Capture stores this evidence in `recording.db` and exposes it on raw events and
 processed `Action` objects. The field is optional, so existing recordings still
 load unchanged. Native observation is enabled by default when its provider is
@@ -424,6 +435,7 @@ for the evidence behind current maturity labels.
 | `transcribe` | Local openai-whisper transcription |
 | `privacy` | `openadapt-privacy` dependency for explicit integrations; no automatic scrubbing |
 | `share` | Explicit Magic Wormhole transfer |
+| `linux` | PyGObject binding for Linux AT-SPI structural observation |
 | `all` | All optional dependencies |
 
 Both transcription extras are installed by the user into their own

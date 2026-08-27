@@ -27,6 +27,7 @@ from openadapt_capture.structural import (
     StructuralObservationRequest,
     StructuralProcessIdentity,
     StructuralWindowIdentity,
+    structural_observation_receipt_fields,
 )
 
 _logger = logging.getLogger(__name__)
@@ -239,6 +240,10 @@ def _element_fields(wrapper: Any) -> dict[str, Any]:
     if info is None:
         return {}
     role = _present_string(_safe_call(wrapper, "friendly_class_name"))
+    protected = bool(
+        _safe_value(info, "is_password")
+        or _safe_value(info, "password")
+    )
     return {
         "automation_id": _present_string(
             _safe_value(info, "automation_id")
@@ -247,13 +252,14 @@ def _element_fields(wrapper: Any) -> dict[str, Any]:
         "role": role,
         "role_source": "pywinauto_friendly_class" if role else None,
         "control_type": _present_string(_safe_value(info, "control_type")),
-        "name": _present_string(_safe_value(info, "name")),
+        "name": None if protected else _present_string(_safe_value(info, "name")),
         "class_name": _present_string(_safe_value(info, "class_name")),
         "framework_id": _present_string(_safe_value(info, "framework_id")),
         "native_window_handle": _present_int(
             _safe_value(info, "handle") or _safe_value(wrapper, "handle")
         ),
         "bounds": _bounds(_safe_value(info, "rectangle")),
+        "protected_value": protected,
     }
 
 
@@ -279,6 +285,7 @@ def _as_ancestor(wrapper: Any) -> StructuralAncestor | None:
     fields = _element_fields(wrapper)
     fields.pop("framework_id", None)
     fields.pop("native_window_handle", None)
+    fields.pop("protected_value", None)
     ancestor = StructuralAncestor(**fields)
     if not ancestor.model_dump(exclude_none=True):
         return None
@@ -417,7 +424,6 @@ def _observe_with_runtime(
     candidate_count, candidate_context = _candidate_cardinality(target)
     return StructuralObservation(
         provider="windows_uia",
-        event_timestamp=request.event_timestamp,
         observed_at=clock(),
         query_kind=query_kind,
         element=element,
@@ -429,6 +435,7 @@ def _observe_with_runtime(
         ),
         candidate_count=candidate_count,
         candidate_context=candidate_context,
+        **structural_observation_receipt_fields(request),
     )
 
 

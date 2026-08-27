@@ -610,6 +610,7 @@ def test_device_stream_reserves_receipt_before_delivered_event_correlation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reserved_timestamps = []
+    receipt_hints = []
 
     class Receipt:
         finished = False
@@ -620,11 +621,13 @@ def test_device_stream_reserves_receipt_before_delivered_event_correlation(
     def consume(_event) -> None:
         return
 
-    def reserve(timestamp):
+    def reserve(timestamp, hint):
         reserved_timestamps.append(timestamp)
+        receipt_hints.append(hint)
         return Receipt()
 
     setattr(consume, "_openadapt_input_receipt", reserve)
+    setattr(consume, "_openadapt_input_receipt_accepts_hint", True)
     observer = LinuxXInputObserver(
         consume,
         observe_keyboard=True,
@@ -653,6 +656,14 @@ def test_device_stream_reserves_receipt_before_delivered_event_correlation(
     )
 
     assert reserved_timestamps == [100.0]
+    assert receipt_hints[0].action_kind == "key"
+    assert receipt_hints[0].action_name == "press"
+    assert receipt_hints[0].pressed is True
+    assert receipt_hints[0].observer_phase == "post_action_unverified"
+    assert receipt_hints[0].receipt_timestamp == 100.0
+    assert receipt_hints[0].receipt_monotonic_ns > 0
+    assert not hasattr(receipt_hints[0], "key_char")
+    assert not hasattr(receipt_hints[0], "key_name")
     assert observer._pending is not None
     assert observer._pending.receipt is not None
 

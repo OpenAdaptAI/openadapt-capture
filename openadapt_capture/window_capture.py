@@ -537,6 +537,40 @@ class WindowCaptureScope:
             )
         return window, scale_x, scale_y, content_rect, generation
 
+    def structural_binding_for_reserved_geometry(
+        self,
+        geometry: tuple[TargetWindow, float, float, tuple[int, int, int, int], int],
+    ) -> dict[str, object]:
+        """Return the exact privacy-safe window epoch frozen at receipt."""
+        window, scale_x, scale_y, _content_rect, generation = geometry
+        with self._lock:
+            topology = self._display_topology
+        topology_sha256 = topology.get("topology_sha256") if topology else None
+        if not isinstance(topology_sha256, str) or len(topology_sha256) != 64:
+            raise WindowCaptureError(
+                "window action has no exact display-topology digest at receipt"
+            )
+        if window.process_start_time is None:
+            raise WindowCaptureError(
+                "window action has no process start identity at receipt"
+            )
+        left, top, width, height = window.bounds
+        return {
+            "window_id": str(window.window_id),
+            "process_id": window.pid,
+            "process_start_time": window.process_start_time,
+            "bounds": {
+                "left": left,
+                "top": top,
+                "right": left + width,
+                "bottom": top + height,
+            },
+            "scale_x": scale_x,
+            "scale_y": scale_y,
+            "geometry_generation": generation,
+            "display_topology_sha256": topology_sha256,
+        }
+
     def _assert_reserved_geometry_current(
         self,
         geometry: tuple[TargetWindow, float, float, tuple[int, int, int, int], int],
