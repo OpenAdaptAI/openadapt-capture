@@ -77,7 +77,9 @@ def test_distribution_validator_requires_every_native_observer(tmp_path) -> None
         verify_distribution(wheel)
 
 
-def test_distribution_validator_requires_the_linux_package_extra(tmp_path) -> None:
+def test_distribution_validator_requires_the_reviewed_linux_package_extra(
+    tmp_path,
+) -> None:
     wheel = tmp_path / "openadapt_capture-1.2.2-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         for path in REQUIRED_OBSERVER_PATHS:
@@ -89,6 +91,25 @@ def test_distribution_validator_requires_the_linux_package_extra(tmp_path) -> No
         )
 
     with pytest.raises(AssertionError, match="Linux AT-SPI package extra"):
+        verify_distribution(wheel)
+
+
+def test_distribution_validator_rejects_an_unbounded_pygobject_extra(
+    tmp_path,
+) -> None:
+    wheel = tmp_path / "openadapt_capture-1.2.2-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for path in REQUIRED_OBSERVER_PATHS:
+            archive.writestr(path, "")
+        archive.writestr("openadapt_capture-1.2.2.dist-info/licenses/LICENSE", "MIT\n")
+        archive.writestr(
+            "openadapt_capture-1.2.2.dist-info/METADATA",
+            "Name: openadapt-capture\n"
+            "Provides-Extra: linux\n"
+            "Requires-Dist: PyGObject>=3.46; extra == 'linux'\n",
+        )
+
+    with pytest.raises(AssertionError, match="reviewed PyGObject range"):
         verify_distribution(wheel)
 
 

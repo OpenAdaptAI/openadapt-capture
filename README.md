@@ -209,7 +209,10 @@ to 512 characters per field. Longer provider values are omitted rather than
 truncated, so partial text is never presented to the compiler as exact identity
 evidence. Capture emits `windows_uia`, `macos_ax`, or `linux_atspi`. macOS
 requires Accessibility permission. Linux requires an available desktop AT-SPI
-bus, the system AT-SPI typelib/runtime, and the `linux` package extra:
+bus and the system AT-SPI typelib. Install your distribution's PyGObject build
+packages and `gir1.2-atspi-2.0` first. The
+[PyGObject install guide](https://pygobject.gnome.org/getting_started.html)
+lists the current package names. Then install the `linux` extra:
 
 ```bash
 pip install "openadapt-capture[linux]"

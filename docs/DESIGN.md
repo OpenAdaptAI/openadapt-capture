@@ -127,9 +127,10 @@ neighboring control. Provider text has strict length and depth bounds. A
 transient provider failure omits the optional observation without corrupting
 the screen and input evidence.
 
-The Linux provider uses the modern GObject AT-SPI binding. The `linux` package
-extra installs PyGObject. The host supplies the AT-SPI typelib/runtime and an
-interactive desktop accessibility bus.
+The Linux provider uses the GObject AT-SPI binding. The `linux` package extra
+installs the reviewed `PyGObject>=3.46,<3.50` range, which supports systems with
+GLib 2.64 or newer. The host supplies the PyGObject build packages, the AT-SPI
+typelib/runtime, and an interactive desktop accessibility bus.
 
 The native provider describes the local accessibility tree. It does not
 describe controls inside an RDP or Citrix pixel stream.
