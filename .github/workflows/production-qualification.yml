@@ -64,18 +64,30 @@ jobs:
           uv build --wheel --sdist
           python scripts/verify_distribution.py dist/*
           python scripts/check_source_boundary.py --require-dist
-          (
-            cd dist
-            sha256sum -- *.whl *.tar.gz > SHA256SUMS
-          )
+          mkdir -p candidate evidence
+          cp -- dist/*.whl dist/*.tar.gz candidate/
+          python scripts/release_candidate.py inventory \
+            --dist candidate \
+            --output evidence/release-artifact-inventory.json
+          sha256sum -- candidate/*.whl candidate/*.tar.gz > evidence/SHA256SUMS
 
       - name: Upload the exact candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: capture-candidate-${{ github.sha }}
-          path: dist/
+          path: |
+            candidate/*.whl
+            candidate/*.tar.gz
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90
+
+      - name: Upload candidate transport evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: capture-candidate-evidence-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 90
 
   clean-wheel:
     name: Clean candidate wheel (${{ matrix.os }})

@@ -112,3 +112,26 @@ def test_native_observers_are_part_of_each_interactive_qualification() -> None:
     for job in (linux, macos, windows):
         assert 'tests/test_structural_observation.py"' in job
         assert 'OPENADAPT_CAPTURE_PRODUCTION_QUALIFICATION: "1"' in job
+
+
+def test_qualification_separates_publishable_candidate_from_transport_evidence() -> None:
+    workflow = (ROOT / ".github/workflows/production-qualification.yml").read_text(
+        encoding="utf-8"
+    )
+    build = workflow[
+        workflow.index("\n  build-candidate:") : workflow.index("\n  clean-wheel:")
+    ]
+    candidate_upload = build[
+        build.index("- name: Upload the exact candidate") : build.index(
+            "- name: Upload candidate transport evidence"
+        )
+    ]
+
+    assert "python scripts/release_candidate.py inventory" in build
+    assert "--dist candidate" in build
+    assert "candidate/*.whl" in candidate_upload
+    assert "candidate/*.tar.gz" in candidate_upload
+    assert "SHA256SUMS" not in candidate_upload
+    assert "release-artifact-inventory.json" not in candidate_upload
+    assert "retention-days: 90" in candidate_upload
+    assert "name: capture-candidate-evidence-${{ github.sha }}" in build
