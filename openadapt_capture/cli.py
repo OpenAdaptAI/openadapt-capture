@@ -11,6 +11,97 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def browser_observer_host_manifest(
+    output_path: str,
+    executable_path: str | None = None,
+    replace: bool = False,
+) -> None:
+    """Create the owner-only Chrome native messaging host manifest.
+
+    This command does not change a browser profile or the Windows registry.
+    The OpenAdapt installer places the resulting file in Chrome's platform
+    directory after it verifies the admitted Capture release.
+
+    Args:
+        output_path: Exact JSON manifest path to create.
+        executable_path: Absolute native-host executable. The installed
+            capture-browser-observer-host command is used when omitted.
+        replace: Replace only the exact output file when true.
+    """
+    import shutil
+
+    from openadapt_capture.browser_observer_native import write_native_host_manifest
+
+    executable = executable_path or shutil.which("capture-browser-observer-host")
+    if executable is None:
+        raise SystemExit("capture-browser-observer-host is not installed on PATH")
+    output = write_native_host_manifest(
+        output_path,
+        executable_path=Path(executable).expanduser().absolute(),
+        replace=replace,
+    )
+    print(output)
+
+
+def browser_observer_provision(
+    extension_zip: str,
+    sbom: str,
+    version: str,
+    source_commit: str,
+    zip_sha256: str,
+    sbom_sha256: str,
+    install_root: str,
+    native_host_manifest_path: str,
+    executable_path: str | None = None,
+) -> None:
+    """Verify and provision one admitted observer and its native-host manifest."""
+
+    import json
+    import shutil
+
+    from openadapt_capture.browser_observer_artifacts import (
+        provision_browser_observer_extension,
+        verify_browser_observer_artifacts,
+    )
+    from openadapt_capture.browser_observer_native import write_native_host_manifest
+
+    executable = executable_path or shutil.which("capture-browser-observer-host")
+    if executable is None:
+        raise SystemExit("capture-browser-observer-host is not installed on PATH")
+    artifact = verify_browser_observer_artifacts(
+        zip_path=extension_zip,
+        sbom_path=sbom,
+        expected_version=version,
+        expected_source_commit=source_commit,
+        expected_zip_sha256=zip_sha256,
+        expected_sbom_sha256=sbom_sha256,
+    )
+    extension_path = provision_browser_observer_extension(
+        artifact,
+        install_root=install_root,
+    )
+    manifest_path = write_native_host_manifest(
+        native_host_manifest_path,
+        executable_path=Path(executable).expanduser().absolute(),
+        replace=True,
+    )
+    print(
+        json.dumps(
+            {
+                "extension_path": str(extension_path),
+                "native_host_manifest_path": str(manifest_path),
+                "version": artifact.version,
+                "source_commit": artifact.source_commit,
+                "zip_sha256": artifact.zip_sha256,
+                "sbom_sha256": artifact.sbom_sha256,
+                "inventory_sha256": artifact.inventory_sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
 def record(
     output_dir: str,
     description: str | None = None,
@@ -44,10 +135,12 @@ def record(
     """
     if browser_events:
         print(
-            "The Chrome-extension WebSocket prototype is not part of the "
-            "supported openadapt-capture runtime."
+            "The legacy Chrome WebSocket recorder is disabled."
         )
-        print("Use openadapt-flow Playwright launch or attach recording instead.")
+        print(
+            "Use openadapt-flow Playwright launch or attach recording. "
+            "Its optional Chrome observer does not use --browser-events."
+        )
         raise SystemExit(2)
 
     import time
@@ -461,6 +554,8 @@ def main() -> None:
         "record": record,
         "status": status,
         "stop": stop,
+        "browser-observer-host-manifest": browser_observer_host_manifest,
+        "browser-observer-provision": browser_observer_provision,
         "visualize": visualize,
         "info": info,
         "transcribe": transcribe,

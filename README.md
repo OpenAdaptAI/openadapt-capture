@@ -58,24 +58,34 @@ Documentation for the whole stack lives at
 | --- | --- |
 | Windows, macOS, and Linux demonstrations | `openadapt-capture` records native input and action-gated screen video; Windows can also retain action-time UI Automation evidence. `openadapt-flow` converts the session into compiler input. |
 | RDP and Citrix/VDI demonstrations | `openadapt-capture` records the selected client window in its own pixel space. The remote application remains externally black-box, and `openadapt-flow` converts the session into compiler input. |
-| Browser demonstrations | `openadapt-flow` uses its Playwright recorder. It can launch Chromium or attach to one existing signed-in local Chromium tab. It does not require this package. |
-| Chrome extension in this repository | Repository-only prototype. Its bridge and legacy direct replay are excluded from the wheel and source archive. It is not the supported recorder. |
+| Browser demonstrations | `openadapt-flow` uses its Playwright recorder. It can launch Chromium or attach to an existing signed-in local Chromium tab. Playwright owns recording, actuation, frames, verification, and replay. |
+| Optional Chrome structural observer | The admitted extension can add a second, passive DOM observation to a Flow launch or attach recording. Capture supplies the authenticated native host and strict protocol. The extension cannot click, type, compile, or replay. |
 
 The supported browser path stays inside `openadapt-flow`. Playwright owns the
 browser context and can bind DOM identity, field geometry, ordered before/after
-frames, and source-time secret redaction to one recording contract. A Chrome
-extension cannot guarantee that contract across browser profiles, extension
-permissions, browser-internal pages, and process or tab disconnects.
+frames, and source-time secret redaction to one recording contract. The
+extension adds evidence to that contract. It doesn't create another recording
+format.
 
-The extension remains useful as a research observer and as a possible future
-source of optional DOM evidence. It should become a supported auxiliary
-observer only after it emits the shared event schema, has a fail-closed
-connection and permission contract, redacts secret fields before persistence,
-and passes the same compiler qualification as the Playwright path. It should
-not replace the Playwright recorder merely to make the package layout uniform,
-create a second compiler format, or bypass governed replay. Flow supports an
-existing authenticated browser session through its local-loopback CDP attach
-mode.
+The native host accepts one owner-only, expiring session capability on IPv4
+loopback. It binds the admitted extension ID, one extension installation, each
+user-approved tab, the top document, child frames, and a contiguous message
+sequence. A reconnect resumes after the last acknowledged sequence. A gap,
+conflicting duplicate, invalid origin, full queue, or expired reconnect window
+fails the observer session. Flow can then refuse an observer-backed recording.
+
+The content script never sends keys, input values, HTML, selectors, URLs, or
+element text. It keeps one bounded source-redacted candidate at the target
+event boundary. Flow claims that candidate by its exact document clock, action,
+retained frame, tab, document, navigation epoch, and viewport epoch. Only the
+claimed observation crosses the native bridge. It contains field geometry and
+a session-salted identity digest for an ordinary element. Password, payment,
+declared-secret, and
+autocomplete-sensitive fields withhold that digest. After a document contains
+a sensitive field value, all later element identities in that document remain
+withheld. The observer retains resize and navigation epochs so Flow can bind an
+observation to the exact Playwright frame. An ambiguous required association
+leaves the recording incomplete.
 
 ## Use it with OpenAdapt
 
@@ -377,16 +387,16 @@ boundary. `openadapt-flow` still refuses desktop `--secret` authoring until its
 source-time field-redaction contract can prove that sensitive values were not
 retained. Review the desktop guide before recording sensitive workflows.
 
-The repository-only Chrome extension prototype can observe pages across its
-configured host permissions. Its development bridge can emit DOM text and
-keyboard events to an unauthenticated local WebSocket and contains legacy
-direct DOM replay. These files are excluded from the package wheel and source
-archive. The production Capture API does not export the bridge, and the former
-`browser_events=True` opt-in fails before it binds a listener. The prototype
-does not provide source-time secret exclusion, authenticated
-profile/tab/document/session binding, acknowledged ordered delivery, or exact
-frame-to-event evidence. Treat it as development code. Do not deploy it in a
-sensitive browser profile.
+The Chrome observer requests access only to an origin named by the active Flow
+session. The operator grants that origin from the target tab. The extension has
+no ambient `<all_urls>` permission and no persistent content-script match. Its
+native messages carry geometry, lifecycle state, and a salted identity digest.
+They don't carry a field value, keystroke, full URL, DOM text, or HTML.
+
+The old `browser_events=True` recorder and its unauthenticated WebSocket source
+file remain disabled for compatibility with old local captures. They are not
+in the wheel, source archive, extension ZIP, or public API. The admitted
+extension ZIP contains no execution message or direct DOM replay code.
 
 Use Flow's supported attach recorder when an existing SSO or 2FA browser
 session is required. See the
@@ -405,11 +415,13 @@ session is required. See the
   unmapped keys instead of silently compiling an incomplete workflow.
 - Display hot-plug, rotation, resolution changes, and scale changes require a
   new recording because one media stream has one fixed virtual-desktop viewport.
-- Browser-extension installation, bridge code, and direct replay are not part
-  of the published Capture artifacts or supported browser path. Promotion
-  requires the shared Flow schema, source-time secret exclusion, authenticated
-  and sequenced delivery, exact frame binding, compiler integration, and
-  removal of direct replay.
+- The optional Chrome observer needs its exact release ZIP, SPDX SBOM, native
+  host registration, and a matching Flow version. A different extension ID,
+  missing native host, unapproved origin, or protocol mismatch fails before
+  Flow accepts observer evidence.
+- Chrome internal pages and another extension's pages cannot be observed.
+  Flow's Playwright recorder remains available when the optional observer is
+  not enabled.
 
 See the organization-wide
 [repository lifecycle registry](https://github.com/OpenAdaptAI/.github/blob/main/REPOSITORY_LIFECYCLE.md)

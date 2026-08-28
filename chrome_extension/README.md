@@ -1,52 +1,105 @@
-# OpenAdapt Capture Chrome extension prototype
+# OpenAdapt Browser Observer
 
-This directory is a development prototype. It is not the supported OpenAdapt
-browser recorder or a governed replay path.
+This extension adds passive DOM structure to an OpenAdapt Flow browser
+recording. Flow's Playwright path still records the demonstration, retains each
+frame, performs governed actions, and verifies the result. The extension has no
+click, type, compiler, or replay command.
 
-Use the Playwright recorder in `openadapt-flow` for browser workflows. It can
-launch a clean Chromium browser or attach to one existing signed-in local
-Chromium tab. Both modes retain the compiler's event, DOM identity, exact
-before/after frame, field geometry, and source-time secret-redaction contract.
-See the
-[`openadapt-flow` browser recording guide](https://github.com/OpenAdaptAI/openadapt-flow/blob/main/docs/BROWSER_RECORDING.md).
+## Release files
 
-## Current prototype behavior
+An admitted Capture GitHub Release contains these browser observer assets:
 
-The extension can collect DOM events and visible HTML and send them to the
-Capture WebSocket bridge on `localhost:8765`. It also contains legacy direct
-DOM replay code.
+- `openadapt-capture-browser-observer-<version>.zip`
+- `openadapt-capture-browser-observer-<version>.spdx.json`
 
-The extension and bridge are repository-only development files. The published
-wheel and source archive exclude the bridge. The package API does not export
-it, and the package does not install its WebSocket dependency. The former
-browser-event recording opt-in fails before it binds a listener.
+The ZIP contains `browser-observer.inventory.json`. That file binds the exact
+source commit, extension ID, protocol, version, member size, and member SHA-256.
+The SPDX file binds the ZIP digest. The Capture release admission binds both
+assets beside the exact wheel and source archive. A ZIP outside that four-file
+release set isn't an admitted observer.
 
-Do not use it in a sensitive browser profile. The current implementation does
-not provide these supported-path controls:
+The manifest public key fixes the unpacked extension ID at
+`nalmeopboaacfhieiblejbabajicjmkb`. The native host accepts only that Chrome
+origin.
 
-- source-time password and declared-secret exclusion;
-- authenticated profile, tab, document, run, and recording-session binding;
-- an acknowledged, ordered event sequence with reconnect recovery;
-- exact retained frame-to-event binding in one coordinate system;
-- compiler integration through the shared Flow recording schema; or
-- governed replay with identity, policy, fresh-frame, and effect checks.
+## Session setup
 
-## Promotion contract
+Install the exact admitted `openadapt-capture` wheel. Then run
+`capture browser-observer-provision` with the release version, source commit,
+ZIP digest, SBOM digest, install root, and Chrome native-host manifest path.
+The command verifies both assets, checks every extension member, extracts the
+ZIP into a digest-addressed owner-only directory, and writes the exact native
+host manifest. Flow verifies the installation again before a launched browser
+loads it. An attached browser uses the same release identity.
 
-This extension can become a supported alternate acquisition transport. It
-must first:
+The package does not register a Chrome Web Store item. A managed installer can
+place the verified directory and native-host manifest through the same APIs.
 
-1. Emit the shared Flow event and evidence schema.
-2. Remove direct replay. All execution must use the governed Flow runtime.
-3. Exclude secrets before an event leaves the content script.
-4. Authenticate and bind the browser profile, tab, document, run, session, and
-   monotonic event sequence.
-5. Acknowledge or safely resume every event after a reconnect. It must not drop
-   an event and report success.
-6. Bind each action to exact before/after frames and viewport metadata.
-7. Pass at least three trials for record and compile, secret exclusion,
-   ambiguity refusal, reconnect behavior, and browser lifecycle preservation.
+Start a Flow launch or attach recording with the browser observer enabled. Flow
+creates one owner-only, expiring session descriptor. Click the extension icon
+in each target tab. Chrome then asks for access only to the origin that the Flow
+session declared. An SSO origin needs a separate declared grant.
 
-Until these items pass the same acceptance gate as the Playwright recorder,
-this directory stays a prototype component. This status applies only to this
-directory. It does not apply to the `openadapt-capture` package.
+The badge shows `ON` after the admitted extension, native host, loopback
+session, tab, and top document are bound. A red `!` means the observer session
+failed. Flow must not finalize that recording as observer-backed.
+
+## Data boundary
+
+The content script keeps a bounded source-redacted structural candidate at the
+browser event boundary. The candidate has no action command, typed value, or
+replay instruction. It stays inside extension session storage until Flow claims
+it by the exact document clock, action sequence, retained frame, tab, document,
+navigation epoch, and viewport epoch. Only that claimed observation crosses the
+native bridge. It contains:
+
+- the session, installation, tab, frame, and document bindings;
+- the navigation and viewport epochs;
+- frame-local CSS geometry and a positional DOM path; and
+- a session-salted identity digest when the field is safe.
+
+It doesn't send keys, field values, raw URLs, selectors, HTML, DOM text, or
+accessible names. Password, payment, declared-secret, and
+autocomplete-sensitive fields withhold the identity digest. Once a sensitive
+field contains a value, the document stays identity-withheld for the rest of
+the session. Geometry and lifecycle evidence remain available.
+
+The extension keeps at most 128 unacknowledged messages and one MiB in session
+storage. It never drops the oldest message to make space. A full queue fails the
+session. A reconnect resumes after the exact acknowledged sequence. A gap,
+conflicting duplicate, wrong extension ID, unapproved origin, stale document,
+stale viewport epoch, or reconnect timeout also fails it.
+
+## Browser lifecycle
+
+A settled tab resize creates a new viewport epoch. Recording can continue. Flow
+associates an observation only when its frame token, document, action sequence,
+and viewport epoch match the Playwright action. A resize or monitor-scale
+change during an action makes that association invalid. When the observer is
+required, Flow leaves the recording incomplete instead of accepting ambiguous
+evidence.
+
+Top-level navigation creates a new document binding. Child frames keep their
+own Chrome document ID and frame-local viewport. A new tab needs an explicit
+operator grant or a bound opener. Chrome internal pages and another extension's
+pages cannot be observed.
+
+## Development checks
+
+Run the JavaScript protocol and redaction tests:
+
+```bash
+node --test chrome_extension/tests/*.test.mjs
+```
+
+Build the two deterministic release assets from an exact commit:
+
+```bash
+python scripts/build_browser_observer_extension.py \
+  --out-dir dist/browser-observer \
+  --source-commit "$(git rev-parse HEAD)" \
+  --version 1.3.0
+```
+
+The release workflow supplies the reviewed version. Do not publish the ZIP or
+SBOM outside the signed Capture release admission.

@@ -1,28 +1,26 @@
 {
   "manifest_version": 3,
-  "name": "OpenAdapt Capture (Prototype)",
+  "name": "OpenAdapt Browser Observer",
   "version": "1.0.0",
-  "description": "Development prototype for DOM event capture; use openadapt-flow for supported browser recording",
+  "description": "Optional structural observations for OpenAdapt Flow browser recordings",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAkrP6lByBYDKJkPOjq2omusDFyy0Bqnw8FuPvK8HTBrhJ85eVtOW/O65cBtWDJHyNkQpFDTdnQSN2LWFKtCuEuYIwr1cRAzNKoHoQy47u0A8LY486ApMTgox5SUFQ3sWIYgyfM1PncAT5DipA+L6G+kxQ4eRLC24wjXESTWuhTq3LkEXQZQAL5NabklUpldKn7OYQRxFfuBEQo0PRbX8IXs8ZBOwKgPcla6iEuX4y6D+HrfjO4UXRpQJH5sgjBfId+fgzKQIrXs4eR+0HgoauNouPAMT6x+8WZt04yIG5p/0jsTKauzlEuDW01Hc6iocLQbfoniPgNRcjGTt/uADa0wIDAQAB",
+  "minimum_chrome_version": "116",
   "permissions": [
     "activeTab",
-    "tabs",
+    "alarms",
+    "nativeMessaging",
     "scripting",
-    "alarms"
+    "storage",
+    "webNavigation"
   ],
-  "host_permissions": [
-    "<all_urls>"
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "run_at": "document_start",
-      "all_frames": true
-    }
-  ],
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -34,6 +32,6 @@
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     },
-    "default_title": "OpenAdapt Capture prototype"
+    "default_title": "Bind this tab to OpenAdapt Flow"
   }
 }

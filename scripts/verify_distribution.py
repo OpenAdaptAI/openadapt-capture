@@ -27,6 +27,10 @@ FORBIDDEN_ARCHIVE_PATHS = (
     "openadapt_capture/browser_bridge.py",
 )
 REQUIRED_OBSERVER_PATHS = {
+    "openadapt_capture/browser_observer.py",
+    "openadapt_capture/browser_observer_artifacts.py",
+    "openadapt_capture/browser_observer_native.py",
+    "openadapt_capture/browser_observer_protocol.py",
     "openadapt_capture/structural.py",
     "openadapt_capture/structural_observer/__init__.py",
     "openadapt_capture/structural_observer/linux.py",
@@ -78,6 +82,18 @@ def verify_distribution(path: Path) -> None:
         f"{path}: native structural observer files are missing: "
         f"{sorted(missing_observers)}"
     )
+
+    if path.suffix == ".whl":
+        entry_points = [
+            content.decode("utf-8")
+            for name, content in files.items()
+            if name.endswith(".dist-info/entry_points.txt")
+        ]
+        assert len(entry_points) == 1, f"{path}: package entry points are missing"
+        assert (
+            "capture-browser-observer-host = "
+            "openadapt_capture.browser_observer_native:main"
+        ) in entry_points[0], f"{path}: browser observer native-host entry point is missing"
 
     if path.name.endswith(".tar.gz"):
         required_source_files = {

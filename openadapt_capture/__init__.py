@@ -11,10 +11,9 @@ except PackageNotFoundError:
     __version__ = "0+unknown"
 
 # High-level APIs (primary interface)
-# Passive browser-event schemas remain public so existing local captures can
-# still be inspected. The repository-only Chrome-extension bridge is not part
-# of the production package or API. Supported browser recording is owned by
-# openadapt-flow's Playwright launch and attach paths.
+# Passive legacy browser-event schemas remain public so existing local captures
+# can still be inspected. The old WebSocket bridge is excluded. The supported
+# extension API below is a structural observer for Flow's Playwright recorder.
 from openadapt_capture.browser_events import (
     BoundingBox,
     BrowserClickEvent,
@@ -30,6 +29,26 @@ from openadapt_capture.browser_events import (
     NavigationType,
     SemanticElementRef,
     VisibleElement,
+)
+from openadapt_capture.browser_observer import (
+    BrowserObserverAborted,
+    BrowserObserverBinding,
+    BrowserObserverError,
+    BrowserObserverProtocolError,
+    BrowserObserverRuntime,
+    BrowserObserverSession,
+    BrowserObserverUnavailable,
+)
+from openadapt_capture.browser_observer_protocol import (
+    BROWSER_OBSERVER_EXTENSION_ID,
+    BROWSER_OBSERVER_PROTOCOL_SCHEMA,
+    ObservationPayload as BrowserStructuralObservation,
+)
+from openadapt_capture.browser_observer_artifacts import (
+    BrowserObserverArtifactError,
+    VerifiedBrowserObserverArtifact,
+    provision_browser_observer_extension,
+    verify_browser_observer_artifacts,
 )
 from openadapt_capture.capture import Action, Capture, CaptureSession
 
@@ -156,6 +175,21 @@ __all__ = [
     "Capture",
     "CaptureSession",
     "Action",
+    # Optional passive browser structural observer
+    "BROWSER_OBSERVER_PROTOCOL_SCHEMA",
+    "BROWSER_OBSERVER_EXTENSION_ID",
+    "BrowserObserverSession",
+    "BrowserObserverRuntime",
+    "BrowserObserverBinding",
+    "BrowserStructuralObservation",
+    "BrowserObserverError",
+    "BrowserObserverUnavailable",
+    "BrowserObserverProtocolError",
+    "BrowserObserverAborted",
+    "BrowserObserverArtifactError",
+    "VerifiedBrowserObserverArtifact",
+    "verify_browser_observer_artifacts",
+    "provision_browser_observer_extension",
     # Native structural observation
     "STRUCTURAL_OBSERVATION_SCHEMA_VERSION",
     "StructuralAncestor",

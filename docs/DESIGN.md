@@ -26,7 +26,7 @@ operation exports it.
 | Full virtual desktop | Capture the combined MSS desktop and translate global input into that exact pixel space. |
 | One native window | Re-resolve and capture the selected window on each frame; translate input into a fixed encoded viewport. |
 | RDP or Citrix client window | Use the native window path. Treat the remote application as pixels; local accessibility APIs do not cross the remote boundary. |
-| Browser | `openadapt-flow` owns the supported Playwright recorder. The Chrome extension and bridge in this repository are source-only development prototypes and are excluded from Capture release artifacts. |
+| Browser | `openadapt-flow` owns the Playwright recorder and governed runtime. Capture supplies an optional admitted Chrome structural observer, its native host, and the passive wire protocol. |
 
 Capture supports native input observation on macOS, Windows, and X11 Linux.
 It retains action-time structure through Windows UI Automation, macOS
@@ -207,32 +207,52 @@ The supported browser recorder remains Playwright-native in `openadapt-flow`.
 It needs one owner for the browser context, DOM identity, field geometry,
 ordered before/after frames, page state, and source-time secret redaction.
 
-The Chrome extension can supply useful DOM observations, but it does not yet
-provide this complete contract. It can become a supported auxiliary observer
-after it has:
+The admitted Chrome extension is an optional structural observer for a Flow
+launch or attach session. It has no recording, compiler, action, or replay
+command. Flow starts the local bridge, retains the before and after frames,
+performs the action, verifies the result, and decides whether one observer
+message belongs to that exact action.
 
-1. a shared versioned event schema;
-2. source-time secret redaction;
-3. explicit permission and browser-profile boundaries;
-4. fail-closed reconnect and tab-lifecycle behavior;
-5. exact frame and event binding; and
-6. end-to-end compiler qualification.
+Chrome starts a registered native messaging host for the admitted extension
+ID. The host reads one owner-only, expiring session descriptor and authenticates
+to an ephemeral IPv4 loopback listener. The bridge binds the extension ID,
+installation digest, session, explicit tab, top document, frame document,
+origin, action request, retained Flow frame token, navigation epoch, viewport
+epoch, and contiguous message sequence. The extension retains a bounded
+unacknowledged queue in session storage. It resumes after the last acknowledged
+sequence. A gap, conflicting duplicate, invalid message, queue limit, origin
+change, or reconnect timeout fails the observer session.
 
-It should not replace the Playwright recorder only to consolidate packages.
-The stronger ownership and redaction boundary is more important than package
-uniformity.
+The extension requests a host origin only after the operator selects a tab. It
+has no ambient page match. SSO can use a second origin when the Flow session
+declares it and the operator grants it. A new tab needs an explicit binding or
+a bound opener. Each child frame carries its own Chrome document identity and
+frame-local CSS viewport. Flow composes that geometry through its existing
+Playwright frame path and omits an ambiguous association.
 
-The extension and its unauthenticated development bridge are repository-only.
-Wheel and source archives exclude the bridge and its legacy direct replay. The
-production package keeps only the passive browser-event schemas needed to read
-old local captures.
+The content script creates a bounded source-redacted structural candidate in
+the capture phase of a target event. It records no action command or typed
+value. Flow later claims one candidate by its exact document clock, action
+sequence, retained frame token, tab, document, navigation epoch, and viewport
+epoch. This preserves the pre-navigation target without making the extension a
+second recorder. An unclaimed candidate expires after 60 seconds. The extension
+doesn't stream keystrokes, field values, HTML, raw URLs, selectors, or element
+text. An ordinary element can emit a session-salted identity digest. Password,
+payment, declared-secret, and autocomplete-sensitive fields withhold it. Once
+a document contains a sensitive field value, later identity digests for that
+document remain withheld. Geometry and lifecycle epochs remain available.
+
+The legacy unauthenticated WebSocket source stays excluded from the wheel,
+source archive, extension ZIP, and public API. The old passive browser-event
+schemas remain readable for existing local captures.
 
 ## Release qualification
 
 The production release workflow is manual and binds evidence to one exact
 commit. It must:
 
-- build and validate one wheel and sdist;
+- build and validate one wheel, one source archive, the deterministic Chrome
+  observer ZIP, and its exact SPDX JSON SBOM;
 - install and uninstall that exact wheel in a clean environment on Linux,
   macOS, and Windows;
 - run interactive native qualification on labeled Linux, macOS, and Windows
@@ -241,6 +261,9 @@ commit. It must:
 - run the complete slow native capture tests with no skip;
 - verify live window movement and resize where the operating system supports
   window-scoped capture; and
+- run three trials for observer attach with SSO, settled resize, multi-tab and
+  child-frame lifecycle, bounded reconnect, invalid input, ordered delivery,
+  source redaction, and stale document or viewport refusal; and
 - retain machine-readable test and topology evidence.
 
 The release workflow accepts only a successful, complete job set for its exact
@@ -253,9 +276,9 @@ commit. Missing, stale, skipped, partial, or failed evidence blocks publication.
 - Windows window capture uses a screen-region grab and requires an unobstructed
   target window.
 - A display-topology change requires a new recording.
-- Browser extension capture is a repository-only development prototype. Its
-  bridge and direct replay are not in release artifacts. It is not the
-  supported browser recorder.
+- The optional Chrome observer requires the exact admitted extension ZIP, SPDX
+  SBOM, native host registration, and matching Flow integration. Playwright
+  remains the browser recorder, actuator, and verifier.
 - A raw capture is sensitive and has no automatic safe-for-egress derivative.
 - Customer RDP and Citrix environments require their own task-specific
   qualification.

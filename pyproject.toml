@@ -91,6 +91,7 @@ dev = [
 
 [project.scripts]
 capture = "openadapt_capture.cli:main"
+capture-browser-observer-host = "openadapt_capture.browser_observer_native:main"
 
 [project.urls]
 Homepage = "https://github.com/OpenAdaptAI/openadapt-capture"
@@ -167,7 +168,7 @@ dev = [
     # Test-only synthetic input driver; excluded from package metadata/runtime.
     "pynput>=1.7.6",
     "pytest>=9.0.2",
-    # Repository-only Chrome-extension prototype tests. The bridge and this
+    # Repository-only legacy WebSocket tests. The disabled bridge and this
     # dependency are not part of wheel or source-distribution runtime.
     "websockets>=12.0",
 ]

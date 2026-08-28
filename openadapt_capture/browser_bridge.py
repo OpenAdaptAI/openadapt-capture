@@ -1,10 +1,10 @@
 """Prototype WebSocket transport for Chrome extension development.
 
-This module is not the supported OpenAdapt browser recorder or a governed
-replay path. Use the Playwright launch or attach recorder in ``openadapt-flow``
-for compile-ready browser demonstrations. The transport remains available for
-development while it gains authenticated session binding, acknowledged
-ordering, source-time secret exclusion, and exact event/frame evidence.
+This module is not the supported OpenAdapt browser recorder, observer, or a
+governed replay path. Use the Playwright launch or attach recorder in
+``openadapt-flow`` and its optional native-messaging observer. This frozen
+repository-only transport reads old development fixtures. It is excluded from
+the wheel, source distribution, extension ZIP, and public API.
 
 This module provides the BrowserBridge WebSocket server that connects to
 the Chrome extension for capturing browser DOM events. It handles:
@@ -146,7 +146,7 @@ class BrowserBridge:
 
     def __init__(
         self,
-        host: str = "localhost",
+        host: str = "127.0.0.1",
         port: int = 8765,
         storage: "CaptureStorage | None" = None,
         on_event: Callable[[BrowserEventRecord], None] | None = None,
@@ -206,6 +206,12 @@ class BrowserBridge:
     def is_running(self) -> bool:
         """Check if the server is running."""
         return self._running
+
+    @property
+    def uri(self) -> str:
+        """Return the exact loopback test URI after the server starts."""
+
+        return f"ws://{self.host}:{self.port}"
 
     def get_events(self) -> list[BrowserEventRecord]:
         """Get all captured events."""
@@ -285,10 +291,16 @@ class BrowserBridge:
             return
 
         # Send to all clients, collecting any exceptions
-        results = await asyncio.gather(
-            *[client.send(message) for client in self._clients],
-            return_exceptions=True
-        )
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(
+                    *[client.send(message) for client in self._clients],
+                    return_exceptions=True,
+                ),
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("legacy browser bridge broadcast timed out") from exc
 
         # Log any failures
         for client, result in zip(self._clients, results):
@@ -606,13 +618,24 @@ class BrowserBridge:
         """Start the WebSocket server."""
         if self._running:
             return
-
-        self._running = True
-        self._server = await websockets.serve(
-            self._handle_client,
-            self.host,
-            self.port,
+        if self.host not in {"127.0.0.1", "localhost"}:
+            raise ValueError("legacy browser bridge is restricted to loopback")
+        self._server = await asyncio.wait_for(
+            websockets.serve(
+                self._handle_client,
+                self.host,
+                self.port,
+            ),
+            timeout=5.0,
         )
+        sockets = self._server.sockets or []
+        if len(sockets) != 1:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+            raise RuntimeError("legacy browser bridge did not bind one loopback socket")
+        self.port = int(sockets[0].getsockname()[1])
+        self._running = True
         logger.info(f"Browser bridge listening on ws://{self.host}:{self.port}")
 
     async def stop(self) -> None:
@@ -621,22 +644,37 @@ class BrowserBridge:
             return
 
         self._running = False
+        close_error: RuntimeError | None = None
 
         # Close all client connections
         if self._clients:
-            await asyncio.gather(
-                *[client.close() for client in self._clients],
-                return_exceptions=True
-            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *[client.close() for client in self._clients],
+                        return_exceptions=True,
+                    ),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError as exc:
+                close_error = RuntimeError("legacy browser bridge client close timed out")
+                close_error.__cause__ = exc
             self._clients.clear()
 
         # Stop the server
         if self._server is not None:
             self._server.close()
-            await self._server.wait_closed()
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError as exc:
+                if close_error is None:
+                    close_error = RuntimeError("legacy browser bridge server close timed out")
+                    close_error.__cause__ = exc
             self._server = None
 
         logger.info("Browser bridge stopped")
+        if close_error is not None:
+            raise close_error
 
     async def run_forever(self) -> None:
         """Run the server until cancelled.
@@ -670,7 +708,7 @@ class BrowserBridge:
 
 
 async def run_browser_bridge(
-    host: str = "localhost",
+    host: str = "127.0.0.1",
     port: int = 8765,
     mode: BrowserMode = BrowserMode.IDLE,
 ) -> None:
