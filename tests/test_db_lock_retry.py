@@ -9,7 +9,7 @@ import sqlalchemy as sa
 
 from openadapt_capture import db
 from openadapt_capture.db import crud
-from openadapt_capture.db.models import MemoryStat
+from openadapt_capture.db.models import MemoryStat, Recording
 
 
 def _operational_error(message):
@@ -103,5 +103,101 @@ def test_persistent_sqlite_writer_lock_still_fails(tmp_path, monkeypatch):
         assert session.query(MemoryStat).count() == 0
     finally:
         locking_connection.close()
+        session.close()
+        engine.dispose()
+
+
+def _recording_under_a_competing_writer(tmp_path, monkeypatch):
+    """Create a capture database whose one write lock a second writer holds."""
+    monkeypatch.setattr(db, "SQLITE_BUSY_TIMEOUT_SECONDS", 0.01)
+    db_path = tmp_path / "recording.db"
+    engine, Session = db.create_db(str(db_path))
+    setup_session = Session()
+    recording = crud.insert_recording(
+        setup_session,
+        {
+            "timestamp": 2.0,
+            "monitor_width": 100,
+            "monitor_height": 100,
+            "platform": "test",
+            "task_description": "Video start time under contention",
+        },
+    )
+    setup_session.close()
+
+    video_writer_session = Session()
+    competitor = sqlite3.connect(db_path, timeout=0.01)
+    competitor.execute("BEGIN IMMEDIATE")
+    competitor.execute(
+        "UPDATE recording SET task_description = task_description WHERE id = ?",
+        (recording.id,),
+    )
+    return engine, video_writer_session, competitor, recording
+
+
+def test_video_start_time_recovers_from_a_transient_writer_lock(tmp_path, monkeypatch):
+    """The video writer must survive another writer holding the write lock.
+
+    Without this recovery the recorder's ``video_writer`` process died of an
+    unhandled OperationalError inside its startup callback, before it could
+    announce readiness, and the whole recording failed.
+    """
+    engine, session, competitor, recording = _recording_under_a_competing_writer(
+        tmp_path, monkeypatch
+    )
+    retry_delays = []
+
+    def release_lock(delay):
+        retry_delays.append(delay)
+        competitor.commit()
+
+    monkeypatch.setattr(crud, "sleep", release_lock)
+    try:
+        crud.update_video_start_time(session, recording, 1234.5)
+        assert retry_delays == [crud.SQLITE_LOCK_RETRY_DELAYS_SECONDS[0]]
+        stored = session.execute(
+            sa.select(Recording.video_start_time).where(Recording.id == recording.id)
+        ).scalar_one()
+        assert stored == pytest.approx(1234.5)
+    finally:
+        competitor.close()
+        session.close()
+        engine.dispose()
+
+
+def test_video_start_time_fails_loud_under_a_held_lock(tmp_path, monkeypatch):
+    """A lock that never clears must surface, never be silently skipped."""
+    engine, session, competitor, recording = _recording_under_a_competing_writer(
+        tmp_path, monkeypatch
+    )
+    retry_delays = []
+    monkeypatch.setattr(crud, "sleep", retry_delays.append)
+    try:
+        with pytest.raises(sa.exc.OperationalError, match="database is locked"):
+            crud.update_video_start_time(session, recording, 1234.5)
+
+        assert retry_delays == list(crud.SQLITE_LOCK_RETRY_DELAYS_SECONDS)
+        competitor.rollback()
+        stored = session.execute(
+            sa.select(Recording.video_start_time).where(Recording.id == recording.id)
+        ).scalar_one()
+        assert stored is None
+    finally:
+        competitor.close()
+        session.close()
+        engine.dispose()
+
+
+def test_video_start_time_reports_a_missing_recording(tmp_path, monkeypatch):
+    """A recording row that is not there must be reported, not written blind."""
+    monkeypatch.setattr(db, "SQLITE_BUSY_TIMEOUT_SECONDS", 0.01)
+    db_path = tmp_path / "recording.db"
+    engine, Session = db.create_db(str(db_path))
+    session = Session()
+    absent = Recording(id=404, timestamp=3.0)
+    try:
+        crud.update_video_start_time(session, absent, 1234.5)
+        assert session.execute(sa.select(sa.func.count(Recording.id))).scalar_one() == 0
+    finally:
         session.close()
         engine.dispose()
