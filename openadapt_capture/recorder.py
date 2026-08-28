@@ -740,8 +740,11 @@ def _raise_for_failed_processes(
     """Surface required child-process failures through the recording boundary.
 
     An exit code alone says a child died, not why. Each child's own traceback
-    is quoted here so the reason crosses the recording boundary with the error,
-    rather than being left in whatever the child's stderr reached.
+    goes into the error message, so the reason crosses the recording boundary
+    with the error rather than being left in whatever the child's stderr
+    reached. It is the message and not an exception note because
+    ``BaseException.add_note`` arrived in Python 3.11 and this package supports
+    3.10, where a note is discarded without a word.
     """
     failures = {
         name: task.exitcode
@@ -753,10 +756,11 @@ def _raise_for_failed_processes(
         detail = ", ".join(
             f"{name} (exit code {exitcode})" for name, exitcode in sorted(failures.items())
         )
-        error = RuntimeError(f"Recording child process failed: {detail}")
-        for name in sorted(failures):
-            add_exception_note(error, _describe_child_failure(name, reported.get(name)))
-        raise error
+        message = "\n".join(
+            [f"Recording child process failed: {detail}"]
+            + [_describe_child_failure(name, reported.get(name)) for name in sorted(failures)]
+        )
+        raise RuntimeError(message)
 
 
 def collect_stats(performance_snapshots: list[tracemalloc.Snapshot]) -> None:

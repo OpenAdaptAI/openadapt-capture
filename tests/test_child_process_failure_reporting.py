@@ -83,10 +83,12 @@ def test_the_raised_recording_error_quotes_the_child_traceback():
     with pytest.raises(RuntimeError) as raised:
         _raise_for_failed_processes({"video_writer": child}, error_sink)
 
-    notes = "\n".join(getattr(raised.value, "__notes__", []))
-    assert "video_writer (exit code 1)" in str(raised.value)
-    assert "_DistinctiveStartupError" in notes
-    assert "the video encoder never opened" in notes
+    # The message, not an exception note: notes need Python 3.11, and this
+    # package supports 3.10, where a note is discarded without a word.
+    reported = str(raised.value)
+    assert "video_writer (exit code 1)" in reported
+    assert "_DistinctiveStartupError" in reported
+    assert "the video encoder never opened" in reported
 
 
 def test_a_child_stopped_by_a_signal_is_reported_as_unexplained():
