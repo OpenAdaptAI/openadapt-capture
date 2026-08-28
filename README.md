@@ -233,7 +233,16 @@ Flow instead: [docs/BROWSER_EXTENSION_BOUNDARY.md](docs/BROWSER_EXTENSION_BOUNDA
 - The browser extension is not a supported recorder and its artifacts are not
   published.
 
-Evidence behind the current maturity labels: the
+## Product state
+
+An exact Capture release reaches Production only through an active signed,
+expiring, revocable release admission. Missing, expired, revoked, mismatched,
+or unverifiable, and the release is **not actively admitted**. The validator
+won't fall back to an older admission or hand out a lifecycle label instead.
+The current state is machine-readable in the
+[signed production record](https://docs.openadapt.ai/production-lifecycle.json).
+
+Evidence behind what each substrate can claim: the
 [repository lifecycle registry](https://github.com/OpenAdaptAI/.github/blob/main/REPOSITORY_LIFECYCLE.md)
 and [Flow's product status](https://github.com/OpenAdaptAI/openadapt-flow/blob/main/docs/PRODUCT_STATUS.md).
 
