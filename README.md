@@ -16,7 +16,7 @@ recorder as a library.
 
 [Documentation](https://docs.openadapt.ai) ·
 [Flow](https://github.com/OpenAdaptAI/openadapt-flow) ·
-[Window capture](docs/WINDOW_CAPTURE.md)
+[Window capture](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/WINDOW_CAPTURE.md)
 
 ## With OpenAdapt
 
@@ -43,11 +43,21 @@ pip install openadapt-capture
 capture record ./my-capture --description "Describe the workflow"
 # The ready message prints the session ID.
 
-# From another terminal:
+capture info ./my-capture
+```
+
+`capture status`, `capture stop`, and the `status_recording` / `stop_recording`
+Python contract below are on `main` and ship in 1.2.3. They are not in the
+published 1.2.2 wheel, so install from source until 1.2.3 reaches PyPI:
+
+```bash
+pip install "openadapt-capture @ git+https://github.com/OpenAdaptAI/openadapt-capture"
+```
+
+```bash
+# From another terminal, against a running capture:
 capture status --session-id SESSION_ID
 capture stop --session-id SESSION_ID
-
-capture info ./my-capture
 ```
 
 Or drive it from Python:
@@ -94,7 +104,8 @@ calls share one finalization result.
 The control endpoint listens on IPv4 loopback only, and every request carries
 an authenticated session capability that lives in an owner-only runtime file
 (`0700`/`0600` on macOS and Linux, a protected current-user DACL on Windows).
-The capability never reaches command arguments, logs, or the capture directory.
+On macOS it also removes extended ACL entries and verifies they are absent. The
+capability never reaches command arguments, logs, or the capture directory.
 
 ## You have to supply FFmpeg
 
@@ -104,6 +115,11 @@ links FFmpeg or PyAV. Point it at an executable with `OPENADAPT_FFMPEG_PATH`,
 putting `ffmpeg` and `ffprobe` on `PATH`. Recording runs a real
 encode-and-decode probe first and refuses before the input listeners start if
 the executable, the codec, or the PNG verification path is missing.
+
+A minimal managed runtime has to supply raw-video input through a pipe, the
+chosen video encoder, MP4 demuxing and muxing, PNG decoding and encoding, the
+`image2pipe` muxer, and the `select` video filter. Desktop provisions and
+probes that exact closure.
 
 Frames stream from memory straight to FFmpeg. A missing integer PTS slot reuses
 the preceding frame, so the encode is deterministic no matter what the
@@ -119,7 +135,9 @@ Where the provider exposes them it records the target identifier, the role,
 the name, the bounds, the supported actions, the process and window identity,
 and the ancestry. Windows UIA also records how many candidates matched inside
 the top-level window. A value the provider doesn't expose stays absent: Capture
-never infers a structural field from coordinates or pixels.
+never infers a structural field from coordinates or pixels. The provider name
+is `windows_uia`, `macos_ax`, or `linux_atspi`, and the field is optional, so
+an older recording still loads unchanged.
 
 It's on by default wherever a provider exists. Turn it off with
 `Recorder(..., capture_structural_observations=False)`, or inject your own
@@ -166,7 +184,7 @@ window is re-resolved every frame, movement and resize are handled by scaling
 into a fixed viewport, and a lost window fails the session rather than
 producing media that looks complete but has an evidence gap. The full contract,
 including the multi-monitor rules and the coordinate-space flags converters
-must respect, is in [docs/WINDOW_CAPTURE.md](docs/WINDOW_CAPTURE.md).
+must respect, is in [docs/WINDOW_CAPTURE.md](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/WINDOW_CAPTURE.md).
 
 Linux window mode needs X11 with EWMH and XComposite. It refuses to start under
 native Wayland or XWayland-only.
@@ -214,7 +232,7 @@ The Chrome extension in this repository is a prototype. It's excluded from the
 published wheel and source archive, it has no source-time secret exclusion, and
 its development bridge speaks to an unauthenticated local WebSocket. Don't run
 it in a sensitive browser profile. Why the supported browser recorder lives in
-Flow instead: [docs/BROWSER_EXTENSION_BOUNDARY.md](docs/BROWSER_EXTENSION_BOUNDARY.md).
+Flow instead: [docs/BROWSER_EXTENSION_BOUNDARY.md](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/BROWSER_EXTENSION_BOUNDARY.md).
 
 ## Limits
 
@@ -254,7 +272,8 @@ and [Flow's product status](https://github.com/OpenAdaptAI/openadapt-flow/blob/m
 | `transcribe` | Local openai-whisper transcription |
 | `privacy` | The `openadapt-privacy` dependency, for explicit integrations. No automatic scrubbing. |
 | `share` | Explicit Magic Wormhole transfer |
-| `all` | Everything above |
+| `linux` | Native Linux AT-SPI structural observation |
+| `all` | Everything in this table |
 
 Neither transcription extra is vendored into this MIT wheel; you install them
 into your own environment. Watch `transcribe-fast`: it pulls PyAV, whose
