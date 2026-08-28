@@ -12,6 +12,7 @@ from scripts.check_display_topology import DisplayTopologyError, qualify_topolog
 from scripts.check_junit_no_skips import JUnitQualificationError, check_reports
 from scripts.check_release_ci import (
     EXPECTED_QUALIFICATION_JOBS,
+    EvidencePending,
     ReleaseEvidenceError,
     check_once,
     validate_qualification_jobs,
@@ -186,3 +187,45 @@ def test_release_gate_binds_both_workflows_and_jobs_to_exact_sha() -> None:
         token="test",
         get_json=get_json,
     ) == {"test.yml": 10, "production-qualification.yml": 20}
+
+
+def test_release_gate_rejects_a_different_qualification_run_id() -> None:
+    sha = "a" * 40
+
+    def get_json(url: str, _token: str):
+        if "/test.yml/runs?" in url:
+            return {
+                "workflow_runs": [
+                    {
+                        "id": 10,
+                        "head_sha": sha,
+                        "event": "push",
+                        "created_at": "2026-08-18T00:00:00Z",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ]
+            }
+        if "/production-qualification.yml/runs?" in url:
+            return {
+                "workflow_runs": [
+                    {
+                        "id": 20,
+                        "head_sha": sha,
+                        "event": "workflow_dispatch",
+                        "created_at": "2026-08-18T00:01:00Z",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+    with pytest.raises(EvidencePending, match="no workflow_dispatch workflow run"):
+        check_once(
+            repository="OpenAdaptAI/openadapt-capture",
+            sha=sha,
+            token="test",
+            qualification_run_id=21,
+            get_json=get_json,
+        )

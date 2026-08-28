@@ -1,0 +1,218 @@
+name: Stage production release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "Exact protected-main commit qualified for publication"
+        type: string
+        required: true
+      version:
+        description: "Reviewed stable package version on the candidate commit"
+        type: string
+        required: true
+      qualification_run_id:
+        description: "Exact successful production qualification workflow run ID"
+        type: string
+        required: true
+
+concurrency:
+  group: capture-release-staging-${{ inputs.candidate_sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  stage:
+    name: Stage App-authored durable candidate
+    runs-on: ubuntu-latest
+    environment: release-identity
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      publication_staging_json: ${{ steps.stage.outputs.publication_staging_json }}
+      publication_staging_sha256: ${{ steps.stage.outputs.publication_staging_sha256 }}
+      draft_release_id: ${{ steps.stage.outputs.draft_release_id }}
+      artifact_inventory_json: ${{ steps.inventory.outputs.artifact_inventory_json }}
+      candidate_artifact_name: capture-candidate-${{ inputs.candidate_sha }}
+      source_commit: ${{ inputs.candidate_sha }}
+      version: ${{ inputs.version }}
+      tag: v${{ inputs.version }}
+    steps:
+      - name: Require the exact authorized protected-main dispatch
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          QUALIFICATION_RUN_ID: ${{ inputs.qualification_run_id }}
+          EXPECTED_DISPATCHER_ID: "774615"
+          EXPECTED_REPOSITORY_ID: "1115283835"
+          EXPECTED_RELEASE_APP_ID: "4730708"
+          EXPECTED_RELEASE_INSTALLATION_ID: "156835568"
+          EXPECTED_RELEASE_ACTOR_ID: "321543906"
+          CONFIGURED_RELEASE_APP_ID: ${{ vars.OPENADAPT_RELEASE_APP_ID }}
+          CONFIGURED_RELEASE_INSTALLATION_ID: ${{ vars.OPENADAPT_RELEASE_APP_INSTALLATION_ID }}
+          CONFIGURED_RELEASE_ACTOR_ID: ${{ vars.OPENADAPT_RELEASE_ACTOR_ID }}
+          EVENT_REPOSITORY_ID: ${{ github.event.repository.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]; then
+            echo "Release staging accepts workflow_dispatch only."
+            exit 1
+          fi
+          if [ "${GITHUB_ACTOR_ID}" != "${EXPECTED_DISPATCHER_ID}" ]; then
+            echo "Release staging requires the configured human dispatcher."
+            exit 1
+          fi
+          if [ "${GITHUB_REF}" != "refs/heads/main" ] || [ "${GITHUB_REF_TYPE}" != "branch" ]; then
+            echo "Release staging must run from protected main."
+            exit 1
+          fi
+          if [[ ! "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]] || [ "${CANDIDATE_SHA}" != "${GITHUB_SHA}" ]; then
+            echo "candidate_sha must equal the exact dispatched main commit."
+            exit 1
+          fi
+          if [[ ! "${RELEASE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version must be an exact stable semantic version."
+            exit 1
+          fi
+          if [[ ! "${QUALIFICATION_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "qualification_run_id must be a positive decimal workflow run ID."
+            exit 1
+          fi
+          if [ "${EVENT_REPOSITORY_ID}" != "${EXPECTED_REPOSITORY_ID}" ]; then
+            echo "The workflow event names a different repository identity."
+            exit 1
+          fi
+          if [ "${CONFIGURED_RELEASE_APP_ID}" != "${EXPECTED_RELEASE_APP_ID}" ] || \
+             [ "${CONFIGURED_RELEASE_INSTALLATION_ID}" != "${EXPECTED_RELEASE_INSTALLATION_ID}" ] || \
+             [ "${CONFIGURED_RELEASE_ACTOR_ID}" != "${EXPECTED_RELEASE_ACTOR_ID}" ]; then
+            echo "The configured release App authority differs from the frozen production identity."
+            exit 1
+          fi
+
+      - name: Checkout the exact candidate source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Require the exact reviewed version and unused immutable tag
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if [ "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ] || \
+             [ "$(git rev-parse refs/remotes/origin/main)" != "${GITHUB_SHA}" ]; then
+            echo "The release candidate is not current protected main."
+            exit 1
+          fi
+          project_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "${project_version}" != "${RELEASE_VERSION}" ]; then
+            echo "The reviewed package version differs from the dispatch input."
+            exit 1
+          fi
+          python scripts/check_changelog.py
+          if ! grep -Eq "^## v${RELEASE_VERSION} \(" CHANGELOG.md; then
+            echo "CHANGELOG.md has no entry for the reviewed release."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v${RELEASE_VERSION}" >/dev/null 2>&1; then
+            echo "The immutable release tag already exists. Use the publication recovery path."
+            exit 1
+          fi
+
+      - name: Require the exact successful test and qualification runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/check_release_ci.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --sha "${GITHUB_SHA}" \
+            --qualification-run-id "${{ inputs.qualification_run_id }}" \
+            --timeout-seconds 1
+
+      - name: Download the exact qualified candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: capture-candidate-${{ inputs.candidate_sha }}
+          path: dist
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.qualification_run_id }}
+
+      - name: Reconstruct and verify the exact candidate inventory
+        id: inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/verify_distribution.py dist/*
+          python scripts/check_source_boundary.py --require-dist
+          mkdir -p evidence
+          python scripts/release_candidate.py inventory \
+            --dist dist \
+            --output evidence/release-artifact-inventory.json \
+            --github-output "${GITHUB_OUTPUT}"
+          python scripts/release_candidate.py verify \
+            --dist dist \
+            --inventory evidence/release-artifact-inventory.json
+
+      - name: Create the exact release App token
+        id: release-app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OPENADAPT_RELEASE_APP_ID }}
+          private-key: ${{ secrets.OPENADAPT_RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: read
+          permission-contents: write
+          permission-metadata: read
+
+      - name: Require the exact release App installation
+        env:
+          ACTUAL_INSTALLATION_ID: ${{ steps.release-app.outputs.installation-id }}
+          EXPECTED_INSTALLATION_ID: "156835568"
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${ACTUAL_INSTALLATION_ID}" != "${EXPECTED_INSTALLATION_ID}" ]; then
+            echo "The minted release App token has the wrong installation identity."
+            exit 1
+          fi
+
+      - name: Stage and verify the durable App-authored draft release
+        id: stage
+        env:
+          GH_TOKEN: ${{ steps.release-app.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/github_release_staging.py stage \
+            --repository "${GITHUB_REPOSITORY}" \
+            --repository-id "1115283835" \
+            --source-commit "${GITHUB_SHA}" \
+            --tag "v${{ inputs.version }}" \
+            --dist dist \
+            --inventory evidence/release-artifact-inventory.json \
+            --output evidence/publication-staging.json \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Upload non-publishable staging evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: capture-publication-staging-${{ inputs.candidate_sha }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 90

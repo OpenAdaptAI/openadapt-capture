@@ -120,6 +120,7 @@ def check_once(
     repository: str,
     sha: str,
     token: str,
+    qualification_run_id: int | None = None,
     get_json: Callable[[str, str], dict[str, Any]] = _github_get,
 ) -> dict[str, int]:
     base = f"https://api.github.com/repos/{repository}"
@@ -136,8 +137,20 @@ def check_once(
             raise EvidencePending(
                 f"GitHub returned no workflow_runs list for {requirement.file_name}"
             )
+        candidate_runs = runs
+        if (
+            requirement.file_name == "production-qualification.yml"
+            and qualification_run_id is not None
+        ):
+            candidate_runs = [
+                run
+                for run in runs
+                if int(run.get("id") or 0) == qualification_run_id
+            ]
         selected[requirement.file_name] = select_exact_run(
-            runs, sha=sha, event=requirement.event
+            candidate_runs,
+            sha=sha,
+            event=requirement.event,
         )
 
     qualification = selected["production-qualification.yml"]
@@ -153,12 +166,23 @@ def check_once(
 
 
 def wait_for_evidence(
-    *, repository: str, sha: str, token: str, timeout_seconds: int, interval_seconds: int
+    *,
+    repository: str,
+    sha: str,
+    token: str,
+    timeout_seconds: int,
+    interval_seconds: int,
+    qualification_run_id: int | None = None,
 ) -> dict[str, int]:
     deadline = time.monotonic() + timeout_seconds
     while True:
         try:
-            return check_once(repository=repository, sha=sha, token=token)
+            return check_once(
+                repository=repository,
+                sha=sha,
+                token=token,
+                qualification_run_id=qualification_run_id,
+            )
         except EvidencePending as exc:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -175,6 +199,7 @@ def main() -> None:
     parser.add_argument("--sha", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=2700)
     parser.add_argument("--interval-seconds", type=int, default=10)
+    parser.add_argument("--qualification-run-id", type=int)
     args = parser.parse_args()
     if len(args.sha) != 40 or any(char not in "0123456789abcdef" for char in args.sha):
         raise SystemExit("--sha must be a lowercase 40-character Git commit SHA")
@@ -187,6 +212,7 @@ def main() -> None:
         token=token,
         timeout_seconds=args.timeout_seconds,
         interval_seconds=args.interval_seconds,
+        qualification_run_id=args.qualification_run_id,
     )
     print(f"exact-commit release evidence is complete: {json.dumps(evidence, sort_keys=True)}")
 
