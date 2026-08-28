@@ -135,3 +135,24 @@ def test_qualification_separates_publishable_candidate_from_transport_evidence()
     assert "release-artifact-inventory.json" not in candidate_upload
     assert "retention-days: 90" in candidate_upload
     assert "name: capture-candidate-evidence-${{ github.sha }}" in build
+
+
+def test_release_staging_uses_two_principals_and_a_durable_draft() -> None:
+    workflow = (ROOT / ".github/workflows/stage-production-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "environment: release-identity" in workflow
+    assert 'EXPECTED_DISPATCHER_ID: "774615"' in workflow
+    assert 'EXPECTED_RELEASE_APP_ID: "4730708"' in workflow
+    assert 'EXPECTED_RELEASE_INSTALLATION_ID: "156835568"' in workflow
+    assert 'EXPECTED_RELEASE_ACTOR_ID: "321543906"' in workflow
+    assert "permission-administration: read" in workflow
+    assert "permission-contents: write" in workflow
+    assert "permission-metadata: read" in workflow
+    assert "permission-actions: write" not in workflow
+    assert "--qualification-run-id" in workflow
+    assert "run-id: ${{ inputs.qualification_run_id }}" in workflow
+    assert "python scripts/github_release_staging.py stage" in workflow
+    assert "capture-publication-staging-${{ inputs.candidate_sha }}" in workflow
+    assert "pypa/gh-action-pypi-publish" not in workflow

@@ -16,10 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from release_candidate import (
-    _canonical_json_bytes,
-    verify_inventory,
-)
+try:
+    from scripts.release_candidate import _canonical_json_bytes, verify_inventory
+except ModuleNotFoundError:  # Direct execution adds scripts/, not the repository root.
+    from release_candidate import _canonical_json_bytes, verify_inventory
 
 STAGING_SCHEMA_VERSION = "openadapt.production-release-staging-evidence/v1"
 RULESET_SCHEMA_VERSION = "openadapt.production-release-tag-ruleset/v1"
@@ -249,13 +249,16 @@ def _normalized_ruleset(
             raise ReleaseStagingError("tag ruleset has an invalid rule")
         rules.append({"type": rule["type"]})
     rules.sort(key=lambda rule: rule["type"])
+    name = raw.get("name")
+    if not isinstance(name, str) or not name:
+        raise ReleaseStagingError("tag ruleset has no stable name")
     return {
         "schema_version": RULESET_SCHEMA_VERSION,
         "role": role,
         "repository": repository,
         "repository_id": repository_id,
         "ruleset_id": _decimal_id(raw.get("id"), label="tag ruleset"),
-        "name": raw.get("name"),
+        "name": name,
         "target": raw.get("target"),
         "enforcement": raw.get("enforcement"),
         "bypass_actors": bypass_actors,
@@ -470,6 +473,7 @@ def _ensure_assets(
     client: GitHubClient,
     release: dict[str, Any],
     *,
+    repository: str,
     dist: Path,
     inventory: dict[str, Any],
     upload_missing: bool,
@@ -504,7 +508,7 @@ def _ensure_assets(
     if missing:
         release_id = _decimal_id(release.get("id"), label="draft release")
         refreshed = client.request_json(
-            f"https://api.github.com/repos/{release['url'].split('/repos/', 1)[1].split('/releases/', 1)[0]}/releases/{release_id}"
+            f"https://api.github.com/repos/{repository}/releases/{release_id}"
         )
         if not isinstance(refreshed, dict) or not isinstance(refreshed.get("assets"), list):
             raise ReleaseStagingError("GitHub returned no refreshed draft assets")
@@ -596,6 +600,7 @@ def stage_release(
     assets = _ensure_assets(
         client,
         release,
+        repository=repository,
         dist=dist,
         inventory=inventory,
         upload_missing=True,
@@ -647,6 +652,7 @@ def verify_staged_release(
     assets = _ensure_assets(
         client,
         release,
+        repository=repository,
         dist=dist,
         inventory=inventory,
         upload_missing=False,
@@ -729,21 +735,83 @@ def _load_canonical_staging(path: Path) -> dict[str, Any]:
         raise ReleaseStagingError("publication staging evidence is not canonical JSON")
     if value.get("schema_version") != STAGING_SCHEMA_VERSION:
         raise ReleaseStagingError("publication staging evidence schema is not supported")
+    fixed = {
+        "repository": "OpenAdaptAI/openadapt-capture",
+        "repository_id": REPOSITORY_ID,
+        "draft": True,
+        "prerelease": False,
+        "release_app_id": RELEASE_APP_ID,
+        "release_app_installation_id": RELEASE_APP_INSTALLATION_ID,
+        "release_app_bot_user_id": RELEASE_BOT_USER_ID,
+        "release_author_login": RELEASE_BOT_LOGIN,
+        "immutable_releases_enabled": True,
+    }
+    if any(value.get(key) != expected for key, expected in fixed.items()):
+        raise ReleaseStagingError("publication staging evidence has an invalid fixed value")
+    _decimal_id(value.get("draft_release_id"), label="draft release")
+    if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", str(value.get("tag"))) is None:
+        raise ReleaseStagingError("publication staging evidence has an invalid tag")
+    if re.fullmatch(r"[0-9a-f]{40}", str(value.get("target_commitish"))) is None:
+        raise ReleaseStagingError("publication staging evidence has an invalid source commit")
     assets = value.get("assets")
     if not isinstance(assets, list) or any(
         not isinstance(asset, dict) or set(asset) != ASSET_FIELDS for asset in assets
     ):
         raise ReleaseStagingError("publication staging evidence has an invalid asset set")
+    if len(assets) != 2:
+        raise ReleaseStagingError("publication staging evidence must contain two assets")
+    asset_order = [(asset["name"], asset["asset_id"]) for asset in assets]
+    if asset_order != sorted(asset_order) or len(asset_order) != len(set(asset_order)):
+        raise ReleaseStagingError("publication staging evidence assets are not sorted and unique")
+    if len({asset["name"] for asset in assets}) != len(assets):
+        raise ReleaseStagingError("publication staging evidence repeats an asset name")
+    for asset in assets:
+        _decimal_id(asset.get("asset_id"), label="release asset")
+        if asset.get("uploader_id") != RELEASE_BOT_USER_ID or asset.get(
+            "uploader_login"
+        ) != RELEASE_BOT_LOGIN:
+            raise ReleaseStagingError("publication staging evidence has an invalid uploader")
+        if not isinstance(asset.get("name"), str) or Path(asset["name"]).name != asset["name"]:
+            raise ReleaseStagingError("publication staging evidence has an unsafe asset name")
+        if not isinstance(asset.get("sha256"), str) or SHA256_PATTERN.fullmatch(
+            asset["sha256"]
+        ) is None:
+            raise ReleaseStagingError("publication staging evidence has an invalid asset digest")
+        if not isinstance(asset.get("size_bytes"), int) or asset["size_bytes"] < 0:
+            raise ReleaseStagingError("publication staging evidence has an invalid asset size")
     rulesets = value.get("tag_rulesets")
     if not isinstance(rulesets, list) or any(
         not isinstance(ruleset, dict) or set(ruleset) != RULESET_FIELDS for ruleset in rulesets
     ):
         raise ReleaseStagingError("publication staging evidence has an invalid ruleset set")
+    if len(rulesets) != 2 or [ruleset.get("role") for ruleset in rulesets] != [
+        "creation_authority",
+        "immutability",
+    ]:
+        raise ReleaseStagingError("publication staging evidence has an invalid ruleset role set")
+    if value.get("tag_rulesets_sha256") != _canonical_digest(
+        RULESETS_DIGEST_DOMAIN,
+        rulesets,
+    ):
+        raise ReleaseStagingError("publication staging evidence has an invalid ruleset digest")
+    for ruleset in rulesets:
+        if (
+            ruleset.get("schema_version") != RULESET_SCHEMA_VERSION
+            or ruleset.get("repository") != fixed["repository"]
+            or ruleset.get("repository_id") != REPOSITORY_ID
+            or ruleset.get("target") != "tag"
+            or ruleset.get("enforcement") != "active"
+        ):
+            raise ReleaseStagingError("publication staging evidence has an invalid ruleset")
+        _decimal_id(ruleset.get("ruleset_id"), label="tag ruleset")
+    _observed_at(value.get("observed_at"))
     return value
 
 
 def _observed_at(value: str | None) -> str:
     if value is not None:
+        if not isinstance(value, str):
+            raise ReleaseStagingError("--observed-at must be an RFC 3339 timestamp")
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError as exc:
@@ -771,6 +839,7 @@ def main() -> int:
     stage.add_argument("--inventory", type=Path, required=True)
     stage.add_argument("--observed-at")
     stage.add_argument("--output", type=Path, required=True)
+    stage.add_argument("--github-output", type=Path)
     verify = subparsers.add_parser("verify")
     verify.add_argument("--dist", type=Path, required=True)
     verify.add_argument("--inventory", type=Path, required=True)
@@ -804,6 +873,19 @@ def main() -> int:
                 observed_at=_observed_at(args.observed_at),
             )
             _write_canonical(args.output, staging)
+            if args.github_output is not None:
+                with args.github_output.open("a", encoding="utf-8") as output:
+                    output.write(
+                        "publication_staging_json="
+                        + _canonical_json_bytes(staging).decode("utf-8")
+                        + "\n"
+                    )
+                    output.write(
+                        "publication_staging_sha256="
+                        + _canonical_digest(STAGING_DIGEST_DOMAIN, staging)
+                        + "\n"
+                    )
+                    output.write(f"draft_release_id={staging['draft_release_id']}\n")
             print(_canonical_json_bytes(staging).decode("utf-8"))
         elif args.command == "verify":
             verify_staged_release(
