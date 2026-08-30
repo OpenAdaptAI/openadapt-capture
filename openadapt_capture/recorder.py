@@ -75,7 +75,9 @@ from openadapt_capture.structural import (
     observe_structural_action,
 )
 from openadapt_capture.window_capture import (
+    WindowCaptureAmbiguousError,
     WindowCaptureError,
+    WindowCapturePermissionError,
     WindowCaptureScope,
     build_window_scope,
 )
@@ -530,6 +532,28 @@ PROC_WRITE_BY_EVENT_TYPE = {
 NUM_MEMORY_STATS_TO_LOG = 3
 STARTUP_WAIT_POLL_SECONDS = 0.1
 STARTUP_READY_TIMEOUT_SECONDS = 30.0
+
+
+def _stable_recorder_error_code(exc: BaseException, stage: str) -> str:
+    """Return a privacy-safe failure code for the owner and control clients."""
+    if isinstance(exc, WindowCapturePermissionError):
+        return "screen_capture_permission_denied"
+    if isinstance(exc, WindowCaptureAmbiguousError):
+        return "window_target_ambiguous"
+    if isinstance(exc, WindowCaptureError):
+        return "window_capture_failed"
+    if isinstance(exc, InputObserverError):
+        return "input_observer_failed"
+    if isinstance(exc, (video.FFmpegEncodingError, video.FFmpegUnavailableError)):
+        return "video_encoder_failed"
+    return {
+        "database_finalization": "database_finalization_failed",
+        "capture_verification": "capture_verification_failed",
+        "terminal_metadata": "terminal_metadata_failed",
+        "capture_seal": "capture_seal_failed",
+        "terminal_publish": "terminal_publish_failed",
+        "worker_health": "recording_worker_failed",
+    }.get(stage, "recording_failed")
 
 # A writer announces readiness only after its first database write returns, so
 # the database's wait for the write lock is spent inside the deadline above.
@@ -3408,6 +3432,7 @@ class Recorder:
         self._control_complete = False
         self._control_integrity_verified = False
         self._control_error_code: str | None = None
+        self._control_failure_stage: str | None = None
         self._control_started_at = time.time()
         self._control_finalized_at: float | None = None
 
@@ -3421,10 +3446,13 @@ class Recorder:
                 "process_started_at": self._process_started_at,
                 "capture_dir": self.capture_dir,
                 "phase": self._control_phase,
-                "ready": self._ready_event.is_set(),
+                "ready": (
+                    self._control_phase == "recording" and self._ready_event.is_set()
+                ),
                 "complete": self._control_complete,
                 "integrity_verified": self._control_integrity_verified,
                 "error_code": self._control_error_code,
+                "failure_stage": self._control_failure_stage,
                 "started_at": self._control_started_at,
                 "finalized_at": self._control_finalized_at,
                 "event_counts": {
@@ -3463,6 +3491,7 @@ class Recorder:
                     "complete": True,
                     "integrity_verified": True,
                     "error_code": None,
+                    "failure_stage": None,
                     "finalized_at": finalized_at,
                 }
             )
@@ -3483,6 +3512,7 @@ class Recorder:
             self._control_complete = True
             self._control_integrity_verified = True
             self._control_error_code = None
+            self._control_failure_stage = None
             self._control_finalized_at = finalized_at
 
     def _transition_control(
@@ -3492,6 +3522,7 @@ class Recorder:
         complete: bool = False,
         integrity_verified: bool = False,
         error_code: str | None = None,
+        failure_stage: str | None = None,
         finalized: bool = False,
     ) -> None:
         with self._control_state_lock:
@@ -3502,6 +3533,7 @@ class Recorder:
                 self._control_complete,
                 self._control_integrity_verified,
                 self._control_error_code,
+                self._control_failure_stage,
                 self._control_finalized_at,
             )
             if (
@@ -3514,6 +3546,7 @@ class Recorder:
             self._control_complete = complete
             self._control_integrity_verified = integrity_verified
             self._control_error_code = error_code
+            self._control_failure_stage = failure_stage
             if finalized:
                 self._control_finalized_at = time.time()
             try:
@@ -3524,6 +3557,7 @@ class Recorder:
                     self._control_complete,
                     self._control_integrity_verified,
                     self._control_error_code,
+                    self._control_failure_stage,
                     self._control_finalized_at,
                 ) = previous
                 raise
@@ -3738,6 +3772,7 @@ class Recorder:
         """Thread target: apply config overrides, then call record()."""
         from openadapt_capture.config import config_override
 
+        failure_stage = "recording_startup"
         try:
             with config_override(self._recording_config):
                 last_source_ordinal = record(
@@ -3757,21 +3792,28 @@ class Recorder:
                 )
             if last_source_ordinal is not None:
                 self._last_source_ordinal = last_source_ordinal
+            failure_stage = "worker_health"
             self.check_health()
             if self._ready_event.is_set():
                 # Every writer has exited by here, so fold the write log back
                 # into the database before anything reads or inventories it.
+                failure_stage = "database_finalization"
                 finalize_capture_database(
                     os.path.join(self.capture_dir, "recording.db")
                 )
+                failure_stage = "capture_verification"
                 self._verify_completed_capture()
+                failure_stage = "terminal_metadata"
                 finalized_at = self._stage_completed_control_state()
+                failure_stage = "capture_seal"
                 self._seal_completed_capture()
+                failure_stage = "terminal_publish"
                 self._publish_completed_control_state(finalized_at)
             else:
                 self._transition_control(
                     "failed",
                     error_code="startup_incomplete",
+                    failure_stage="recording_startup",
                     finalized=True,
                 )
         except BaseException as exc:
@@ -3782,7 +3824,8 @@ class Recorder:
             try:
                 self._transition_control(
                     "failed",
-                    error_code="recording_or_finalization_failed",
+                    error_code=_stable_recorder_error_code(exc, failure_stage),
+                    failure_stage=failure_stage,
                     finalized=True,
                 )
             except BaseException as state_exc:

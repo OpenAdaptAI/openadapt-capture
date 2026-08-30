@@ -703,9 +703,11 @@ def test_recorder_failure_keeps_incomplete_state_and_removes_endpoint(
         (capture_dir / control.TERMINAL_STATE_FILENAME).read_text(encoding="utf-8")
     )
     assert terminal["phase"] == "failed"
+    assert terminal["ready"] is False
     assert terminal["complete"] is False
     assert terminal["integrity_verified"] is False
-    assert terminal["error_code"] == "recording_or_finalization_failed"
+    assert terminal["error_code"] == "recording_failed"
+    assert terminal["failure_stage"] == "recording_startup"
 
 
 def test_complete_state_write_failure_cannot_return_success(

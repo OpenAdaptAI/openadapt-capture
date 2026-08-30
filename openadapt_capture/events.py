@@ -86,6 +86,8 @@ class WindowCaptureStateV2(BaseModel):
     pid: int = Field(gt=0)
     process_start_time: float = Field(gt=0)
     coordinate_source: str = Field(min_length=1)
+    capture_source: str = Field(default="platform-window-image", min_length=1)
+    visibility_independent: bool = False
     geometry_generation: int = Field(ge=1)
     geometry_epoch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     display_topology_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

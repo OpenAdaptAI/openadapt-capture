@@ -43,7 +43,9 @@ from openadapt_capture.recorder import (
 )
 from openadapt_capture.window_capture import (
     TargetWindow,
+    WindowCaptureAmbiguousError,
     WindowCaptureError,
+    WindowCapturePermissionError,
     WindowCaptureScope,
     WindowTarget,
     build_window_scope,
@@ -911,6 +913,7 @@ def test_window_capture_state_rejects_scales_not_derived_from_content(scope):
 
 
 def test_macos_resolver_ignores_a_larger_hidden_matching_window(monkeypatch):
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: False)
     hidden = {
         "kCGWindowOwnerName": "FakeApp",
         "kCGWindowName": "Document",
@@ -942,6 +945,128 @@ def test_macos_resolver_ignores_a_larger_hidden_matching_window(monkeypatch):
     assert resolved is not None
     assert resolved.window_id == 2
     assert resolved.on_screen is True
+
+
+def test_macos_resolver_accepts_offspace_window_with_screencapturekit(monkeypatch):
+    hidden = {
+        "kCGWindowOwnerName": "FakeApp",
+        "kCGWindowName": "Document",
+        "kCGWindowLayer": 0,
+        "kCGWindowIsOnscreen": False,
+        "kCGWindowBounds": {"X": 0, "Y": 0, "Width": 1512, "Height": 944},
+        "kCGWindowOwnerPID": 100,
+        "kCGWindowNumber": 19373,
+    }
+    quartz = SimpleNamespace(
+        kCGWindowListOptionAll=1,
+        kCGNullWindowID=0,
+        CGWindowListCopyWindowInfo=lambda *_args: [hidden],
+    )
+    monkeypatch.setitem(sys.modules, "Quartz", quartz)
+    monkeypatch.setattr(window_capture_module, "_process_start_time", lambda _pid: 123.0)
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: True)
+
+    resolved = window_capture_module._resolve_window_macos(
+        WindowTarget(owner="FakeApp", title="Document")
+    )
+
+    assert resolved is not None
+    assert resolved.window_id == 19373
+    assert resolved.on_screen is False
+    assert resolved.visibility_independent is True
+    assert resolved.capture_source == "macos-exact-window-provider-chain"
+
+
+def test_macos_resolver_refuses_ambiguous_owner_only_match(monkeypatch):
+    windows = [
+        {
+            "kCGWindowOwnerName": "Google Chrome",
+            "kCGWindowName": title,
+            "kCGWindowLayer": 0,
+            "kCGWindowIsOnscreen": True,
+            "kCGWindowBounds": {"X": 0, "Y": 0, "Width": 1512, "Height": 944},
+            "kCGWindowOwnerPID": 100,
+            "kCGWindowNumber": window_id,
+        }
+        for window_id, title in ((95, "Profile picker"), (19373, "Amex"))
+    ]
+    quartz = SimpleNamespace(
+        kCGWindowListOptionAll=1,
+        kCGNullWindowID=0,
+        CGWindowListCopyWindowInfo=lambda *_args: windows,
+    )
+    monkeypatch.setitem(sys.modules, "Quartz", quartz)
+    monkeypatch.setattr(window_capture_module, "_process_start_time", lambda _pid: 123.0)
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: True)
+
+    with pytest.raises(WindowCaptureAmbiguousError, match="complete window title"):
+        window_capture_module._resolve_window_macos(WindowTarget(owner="Google Chrome"))
+
+
+def test_macos_capture_uses_exact_utility_after_sck_and_quartz_fail(monkeypatch):
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+        coordinate_source="quartz-screen-points",
+        capture_source="macos-exact-window-provider-chain",
+        visibility_independent=True,
+    )
+    quartz = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "Quartz", quartz)
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: True)
+    monkeypatch.setattr(
+        window_capture_module,
+        "_capture_window_macos_screencapturekit",
+        lambda _window: (_ for _ in ()).throw(WindowCapturePermissionError("denied")),
+    )
+    expected = Image.new("RGB", (3024, 1888), "white")
+    expected.info["openadapt_capture_source"] = "macos-screencapture-utility"
+    monkeypatch.setattr(
+        window_capture_module,
+        "_capture_window_macos_utility",
+        lambda _window: expected,
+    )
+
+    captured = window_capture_module._capture_window_macos(window)
+
+    assert captured.size == (3024, 1888)
+    assert captured.info["openadapt_capture_source"] == "macos-screencapture-utility"
+
+
+def test_screencapturekit_enumerates_other_spaces_and_selects_exact_id(monkeypatch):
+    calls = []
+
+    class FakeWindow:
+        def __init__(self, window_id):
+            self._window_id = window_id
+
+        def windowID(self):
+            return self._window_id
+
+    expected = FakeWindow(19373)
+    content = SimpleNamespace(windows=lambda: [FakeWindow(95), expected])
+
+    class FakeShareableContent:
+        @staticmethod
+        def getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+            exclude_desktop, on_screen_only, callback
+        ):
+            calls.append((exclude_desktop, on_screen_only))
+            callback(content, None)
+
+    fake_sck = SimpleNamespace(SCShareableContent=FakeShareableContent)
+    monkeypatch.setitem(sys.modules, "ScreenCaptureKit", fake_sck)
+    window_capture_module._MACOS_SC_WINDOW_CACHE.clear()
+
+    resolved = window_capture_module._screen_capture_kit_window(19373)
+
+    assert resolved is expected
+    assert calls == [(True, False)]
 
 
 class TestTranslatePoint:

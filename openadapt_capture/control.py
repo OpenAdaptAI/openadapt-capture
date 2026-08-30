@@ -70,6 +70,7 @@ class RecorderStatus:
     integrity_verified: bool
     event_counts: dict[str, int]
     error_code: str | None = None
+    failure_stage: str | None = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "RecorderStatus":
@@ -94,6 +95,11 @@ class RecorderStatus:
                 event_counts=counts,
                 error_code=(
                     str(payload["error_code"]) if payload.get("error_code") is not None else None
+                ),
+                failure_stage=(
+                    str(payload["failure_stage"])
+                    if payload.get("failure_stage") is not None
+                    else None
                 ),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -1193,6 +1199,7 @@ class RecorderControlServer:
                 "integrity_verified",
                 "event_counts",
                 "error_code",
+                "failure_stage",
             ):
                 if key in status:
                     response[key] = status[key]

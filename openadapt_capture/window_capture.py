@@ -3,8 +3,8 @@
 Why this exists (the Citrix / remote-display wedge): openadapt-flow's
 ``RemoteDisplayBackend`` (``record --backend rdp``, ``rdp_window`` mode)
 *replays* against the pixels of a single client window (Parallels, Citrix
-Workspace, Microsoft Remote Desktop) captured per-window — on macOS via
-``CGWindowListCreateImage`` by window id. A demonstration recorded FULL-SCREEN
+Workspace, Microsoft Remote Desktop) captured by exact window id. A
+demonstration recorded FULL-SCREEN
 is in a different coordinate space than that replay surface, so converters had
 to work around the mismatch (record inside the session, or full-screen the
 client). Window-scoped recording removes the mismatch at the source: frames
@@ -16,9 +16,9 @@ Coordinate semantics (kept in exact parity with openadapt-flow
 
 - ``bounds`` is ``(x, y, w, h)`` in **screen points**, top-left origin — the
   space native platform observers use for global mouse coordinates.
-- A captured frame contains the window's own **pixels** (macOS:
-  ``CGWindowListCreateImage`` with ``kCGWindowImageBoundsIgnoreFraming`` — the
-  identical call flow's replay capture path uses).
+- A captured frame contains the window's own **pixels**. Current macOS uses a
+  ScreenCaptureKit desktop-independent window filter. Exact-window Quartz and
+  system-utility providers remain compatibility paths.
 - ``scale`` = captured pixel width / bounds width (e.g. 2.0 on Retina).
 - Replay maps a captured pixel to a screen point as
   ``screen = bounds_origin + pixel / scale`` (flow's ``_to_screen``).
@@ -36,7 +36,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import subprocess
 import sys
+import tempfile
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -93,6 +95,18 @@ class WindowCaptureError(RuntimeError):
     silently fell back to full-screen would produce coordinates in the wrong
     space — a corrupt demonstration that *looks* valid.
     """
+
+
+class WindowCapturePermissionError(WindowCaptureError):
+    """The operating system denied exact-window capture."""
+
+
+class WindowCaptureAmbiguousError(WindowCaptureError):
+    """The configured selectors match more than one capturable window."""
+
+
+class WindowCaptureUnavailableError(WindowCaptureError):
+    """The exact-window capture provider is not available."""
 
 
 @dataclass(frozen=True)
@@ -153,6 +167,8 @@ class TargetWindow:
     on_screen: bool = True
     process_start_time: float | None = None
     coordinate_source: str = "platform-screen"
+    capture_source: str = "platform-window-image"
+    visibility_independent: bool = False
 
     @property
     def identity(self) -> tuple[int, int, float | None, str]:
@@ -222,6 +238,7 @@ class WindowCaptureScope:
         self._source_viewport: tuple[int, int] | None = None
         self._content_rect: tuple[int, int, int, int] | None = None
         self._fit_scale: float | None = None
+        self._capture_source: str | None = None
         self._geometry_generation = 0
         self._geometry_signature: tuple | None = None
         self._published_generation = 0
@@ -271,14 +288,14 @@ class WindowCaptureScope:
         """Resolve the target window without changing captured-frame geometry.
 
         Raises:
-            WindowCaptureError: If no matching window is on screen.
+            WindowCaptureError: If no matching window can be captured safely.
         """
         win = self._resolver(self.target)
         if win is None:
             raise WindowCaptureError(
                 f"no window matching owner {self.target.owner!r} "
                 f"title {self.target.title!r}; is the target application "
-                "running with a visible window?"
+                "running with a capturable window?"
             )
         if self.target.owner and self.target.owner.casefold() not in win.owner.casefold():
             raise WindowCaptureError(
@@ -288,8 +305,11 @@ class WindowCaptureScope:
             raise WindowCaptureError(
                 "the window resolver returned a title outside the configured selector"
             )
-        if not win.on_screen:
-            raise WindowCaptureError("the resolved target window is not on screen")
+        if not win.on_screen and not win.visibility_independent:
+            raise WindowCaptureError(
+                "the resolved target window is not visible and the active "
+                "capture provider requires visibility"
+            )
         if win.pid <= 0:
             raise WindowCaptureError("the resolved target has no owning process identity")
         if (
@@ -385,6 +405,9 @@ class WindowCaptureScope:
         win = post
         if source_image.width <= 0 or source_image.height <= 0:
             raise WindowCaptureError("window capture returned an empty frame")
+        capture_source = str(
+            source_image.info.get("openadapt_capture_source", win.capture_source)
+        )
         source_viewport = (source_image.width, source_image.height)
         output_viewport = output_viewport or source_viewport
         output_width, output_height = output_viewport
@@ -436,6 +459,7 @@ class WindowCaptureScope:
             self._source_viewport = source_viewport
             self._content_rect = (offset_x, offset_y, fitted_width, fitted_height)
             self._fit_scale = fit_scale
+            self._capture_source = capture_source
             if self._bound_identity is None:
                 self._bound_identity = win.identity
             if geometry_signature != self._geometry_signature:
@@ -510,8 +534,11 @@ class WindowCaptureScope:
             )
         live = self.resolve()
         self._assert_bound_identity(live)
-        if not live.on_screen:
-            raise WindowCaptureError("the target window is not on screen at action time")
+        if not live.on_screen and not live.visibility_independent:
+            raise WindowCaptureError(
+                "the target window is not visible at action time and the active "
+                "capture provider requires visibility"
+            )
         if live.bounds != window.bounds:
             raise WindowCaptureError(
                 "the target moved or resized after the last published frame; "
@@ -610,6 +637,7 @@ class WindowCaptureScope:
             source_viewport = self._source_viewport
             content_rect = self._content_rect
             fit_scale = self._fit_scale
+            capture_source = self._capture_source
             generation = self._geometry_generation
             topology = self._display_topology
         if window is None:
@@ -623,6 +651,8 @@ class WindowCaptureScope:
             "pid": window.pid,
             "process_start_time": window.process_start_time,
             "coordinate_source": window.coordinate_source,
+            "capture_source": capture_source or window.capture_source,
+            "visibility_independent": window.visibility_independent,
             "geometry_generation": generation,
             "display_topology_sha256": (
                 topology.get("topology_sha256") if topology else None
@@ -664,6 +694,7 @@ class WindowCaptureScope:
             source_viewport = self._source_viewport
             content_rect = self._content_rect
             fit_scale = self._fit_scale
+            capture_source = self._capture_source
             generation = self._geometry_generation
             topology = self._display_topology
         data: dict = {
@@ -681,6 +712,8 @@ class WindowCaptureScope:
                     "pid": window.pid,
                     "process_start_time": window.process_start_time,
                     "coordinate_source": window.coordinate_source,
+                    "capture_source": capture_source or window.capture_source,
+                    "visibility_independent": window.visibility_independent,
                     "geometry_generation": generation,
                     "initial_bounds": list(window.bounds),
                     "scale": scale,
@@ -802,19 +835,222 @@ def _process_start_time(pid: int) -> float:
         ) from exc
 
 
+_MACOS_CAPTURE_TIMEOUT_SECONDS = 15.0
+_MACOS_SC_WINDOW_CACHE: dict[int, object] = {}
+_MACOS_SC_WINDOW_CACHE_LOCK = threading.Lock()
+
+
+def _screen_capture_kit_available() -> bool:
+    """Return whether single-frame desktop-independent capture is available."""
+    try:
+        import ScreenCaptureKit
+    except ImportError:
+        return False
+    return hasattr(
+        ScreenCaptureKit.SCScreenshotManager,
+        "captureImageWithFilter_configuration_completionHandler_",
+    )
+
+
+def _macos_completion(
+    start: Callable[[Callable[..., None]], None],
+    *,
+    operation: str,
+) -> object:
+    """Wait for one ScreenCaptureKit completion without requiring an event loop."""
+    completed = threading.Event()
+    result: dict[str, object | None] = {"value": None, "error": None}
+
+    def completion(value: object | None, error: object | None) -> None:
+        result["value"] = value
+        result["error"] = error
+        completed.set()
+
+    try:
+        start(completion)
+    except Exception as exc:
+        raise WindowCaptureUnavailableError(
+            f"ScreenCaptureKit could not start {operation}"
+        ) from exc
+    if not completed.wait(_MACOS_CAPTURE_TIMEOUT_SECONDS):
+        raise WindowCaptureUnavailableError(
+            f"ScreenCaptureKit timed out during {operation}"
+        )
+    if result["error"] is not None:
+        error = result["error"]
+        code_getter = getattr(error, "code", None)
+        code = int(code_getter()) if callable(code_getter) else None
+        error_type = (
+            WindowCapturePermissionError
+            if code in {-3801, -3803}
+            else WindowCaptureError
+        )
+        raise error_type(
+            f"ScreenCaptureKit failed during {operation}"
+            + (f" (error {code})" if code is not None else "")
+        )
+    if result["value"] is None:
+        raise WindowCaptureError(
+            f"ScreenCaptureKit returned no result during {operation}"
+        )
+    return result["value"]
+
+
+def _screen_capture_kit_window(window_id: int) -> object:
+    """Return the exact shareable window, including windows on other Spaces."""
+    with _MACOS_SC_WINDOW_CACHE_LOCK:
+        cached = _MACOS_SC_WINDOW_CACHE.get(window_id)
+    if cached is not None:
+        return cached
+
+    try:
+        import ScreenCaptureKit
+    except ImportError as exc:
+        raise WindowCaptureUnavailableError(
+            "ScreenCaptureKit requires pyobjc-framework-ScreenCaptureKit"
+        ) from exc
+
+    get_content = getattr(
+        ScreenCaptureKit.SCShareableContent,
+        "getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_",
+    )
+    content = _macos_completion(
+        lambda callback: get_content(
+            True,
+            False,
+            callback,
+        ),
+        operation="window enumeration",
+    )
+    windows = list(content.windows() or [])
+    match = next(
+        (candidate for candidate in windows if int(candidate.windowID()) == window_id),
+        None,
+    )
+    if match is None:
+        raise WindowCaptureError(
+            f"ScreenCaptureKit cannot access exact window {window_id}"
+        )
+    with _MACOS_SC_WINDOW_CACHE_LOCK:
+        _MACOS_SC_WINDOW_CACHE[window_id] = match
+    return match
+
+
+def _pil_image_from_cgimage(img_ref: object, *, source: str) -> "Image.Image":
+    """Convert one ScreenCaptureKit or Quartz CGImage to stable RGB pixels."""
+    import Quartz
+    from PIL import Image
+
+    width = int(Quartz.CGImageGetWidth(img_ref))
+    height = int(Quartz.CGImageGetHeight(img_ref))
+    if width <= 0 or height <= 0:
+        raise WindowCaptureError("captured window image has zero size")
+    bytes_per_row = int(Quartz.CGImageGetBytesPerRow(img_ref))
+    provider = Quartz.CGImageGetDataProvider(img_ref)
+    data = Quartz.CGDataProviderCopyData(provider)
+    image = Image.frombuffer(
+        "RGBA",
+        (width, height),
+        bytes(data),
+        "raw",
+        "BGRA",
+        bytes_per_row,
+        1,
+    ).convert("RGB")
+    image.info["openadapt_capture_source"] = source
+    return image
+
+
+def _capture_window_macos_screencapturekit(window: TargetWindow) -> "Image.Image":
+    """Capture one exact window without requiring it to be frontmost or visible."""
+    try:
+        import ScreenCaptureKit
+    except ImportError as exc:
+        raise WindowCaptureUnavailableError(
+            "ScreenCaptureKit requires pyobjc-framework-ScreenCaptureKit"
+        ) from exc
+
+    sc_window = _screen_capture_kit_window(window.window_id)
+    content_filter = ScreenCaptureKit.SCContentFilter.alloc().initWithDesktopIndependentWindow_(
+        sc_window
+    )
+    point_scale = float(content_filter.pointPixelScale())
+    if not math.isfinite(point_scale) or point_scale <= 0:
+        raise WindowCaptureError("ScreenCaptureKit returned an invalid point-to-pixel scale")
+    configuration = ScreenCaptureKit.SCStreamConfiguration.alloc().init()
+    configuration.setWidth_(max(1, round(window.bounds[2] * point_scale)))
+    configuration.setHeight_(max(1, round(window.bounds[3] * point_scale)))
+    configuration.setShowsCursor_(False)
+    if hasattr(configuration, "setIgnoreShadowsSingleWindow_"):
+        configuration.setIgnoreShadowsSingleWindow_(True)
+    capture_image = getattr(
+        ScreenCaptureKit.SCScreenshotManager,
+        "captureImageWithFilter_configuration_completionHandler_",
+    )
+    img_ref = _macos_completion(
+        lambda callback: capture_image(
+            content_filter,
+            configuration,
+            callback,
+        ),
+        operation=f"exact-window capture for window {window.window_id}",
+    )
+    return _pil_image_from_cgimage(img_ref, source="macos-screencapturekit")
+
+
+def _capture_window_macos_utility(window: TargetWindow) -> "Image.Image":
+    """Use the signed system utility as an exact-window compatibility path."""
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory(prefix="openadapt-window-") as temp_dir:
+        capture_path = f"{temp_dir}/window.png"
+        try:
+            result = subprocess.run(
+                [
+                    "/usr/sbin/screencapture",
+                    "-x",
+                    "-o",
+                    "-l",
+                    str(window.window_id),
+                    capture_path,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_MACOS_CAPTURE_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise WindowCaptureUnavailableError(
+                "the macOS exact-window compatibility capture could not run"
+            ) from exc
+        if result.returncode != 0:
+            raise WindowCapturePermissionError(
+                "the macOS exact-window compatibility capture was denied"
+            )
+        try:
+            with Image.open(capture_path) as image:
+                captured = image.convert("RGB").copy()
+        except OSError as exc:
+            raise WindowCaptureError(
+                "the macOS exact-window compatibility capture produced no readable image"
+            ) from exc
+    captured.info["openadapt_capture_source"] = "macos-screencapture-utility"
+    return captured
+
+
 def _resolve_window_macos(target: WindowTarget) -> TargetWindow | None:
     """macOS: CGWindowList by owner/title substring.
 
-    Selects the largest visible layer-0 window that matches the configured
-    owner/title substrings.
+    ScreenCaptureKit can capture an occluded window or a window on another
+    Space. Older macOS versions retain the visible-window Quartz behavior.
     """
     import Quartz
 
+    visibility_independent = _screen_capture_kit_available()
     owner_l = target.owner.lower() if target.owner else None
     title_l = target.title.lower() if target.title else None
     wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID)
-    best: TargetWindow | None = None
-    best_area = -1.0
+    matches: list[TargetWindow] = []
     for w in wins or []:
         owner = str(w.get("kCGWindowOwnerName", "") or "")
         name = str(w.get("kCGWindowName", "") or "")
@@ -824,7 +1060,8 @@ def _resolve_window_macos(target: WindowTarget) -> TargetWindow | None:
             continue
         if int(w.get("kCGWindowLayer", 0) or 0) != 0:
             continue  # skip menubar/overlay layers; the app window is layer 0
-        if not bool(w.get("kCGWindowIsOnscreen", False)):
+        on_screen = bool(w.get("kCGWindowIsOnscreen", False))
+        if not on_screen and not visibility_independent:
             continue
         b = w.get("kCGWindowBounds", {}) or {}
         bounds = (
@@ -833,58 +1070,100 @@ def _resolve_window_macos(target: WindowTarget) -> TargetWindow | None:
             float(b.get("Width", 0.0)),
             float(b.get("Height", 0.0)),
         )
-        area = bounds[2] * bounds[3]
-        if area > best_area:
-            best_area = area
-            pid = int(w.get("kCGWindowOwnerPID", 0) or 0)
-            best = TargetWindow(
+        if bounds[2] <= 0 or bounds[3] <= 0:
+            continue
+        pid = int(w.get("kCGWindowOwnerPID", 0) or 0)
+        matches.append(
+            TargetWindow(
                 window_id=int(w.get("kCGWindowNumber", 0) or 0),
                 owner=owner,
                 title=name,
                 pid=pid,
                 bounds=bounds,
-                on_screen=bool(w.get("kCGWindowIsOnscreen", False)),
+                on_screen=on_screen,
                 process_start_time=_process_start_time(pid),
                 coordinate_source="quartz-screen-points",
+                capture_source=(
+                    "macos-exact-window-provider-chain"
+                    if visibility_independent
+                    else "macos-quartz-window-image"
+                ),
+                visibility_independent=visibility_independent,
             )
-    return best
+        )
+    if not matches:
+        return None
+
+    exact = [
+        match
+        for match in matches
+        if (target.owner is None or match.owner.casefold() == target.owner.casefold())
+        and (target.title is None or match.title.casefold() == target.title.casefold())
+    ]
+    candidates = exact or matches
+    if len(candidates) != 1:
+        raise WindowCaptureAmbiguousError(
+            f"window selectors matched {len(candidates)} capturable windows; "
+            "provide the complete window title"
+        )
+    return candidates[0]
 
 
 def _capture_window_macos(window: TargetWindow) -> "Image.Image":
-    """macOS: per-window capture via ``CGWindowListCreateImage``.
+    """Capture an exact macOS window through an explicit provider chain.
 
-    The identical call (``CGRectNull`` + ``kCGWindowListOptionIncludingWindow``
-    + ``kCGWindowImageBoundsIgnoreFraming``) and BGRA->RGB conversion as flow's
-    ``MacWindowClient.capture`` — the replay surface — so recorded frames and
-    replay frames share coordinate semantics byte for byte.
+    ScreenCaptureKit is primary. Quartz remains for older systems. The signed
+    system utility is the final exact-window compatibility path. No provider
+    can substitute a full-screen image or another window.
     """
     import Quartz
-    from PIL import Image
 
-    img_ref = Quartz.CGWindowListCreateImage(
-        Quartz.CGRectNull,
-        Quartz.kCGWindowListOptionIncludingWindow,
-        window.window_id,
-        Quartz.kCGWindowImageBoundsIgnoreFraming,
-    )
-    if img_ref is None:
-        raise WindowCaptureError(
-            f"CGWindowListCreateImage returned None for window "
-            f"{window.window_id} ({window.owner!r}); if this recurs, check "
-            "Screen Recording permission for the recording process"
+    failures: list[BaseException] = []
+    if _screen_capture_kit_available():
+        try:
+            return _capture_window_macos_screencapturekit(window)
+        except WindowCaptureError as exc:
+            failures.append(exc)
+            logger.warning(
+                "ScreenCaptureKit exact-window capture failed; trying the "
+                "legacy exact-window providers"
+            )
+
+    img_ref = None
+    if window.on_screen:
+        img_ref = Quartz.CGWindowListCreateImage(
+            Quartz.CGRectNull,
+            Quartz.kCGWindowListOptionIncludingWindow,
+            window.window_id,
+            Quartz.kCGWindowImageBoundsIgnoreFraming,
         )
-    w = int(Quartz.CGImageGetWidth(img_ref))
-    h = int(Quartz.CGImageGetHeight(img_ref))
-    if w <= 0 or h <= 0:
-        raise WindowCaptureError("captured window image has zero size")
-    bpr = int(Quartz.CGImageGetBytesPerRow(img_ref))
-    provider = Quartz.CGImageGetDataProvider(img_ref)
-    data = Quartz.CGDataProviderCopyData(provider)
-    buf = bytes(data)
-    # CGImage from the window server is BGRA, premultiplied; read with the row
-    # stride and drop alpha for a stable RGB frame.
-    img = Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", bpr, 1)
-    return img.convert("RGB")
+    if img_ref is not None:
+        return _pil_image_from_cgimage(img_ref, source="macos-quartz-window-image")
+    failures.append(
+        WindowCapturePermissionError(
+            (
+                "Quartz returned no image"
+                if window.on_screen
+                else "Quartz was skipped because the target is not on screen"
+            )
+            + f" for exact window {window.window_id}"
+        )
+    )
+    try:
+        return _capture_window_macos_utility(window)
+    except WindowCaptureError as exc:
+        failures.append(exc)
+        failure = WindowCaptureError(
+            f"all exact-window capture providers failed for window {window.window_id}"
+        )
+        for provider_failure in failures:
+            try:
+                failure.add_note(
+                    f"{type(provider_failure).__name__}: {provider_failure}"
+                )
+            except AttributeError:  # Python 3.10
+                pass
+        raise failure from exc
 
 
 def _resolve_window_windows(target: WindowTarget) -> TargetWindow | None:

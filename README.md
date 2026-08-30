@@ -213,6 +213,11 @@ producing media that looks complete but has an evidence gap. The full contract,
 including the multi-monitor rules and the coordinate-space flags converters
 must respect, is in [docs/WINDOW_CAPTURE.md](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/WINDOW_CAPTURE.md).
 
+On current macOS, exact-window capture uses ScreenCaptureKit and does not
+require the window to be frontmost. It can capture an occluded window or a
+window on another Space. The recorder still needs a logged-in desktop session,
+and a minimized window must return a valid exact frame.
+
 Linux window mode needs X11 with EWMH and XComposite. It refuses to start under
 native Wayland or XWayland-only.
 
@@ -263,7 +268,7 @@ Flow instead: [docs/BROWSER_EXTENSION_BOUNDARY.md](https://github.com/OpenAdaptA
 
 ## Limits
 
-- Native recording needs a visible user session plus the operating system's
+- Native recording needs a logged-in user session plus the operating system's
   screen-recording and input-monitoring permissions.
 - Accessibility evidence appears only where the application and the local
   provider expose it. An opaque remote application still needs Flow's visual

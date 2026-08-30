@@ -37,10 +37,17 @@ matching how `openadapt-flow` identifies the same window at replay time. The
 selectors can also be set through config or environment
 (`RECORD_WINDOW_OWNER` / `RECORD_WINDOW_TITLE`).
 
+On macOS, a selector that still matches multiple capturable windows fails.
+Use the complete title. Capture never chooses the largest match when that can
+bind the recording to a different window.
+
 In this mode:
 
-- **Frames are the target window's pixels.** macOS captures the window's own
-  buffer (`CGWindowListCreateImage`, the identical call flow's replay uses);
+- **Frames are the target window's pixels.** On current macOS, ScreenCaptureKit
+  captures a desktop-independent exact-window filter. The legacy Quartz image
+  API and `/usr/sbin/screencapture -o -l` remain exact-window compatibility
+  paths. This supports an occluded window and a window on another Space. A
+  minimized window must still return a valid exact frame or the session fails.
   Linux X11 reads an XComposite named-window pixmap. It doesn't use a root
   screenshot, so another window cannot replace the target pixels. Windows
   grabs the window's screen region, so keep the window unoccluded.
@@ -71,6 +78,9 @@ In this mode:
   with a warning instead of being recorded in the wrong coordinate space; a
   lost window, capture failure, or unexpected output-frame size fails the
   session instead of producing complete-looking media with an evidence gap.
+
+The persisted frame state names the provider that produced the pixels and
+whether the provider was independent of window visibility.
 
 Linux window mode requires an X11 session with EWMH and XComposite. Capture
 won't start window mode in a native Wayland or XWayland-only session. A future
