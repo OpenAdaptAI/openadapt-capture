@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## Unreleased
+
+### Features
+
+- Add attended authentication handoffs. Capture suppresses sensitive source
+  data, seals a bounded method marker, and retains a fresh exact frame before
+  native input resumes. The same retry-safe operations are available through
+  the authenticated local control channel.
+
 ## v1.3.0 (2026-08-28)
 
 _This release is published under the MIT License._

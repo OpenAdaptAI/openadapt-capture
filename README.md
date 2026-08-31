@@ -16,7 +16,8 @@ recorder as a library.
 
 [Documentation](https://docs.openadapt.ai) ·
 [Flow](https://github.com/OpenAdaptAI/openadapt-flow) ·
-[Window capture](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/WINDOW_CAPTURE.md)
+[Window capture](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/WINDOW_CAPTURE.md) ·
+[Authentication handoffs](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/AUTHENTICATION_HANDOFF.md)
 
 ## With OpenAdapt
 
@@ -88,6 +89,7 @@ A finished capture looks like this:
 
 ```text
 my-capture/
+├── authentication-handoffs.json
 ├── capture-state.json
 ├── recording.db
 ├── oa_recording-*.mp4
@@ -107,6 +109,30 @@ an authenticated session capability that lives in an owner-only runtime file
 (`0700`/`0600` on macOS and Linux, a protected current-user DACL on Windows).
 On macOS it also removes extended ACL entries and verifies they are absent. The
 capability never reaches command arguments, logs, or the capture directory.
+
+## Authentication inside a recording
+
+Authenticate before recording when the demonstration does not need the login.
+When login belongs inside the workflow, start an authentication handoff. Capture
+then drops screen, input, structural, window, browser-category, and microphone
+content at the source boundary. It stores a sealed marker with method classes
+and booleans. It has no field for a credential or account identifier.
+
+```python
+handoff = recorder.begin_authentication(
+    methods="password_manager",
+    requires_user_presence=True,
+    saved_account_selected=True,
+)
+# Select the saved account and finish any MFA prompt.
+marker = recorder.end_authentication(handoff, outcome="completed")
+```
+
+The end call returns after Capture retains a new exact frame. Input stays
+blocked if that frame fails. A launcher can use the authenticated
+`begin_authentication_handoff()` and `end_authentication_handoff()` process
+control functions for the same contract. See
+[the authentication handoff contract](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/AUTHENTICATION_HANDOFF.md).
 
 ## FFmpeg
 
@@ -231,6 +257,9 @@ native Wayland or XWayland-only.
 A raw capture can hold everything visible on screen and everything typed:
 credentials, personal data, protected health information. Keep the whole
 directory inside its approved local boundary and give it a retention policy.
+
+An authentication handoff prevents the named login interval from entering the
+raw capture. Content retained before or after that interval remains sensitive.
 
 Capture doesn't upload a session. The sharing command and the profiling
 transfer are the only two transfers and both are explicit. Installing the
