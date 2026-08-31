@@ -43,11 +43,17 @@ bind the recording to a different window.
 
 In this mode:
 
-- **Frames are the target window's pixels.** On current macOS, ScreenCaptureKit
-  captures a desktop-independent exact-window filter. The legacy Quartz image
-  API and `/usr/sbin/screencapture -o -l` remain exact-window compatibility
-  paths. This supports an occluded window and a window on another Space. A
-  minimized window must still return a valid exact frame or the session fails.
+- **Frames are the target window's pixels.** On current macOS, one persistent
+  ScreenCaptureKit stream stays bound to a desktop-independent exact-window
+  filter. It accepts complete frames and reuses the last complete pixels only
+  when ScreenCaptureKit reports that the window is idle. Each window event
+  retains the stream generation, sequence, frame status, display time, pixel
+  time, and a capture-evidence digest. The legacy Quartz
+  image API and `/usr/sbin/screencapture -o -l` remain exact-window
+  compatibility paths. A failed provider stays disabled for that recording.
+  This supports an occluded window and a window on another Space. It also
+  supports a window that macOS does not report as on screen. A minimized window
+  must still return a valid exact frame or the session fails.
   Linux X11 reads an XComposite named-window pixmap. It doesn't use a root
   screenshot, so another window cannot replace the target pixels. Windows
   grabs the window's screen region, so keep the window unoccluded.

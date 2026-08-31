@@ -213,10 +213,13 @@ producing media that looks complete but has an evidence gap. The full contract,
 including the multi-monitor rules and the coordinate-space flags converters
 must respect, is in [docs/WINDOW_CAPTURE.md](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/WINDOW_CAPTURE.md).
 
-On current macOS, exact-window capture uses ScreenCaptureKit and does not
-require the window to be frontmost. It can capture an occluded window or a
-window on another Space. The recorder still needs a logged-in desktop session,
-and a minimized window must return a valid exact frame.
+On current macOS, exact-window capture keeps one ScreenCaptureKit stream bound
+to a desktop-independent window filter. The window can be occluded or on
+another Space. It does not need to be frontmost or reported as on screen. The
+recorder accepts complete frames and proven idle frames. A failed provider is
+disabled for the rest of that recording, so each frame does not repeat a slow
+failure. The recorder still needs a logged-in desktop session. A minimized
+window must return a valid exact frame.
 
 Linux window mode needs X11 with EWMH and XComposite. It refuses to start under
 native Wayland or XWayland-only.

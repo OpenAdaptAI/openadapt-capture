@@ -36,10 +36,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, Optional
@@ -78,6 +80,35 @@ def window_geometry_epoch_sha256(state: dict) -> str:
     encoded = json.dumps(
         {
             "schema_domain": "openadapt.capture.window-geometry-epoch/v1",
+            **payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def window_capture_evidence_sha256(state: dict) -> str:
+    """Hash provider evidence without changing the stable geometry digest."""
+    payload = {
+        key: state.get(key)
+        for key in (
+            "geometry_epoch_sha256",
+            "capture_source",
+            "visibility_independent",
+            "on_screen",
+            "frame_status",
+            "frame_display_time",
+            "pixel_display_time",
+            "stream_generation",
+            "stream_sequence",
+        )
+    }
+    encoded = json.dumps(
+        {
+            "schema_domain": "openadapt.capture.window-frame-evidence/v1",
             **payload,
         },
         sort_keys=True,
@@ -152,7 +183,7 @@ class WindowTarget:
 
 @dataclass(frozen=True)
 class TargetWindow:
-    """One resolved on-screen window.
+    """One resolved exact window.
 
     ``bounds`` is ``(x, y, w, h)`` in screen points, top-left origin — the
     same space as native global mouse coordinates. Same field semantics as
@@ -223,11 +254,19 @@ class WindowCaptureScope:
         target: WindowTarget,
         resolver: ResolverFn | None = None,
         capturer: CapturerFn | None = None,
+        frame_rate: float | None = None,
     ) -> None:
         """Initialize the scope for ``target``."""
         self.target = target
         self._resolver = resolver or resolve_window
-        self._capturer = capturer or capture_window
+        self._capture_provider = None
+        if capturer is None and sys.platform == "darwin":
+            self._capture_provider = _MacOSWindowCaptureProvider(
+                frame_rate=frame_rate,
+            )
+            self._capturer = self._capture_provider.capture
+        else:
+            self._capturer = capturer or capture_window
         self._lock = threading.Lock()
         self._observation_lock = threading.RLock()
         self._window: TargetWindow | None = None
@@ -239,6 +278,11 @@ class WindowCaptureScope:
         self._content_rect: tuple[int, int, int, int] | None = None
         self._fit_scale: float | None = None
         self._capture_source: str | None = None
+        self._frame_status: str | None = None
+        self._frame_display_time: int | None = None
+        self._pixel_display_time: int | None = None
+        self._stream_sequence: int | None = None
+        self._stream_generation: int | None = None
         self._geometry_generation = 0
         self._geometry_signature: tuple | None = None
         self._published_generation = 0
@@ -254,6 +298,17 @@ class WindowCaptureScope:
         # resolve() (e.g. a pre-flight existence check) never suppresses the
         # first frame's timeline entry.
         self._frame_window: TargetWindow | None = None
+
+    def close(self) -> None:
+        """Release an owned platform capture provider.
+
+        Injected capturers remain caller-owned. The macOS recorder owns one
+        persistent ScreenCaptureKit stream and must stop it before the session
+        reaches its terminal state.
+        """
+        provider = self._capture_provider
+        if provider is not None:
+            provider.close()
 
     @contextmanager
     def observation_boundary(self) -> Iterator[None]:
@@ -408,6 +463,11 @@ class WindowCaptureScope:
         capture_source = str(
             source_image.info.get("openadapt_capture_source", win.capture_source)
         )
+        frame_status = source_image.info.get("openadapt_frame_status")
+        frame_display_time = source_image.info.get("openadapt_frame_display_time")
+        pixel_display_time = source_image.info.get("openadapt_pixel_display_time")
+        stream_sequence = source_image.info.get("openadapt_stream_sequence")
+        stream_generation = source_image.info.get("openadapt_stream_generation")
         source_viewport = (source_image.width, source_image.height)
         output_viewport = output_viewport or source_viewport
         output_width, output_height = output_viewport
@@ -460,6 +520,21 @@ class WindowCaptureScope:
             self._content_rect = (offset_x, offset_y, fitted_width, fitted_height)
             self._fit_scale = fit_scale
             self._capture_source = capture_source
+            self._frame_status = (
+                str(frame_status) if frame_status is not None else None
+            )
+            self._frame_display_time = (
+                int(frame_display_time) if frame_display_time is not None else None
+            )
+            self._pixel_display_time = (
+                int(pixel_display_time) if pixel_display_time is not None else None
+            )
+            self._stream_sequence = (
+                int(stream_sequence) if stream_sequence is not None else None
+            )
+            self._stream_generation = (
+                int(stream_generation) if stream_generation is not None else None
+            )
             if self._bound_identity is None:
                 self._bound_identity = win.identity
             if geometry_signature != self._geometry_signature:
@@ -638,6 +713,11 @@ class WindowCaptureScope:
             content_rect = self._content_rect
             fit_scale = self._fit_scale
             capture_source = self._capture_source
+            frame_status = self._frame_status
+            frame_display_time = self._frame_display_time
+            pixel_display_time = self._pixel_display_time
+            stream_sequence = self._stream_sequence
+            stream_generation = self._stream_generation
             generation = self._geometry_generation
             topology = self._display_topology
         if window is None:
@@ -653,6 +733,11 @@ class WindowCaptureScope:
             "coordinate_source": window.coordinate_source,
             "capture_source": capture_source or window.capture_source,
             "visibility_independent": window.visibility_independent,
+            "frame_status": frame_status,
+            "frame_display_time": frame_display_time,
+            "pixel_display_time": pixel_display_time,
+            "stream_generation": stream_generation,
+            "stream_sequence": stream_sequence,
             "geometry_generation": generation,
             "display_topology_sha256": (
                 topology.get("topology_sha256") if topology else None
@@ -668,6 +753,7 @@ class WindowCaptureScope:
             "on_screen": window.on_screen,
         }
         state["geometry_epoch_sha256"] = window_geometry_epoch_sha256(state)
+        state["capture_evidence_sha256"] = window_capture_evidence_sha256(state)
         return {
             "title": window.title,
             "left": int(x),
@@ -836,19 +922,63 @@ def _process_start_time(pid: int) -> float:
 
 
 _MACOS_CAPTURE_TIMEOUT_SECONDS = 15.0
-_MACOS_SC_WINDOW_CACHE: dict[int, object] = {}
-_MACOS_SC_WINDOW_CACHE_LOCK = threading.Lock()
+_MACOS_PROVIDER_CHAIN_TIMEOUT_SECONDS = 20.0
+_MACOS_SCK_ATTEMPT_TIMEOUT_SECONDS = 12.0
+_MACOS_RUNTIME_LOCK = threading.Lock()
+_MACOS_RUNTIME_READY = False
+_MACOS_SC_OUTPUT_CLASS: type | None = None
+_MACOS_SC_OUTPUT_CLASS_LOCK = threading.Lock()
+
+
+def prepare_macos_window_capture_runtime() -> None:
+    """Initialize AppKit before ScreenCaptureKit runs on a worker thread."""
+    global _MACOS_RUNTIME_READY
+    if (
+        sys.platform != "darwin"
+        or _MACOS_RUNTIME_READY
+        or not _screen_capture_kit_available()
+    ):
+        return
+    with _MACOS_RUNTIME_LOCK:
+        if _MACOS_RUNTIME_READY:
+            return
+        try:
+            import AppKit
+
+            loaded = AppKit.NSApplicationLoad()
+        except (ImportError, OSError) as exc:
+            raise WindowCaptureUnavailableError(
+                "macOS window capture could not initialize AppKit"
+            ) from exc
+        if loaded is False:
+            raise WindowCaptureUnavailableError(
+                "macOS window capture could not load AppKit"
+            )
+        _MACOS_RUNTIME_READY = True
 
 
 def _screen_capture_kit_available() -> bool:
-    """Return whether single-frame desktop-independent capture is available."""
+    """Return whether persistent desktop-independent capture is available."""
     try:
         import ScreenCaptureKit
     except ImportError:
         return False
-    return hasattr(
-        ScreenCaptureKit.SCScreenshotManager,
-        "captureImageWithFilter_configuration_completionHandler_",
+    return all(
+        hasattr(ScreenCaptureKit, name)
+        for name in (
+            "SCContentFilter",
+            "SCShareableContent",
+            "SCStream",
+            "SCStreamConfiguration",
+        )
+    )
+
+
+def _macos_visibility_independent_capture_available() -> bool:
+    """Return whether an exact window can be captured without visibility."""
+    return _screen_capture_kit_available() or (
+        os.path.isfile("/usr/sbin/screencapture")
+        and os.access("/usr/sbin/screencapture", os.X_OK)
     )
 
 
@@ -856,6 +986,7 @@ def _macos_completion(
     start: Callable[[Callable[..., None]], None],
     *,
     operation: str,
+    timeout_seconds: float = _MACOS_CAPTURE_TIMEOUT_SECONDS,
 ) -> object:
     """Wait for one ScreenCaptureKit completion without requiring an event loop."""
     completed = threading.Event()
@@ -872,7 +1003,7 @@ def _macos_completion(
         raise WindowCaptureUnavailableError(
             f"ScreenCaptureKit could not start {operation}"
         ) from exc
-    if not completed.wait(_MACOS_CAPTURE_TIMEOUT_SECONDS):
+    if not completed.wait(max(0.001, timeout_seconds)):
         raise WindowCaptureUnavailableError(
             f"ScreenCaptureKit timed out during {operation}"
         )
@@ -896,13 +1027,51 @@ def _macos_completion(
     return result["value"]
 
 
-def _screen_capture_kit_window(window_id: int) -> object:
-    """Return the exact shareable window, including windows on other Spaces."""
-    with _MACOS_SC_WINDOW_CACHE_LOCK:
-        cached = _MACOS_SC_WINDOW_CACHE.get(window_id)
-    if cached is not None:
-        return cached
+def _macos_error_completion(
+    start: Callable[[Callable[[object | None], None]], None],
+    *,
+    operation: str,
+    timeout_seconds: float = _MACOS_CAPTURE_TIMEOUT_SECONDS,
+) -> None:
+    """Wait for a ScreenCaptureKit start/stop completion callback."""
+    completed = threading.Event()
+    result: dict[str, object | None] = {"error": None}
 
+    def completion(error: object | None) -> None:
+        result["error"] = error
+        completed.set()
+
+    try:
+        start(completion)
+    except Exception as exc:
+        raise WindowCaptureUnavailableError(
+            f"ScreenCaptureKit could not start {operation}"
+        ) from exc
+    if not completed.wait(max(0.001, timeout_seconds)):
+        raise WindowCaptureUnavailableError(
+            f"ScreenCaptureKit timed out during {operation}"
+        )
+    if result["error"] is not None:
+        error = result["error"]
+        code_getter = getattr(error, "code", None)
+        code = int(code_getter()) if callable(code_getter) else None
+        error_type = (
+            WindowCapturePermissionError
+            if code in {-3801, -3803}
+            else WindowCaptureError
+        )
+        raise error_type(
+            f"ScreenCaptureKit failed during {operation}"
+            + (f" (error {code})" if code is not None else "")
+        )
+
+
+def _screen_capture_kit_window(
+    window_id: int,
+    *,
+    timeout_seconds: float = _MACOS_CAPTURE_TIMEOUT_SECONDS,
+) -> object:
+    """Return the exact shareable window, including windows on other Spaces."""
     try:
         import ScreenCaptureKit
     except ImportError as exc:
@@ -921,6 +1090,7 @@ def _screen_capture_kit_window(window_id: int) -> object:
             callback,
         ),
         operation="window enumeration",
+        timeout_seconds=timeout_seconds,
     )
     windows = list(content.windows() or [])
     match = next(
@@ -931,8 +1101,6 @@ def _screen_capture_kit_window(window_id: int) -> object:
         raise WindowCaptureError(
             f"ScreenCaptureKit cannot access exact window {window_id}"
         )
-    with _MACOS_SC_WINDOW_CACHE_LOCK:
-        _MACOS_SC_WINDOW_CACHE[window_id] = match
     return match
 
 
@@ -961,44 +1129,434 @@ def _pil_image_from_cgimage(img_ref: object, *, source: str) -> "Image.Image":
     return image
 
 
-def _capture_window_macos_screencapturekit(window: TargetWindow) -> "Image.Image":
-    """Capture one exact window without requiring it to be frontmost or visible."""
+def _screen_capture_kit_output_class() -> type:
+    """Build the Objective-C stream delegate once, without display access."""
+    global _MACOS_SC_OUTPUT_CLASS
+    if _MACOS_SC_OUTPUT_CLASS is not None:
+        return _MACOS_SC_OUTPUT_CLASS
+    with _MACOS_SC_OUTPUT_CLASS_LOCK:
+        if _MACOS_SC_OUTPUT_CLASS is not None:
+            return _MACOS_SC_OUTPUT_CLASS
+        try:
+            import objc
+            from Foundation import NSObject
+        except ImportError as exc:
+            raise WindowCaptureUnavailableError(
+                "ScreenCaptureKit requires PyObjC Cocoa bindings"
+            ) from exc
+
+        class OpenAdaptSCStreamOutput(
+            NSObject,
+            protocols=[
+                objc.protocolNamed("SCStreamOutput"),
+                objc.protocolNamed("SCStreamDelegate"),
+            ],
+        ):
+            def initWithOwner_(self, owner):
+                self = objc.super(OpenAdaptSCStreamOutput, self).init()
+                if self is not None:
+                    self._openadapt_owner = owner
+                return self
+
+            @objc.typedSelector(b"v@:@^{opaqueCMSampleBuffer=}q")
+            def stream_didOutputSampleBuffer_ofType_(
+                self,
+                _stream,
+                sample_buffer,
+                output_type,
+            ):
+                self._openadapt_owner._receive_sample(
+                    self._openadapt_generation,
+                    sample_buffer,
+                    output_type,
+                )
+
+            @objc.typedSelector(b"v@:@@")
+            def stream_didStopWithError_(self, _stream, error):
+                self._openadapt_owner._receive_stop(
+                    self._openadapt_generation,
+                    error,
+                )
+
+        _MACOS_SC_OUTPUT_CLASS = OpenAdaptSCStreamOutput
+        return _MACOS_SC_OUTPUT_CLASS
+
+
+def _macos_dispatch_queue(label: bytes) -> object:
+    """Create the serial dispatch queue required by SCStreamOutput."""
     try:
-        import ScreenCaptureKit
-    except ImportError as exc:
+        import objc
+
+        functions: dict[str, object] = {}
+        objc.loadBundleFunctions(None, functions, [("dispatch_queue_create", b"@*@")])
+        return functions["dispatch_queue_create"](label, None)
+    except Exception as exc:
         raise WindowCaptureUnavailableError(
-            "ScreenCaptureKit requires pyobjc-framework-ScreenCaptureKit"
+            "ScreenCaptureKit could not create its callback queue"
         ) from exc
 
-    sc_window = _screen_capture_kit_window(window.window_id)
-    content_filter = ScreenCaptureKit.SCContentFilter.alloc().initWithDesktopIndependentWindow_(
-        sc_window
+
+def _pil_image_from_sample_buffer(sample_buffer: object) -> "Image.Image":
+    """Copy a ScreenCaptureKit sample buffer into stable RGB pixels."""
+    try:
+        import CoreMedia
+        import Quartz
+
+        pixel_buffer = CoreMedia.CMSampleBufferGetImageBuffer(sample_buffer)
+        if pixel_buffer is None:
+            raise WindowCaptureError("ScreenCaptureKit returned no pixel buffer")
+        ci_image = Quartz.CIImage.imageWithCVPixelBuffer_(pixel_buffer)
+        context = Quartz.CIContext.contextWithOptions_(None)
+        img_ref = context.createCGImage_fromRect_(ci_image, ci_image.extent())
+    except WindowCaptureError:
+        raise
+    except Exception as exc:
+        raise WindowCaptureError(
+            "ScreenCaptureKit returned an unreadable pixel buffer"
+        ) from exc
+    if img_ref is None:
+        raise WindowCaptureError("ScreenCaptureKit returned no window image")
+    return _pil_image_from_cgimage(
+        img_ref,
+        source="macos-screencapturekit-stream",
     )
-    point_scale = float(content_filter.pointPixelScale())
-    if not math.isfinite(point_scale) or point_scale <= 0:
-        raise WindowCaptureError("ScreenCaptureKit returned an invalid point-to-pixel scale")
-    configuration = ScreenCaptureKit.SCStreamConfiguration.alloc().init()
-    configuration.setWidth_(max(1, round(window.bounds[2] * point_scale)))
-    configuration.setHeight_(max(1, round(window.bounds[3] * point_scale)))
-    configuration.setShowsCursor_(False)
-    if hasattr(configuration, "setIgnoreShadowsSingleWindow_"):
-        configuration.setIgnoreShadowsSingleWindow_(True)
-    capture_image = getattr(
-        ScreenCaptureKit.SCScreenshotManager,
-        "captureImageWithFilter_configuration_completionHandler_",
-    )
-    img_ref = _macos_completion(
-        lambda callback: capture_image(
+
+
+class _MacOSScreenCaptureKitStream:
+    """One persistent desktop-independent stream for one exact window ID."""
+
+    def __init__(self, *, frame_rate: float | None = None) -> None:
+        self._condition = threading.Condition()
+        self._capture_lock = threading.RLock()
+        self._stream = None
+        self._delegate = None
+        self._queue = None
+        self._window_id: int | None = None
+        self._bounds_size: tuple[float, float] | None = None
+        self._sequence = 0
+        self._delivered_sequence = 0
+        self._last_complete_image = None
+        self._last_complete_display_time: int | None = None
+        self._last_display_time: int | None = None
+        self._last_status: int | None = None
+        self._error: WindowCaptureError | None = None
+        self._closing = False
+        self._closed = False
+        self._generation = 0
+        self._frame_rate = (
+            float(frame_rate)
+            if frame_rate is not None
+            and math.isfinite(float(frame_rate))
+            and float(frame_rate) > 0
+            else 10.0
+        )
+
+    def _receive_sample(
+        self,
+        generation: int,
+        sample_buffer: object,
+        output_type: int,
+    ) -> None:
+        with self._condition:
+            if generation != self._generation or self._closing or self._closed:
+                return
+        try:
+            import CoreMedia
+            import ScreenCaptureKit
+
+            if int(output_type) != int(ScreenCaptureKit.SCStreamOutputTypeScreen):
+                return
+            attachments = CoreMedia.CMSampleBufferGetSampleAttachmentsArray(
+                sample_buffer,
+                False,
+            )
+            attachment = list(attachments or [])[0] if attachments else {}
+            status_value = attachment.get(ScreenCaptureKit.SCStreamFrameInfoStatus)
+            if status_value is None:
+                raise WindowCaptureError(
+                    "ScreenCaptureKit frame has no explicit status"
+                )
+            status = int(status_value)
+            display_time_value = attachment.get(
+                ScreenCaptureKit.SCStreamFrameInfoDisplayTime
+            )
+            if display_time_value is None:
+                raise WindowCaptureError(
+                    "ScreenCaptureKit frame has no display time"
+                )
+            display_time = int(display_time_value)
+            image = None
+            error = None
+            if status == int(ScreenCaptureKit.SCFrameStatusComplete):
+                image = _pil_image_from_sample_buffer(sample_buffer)
+            elif status not in (
+                int(ScreenCaptureKit.SCFrameStatusIdle),
+                int(ScreenCaptureKit.SCFrameStatusStarted),
+            ):
+                error = WindowCaptureError(
+                    f"ScreenCaptureKit returned unusable frame status {status}"
+                )
+        except Exception as exc:
+            image = None
+            status = -1
+            display_time = None
+            error = (
+                exc
+                if isinstance(exc, WindowCaptureError)
+                else WindowCaptureError("ScreenCaptureKit frame processing failed")
+            )
+        with self._condition:
+            if generation != self._generation or self._closing or self._closed:
+                return
+            self._sequence += 1
+            self._last_status = status
+            if display_time is not None:
+                self._last_display_time = display_time
+            if image is not None:
+                self._last_complete_image = image
+                self._last_complete_display_time = display_time
+            if error is not None:
+                self._error = error
+            self._condition.notify_all()
+
+    def _receive_stop(self, generation: int, error: object | None) -> None:
+        with self._condition:
+            if generation != self._generation:
+                return
+            if not self._closing:
+                code_getter = getattr(error, "code", None)
+                code = int(code_getter()) if callable(code_getter) else None
+                self._error = WindowCaptureError(
+                    "ScreenCaptureKit stopped the exact-window stream"
+                    + (f" (error {code})" if code is not None else "")
+                )
+            self._condition.notify_all()
+
+    @staticmethod
+    def _remaining(deadline: float, operation: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WindowCaptureUnavailableError(
+                f"ScreenCaptureKit timed out before {operation}"
+            )
+        return remaining
+
+    def _start(self, window: TargetWindow, *, deadline: float) -> None:
+        try:
+            import CoreMedia
+            import ScreenCaptureKit
+        except ImportError as exc:
+            raise WindowCaptureUnavailableError(
+                "ScreenCaptureKit requires its PyObjC framework bindings"
+            ) from exc
+
+        prepare_macos_window_capture_runtime()
+        sc_window = _screen_capture_kit_window(
+            window.window_id,
+            timeout_seconds=self._remaining(deadline, "window enumeration"),
+        )
+        content_filter = (
+            ScreenCaptureKit.SCContentFilter.alloc().initWithDesktopIndependentWindow_(
+                sc_window
+            )
+        )
+        point_scale = float(content_filter.pointPixelScale())
+        if not math.isfinite(point_scale) or point_scale <= 0:
+            raise WindowCaptureError(
+                "ScreenCaptureKit returned an invalid point-to-pixel scale"
+            )
+        configuration = ScreenCaptureKit.SCStreamConfiguration.alloc().init()
+        configuration.setWidth_(max(1, round(window.bounds[2] * point_scale)))
+        configuration.setHeight_(max(1, round(window.bounds[3] * point_scale)))
+        configuration.setShowsCursor_(False)
+        configuration.setQueueDepth_(3)
+        configuration.setMinimumFrameInterval_(
+            CoreMedia.CMTimeMakeWithSeconds(1.0 / self._frame_rate, 600)
+        )
+        if hasattr(configuration, "setIgnoreShadowsSingleWindow_"):
+            configuration.setIgnoreShadowsSingleWindow_(True)
+
+        with self._condition:
+            if self._closed:
+                raise WindowCaptureError("ScreenCaptureKit stream is closed")
+            self._generation += 1
+            generation = self._generation
+        output_class = _screen_capture_kit_output_class()
+        delegate = output_class.alloc().initWithOwner_(self)
+        delegate._openadapt_generation = generation
+        queue = _macos_dispatch_queue(
+            f"ai.openadapt.capture.window.{window.window_id}".encode("ascii")
+        )
+        stream = ScreenCaptureKit.SCStream.alloc().initWithFilter_configuration_delegate_(
             content_filter,
             configuration,
-            callback,
-        ),
-        operation=f"exact-window capture for window {window.window_id}",
-    )
-    return _pil_image_from_cgimage(img_ref, source="macos-screencapturekit")
+            delegate,
+        )
+        result = stream.addStreamOutput_type_sampleHandlerQueue_error_(
+            delegate,
+            ScreenCaptureKit.SCStreamOutputTypeScreen,
+            queue,
+            None,
+        )
+        if isinstance(result, tuple):
+            added, add_error = result
+        else:
+            added, add_error = result, None
+        if not added:
+            code_getter = getattr(add_error, "code", None)
+            code = int(code_getter()) if callable(code_getter) else None
+            raise WindowCaptureError(
+                "ScreenCaptureKit could not add the exact-window output"
+                + (f" (error {code})" if code is not None else "")
+            )
+        with self._condition:
+            self._stream = stream
+            self._delegate = delegate
+            self._queue = queue
+            self._window_id = window.window_id
+            self._bounds_size = (window.bounds[2], window.bounds[3])
+            self._sequence = 0
+            self._delivered_sequence = 0
+            self._last_complete_image = None
+            self._last_complete_display_time = None
+            self._last_display_time = None
+            self._last_status = None
+            self._error = None
+            self._closing = False
+        try:
+            _macos_error_completion(
+                lambda callback: stream.startCaptureWithCompletionHandler_(callback),
+                operation=f"exact-window stream start for window {window.window_id}",
+                timeout_seconds=self._remaining(deadline, "stream start"),
+            )
+        except Exception:
+            self._stop_stream(suppress_errors=True, deadline=deadline)
+            raise
+
+    def capture(
+        self,
+        window: TargetWindow,
+        *,
+        deadline: float | None = None,
+    ) -> "Image.Image":
+        """Return the next complete or proven-idle frame from the stream."""
+        try:
+            import ScreenCaptureKit
+        except ImportError as exc:
+            raise WindowCaptureUnavailableError(
+                "ScreenCaptureKit requires its PyObjC framework bindings"
+            ) from exc
+        usable_statuses = {
+            int(ScreenCaptureKit.SCFrameStatusComplete),
+            int(ScreenCaptureKit.SCFrameStatusIdle),
+        }
+        deadline = deadline or (
+            time.monotonic() + _MACOS_SCK_ATTEMPT_TIMEOUT_SECONDS
+        )
+        with self._capture_lock:
+            if self._closed:
+                raise WindowCaptureError("ScreenCaptureKit stream is closed")
+            desired_size = (window.bounds[2], window.bounds[3])
+            if (
+                self._stream is None
+                or self._window_id != window.window_id
+                or self._bounds_size != desired_size
+            ):
+                self._stop_stream(suppress_errors=False, deadline=deadline)
+                self._start(window, deadline=deadline)
+            with self._condition:
+                while (
+                    (
+                        self._sequence <= self._delivered_sequence
+                        or self._last_complete_image is None
+                        or self._last_status not in usable_statuses
+                    )
+                    and self._error is None
+                ):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise WindowCaptureUnavailableError(
+                            "ScreenCaptureKit timed out waiting for an exact-window frame"
+                        )
+                    self._condition.wait(remaining)
+                if self._error is not None:
+                    raise self._error
+                self._delivered_sequence = self._sequence
+                image = self._last_complete_image.copy()
+                image.info["openadapt_capture_source"] = (
+                    "macos-screencapturekit-stream"
+                )
+                image.info["openadapt_frame_status"] = (
+                    "complete"
+                    if self._last_status
+                    == int(ScreenCaptureKit.SCFrameStatusComplete)
+                    else "idle"
+                )
+                image.info["openadapt_frame_display_time"] = self._last_display_time
+                image.info["openadapt_pixel_display_time"] = (
+                    self._last_complete_display_time
+                )
+                image.info["openadapt_stream_sequence"] = self._sequence
+                image.info["openadapt_stream_generation"] = self._generation
+                return image
+
+    def _stop_stream(
+        self,
+        *,
+        suppress_errors: bool,
+        deadline: float | None = None,
+    ) -> None:
+        """Stop the current generation. The caller holds ``_capture_lock``."""
+        with self._condition:
+            stream = self._stream
+            self._closing = True
+        stop_error = None
+        if stream is not None:
+            try:
+                _macos_error_completion(
+                    lambda callback: stream.stopCaptureWithCompletionHandler_(callback),
+                    operation="exact-window stream stop",
+                    timeout_seconds=(
+                        self._remaining(deadline, "stream stop")
+                        if deadline is not None
+                        else _MACOS_CAPTURE_TIMEOUT_SECONDS
+                    ),
+                )
+            except WindowCaptureError as exc:
+                stop_error = exc
+        with self._condition:
+            self._stream = None
+            self._delegate = None
+            self._queue = None
+            self._window_id = None
+            self._bounds_size = None
+            if not self._closed:
+                self._closing = False
+            self._condition.notify_all()
+        if stop_error is not None:
+            if suppress_errors:
+                logger.warning("ScreenCaptureKit stream stop failed: {}", stop_error)
+            else:
+                raise stop_error
+
+    def close(self, *, timeout_seconds: float = _MACOS_CAPTURE_TIMEOUT_SECONDS) -> None:
+        """Stop the stream and wake any waiting capture."""
+        with self._condition:
+            self._closed = True
+            self._error = WindowCaptureError("ScreenCaptureKit stream was closed")
+            self._condition.notify_all()
+        with self._capture_lock:
+            self._stop_stream(
+                suppress_errors=True,
+                deadline=time.monotonic() + max(0.001, timeout_seconds),
+            )
 
 
-def _capture_window_macos_utility(window: TargetWindow) -> "Image.Image":
+def _capture_window_macos_utility(
+    window: TargetWindow,
+    *,
+    timeout_seconds: float = _MACOS_CAPTURE_TIMEOUT_SECONDS,
+) -> "Image.Image":
     """Use the signed system utility as an exact-window compatibility path."""
     from PIL import Image
 
@@ -1017,7 +1575,7 @@ def _capture_window_macos_utility(window: TargetWindow) -> "Image.Image":
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=_MACOS_CAPTURE_TIMEOUT_SECONDS,
+                timeout=max(0.001, timeout_seconds),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise WindowCaptureUnavailableError(
@@ -1046,7 +1604,7 @@ def _resolve_window_macos(target: WindowTarget) -> TargetWindow | None:
     """
     import Quartz
 
-    visibility_independent = _screen_capture_kit_available()
+    visibility_independent = _macos_visibility_independent_capture_available()
     owner_l = target.owner.lower() if target.owner else None
     title_l = target.title.lower() if target.title else None
     wins = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID)
@@ -1116,54 +1674,124 @@ def _capture_window_macos(window: TargetWindow) -> "Image.Image":
     system utility is the final exact-window compatibility path. No provider
     can substitute a full-screen image or another window.
     """
-    import Quartz
+    provider = _MacOSWindowCaptureProvider()
+    try:
+        return provider.capture(window)
+    finally:
+        provider.close()
 
-    failures: list[BaseException] = []
-    if _screen_capture_kit_available():
+
+class _MacOSWindowCaptureProvider:
+    """Session-owned exact-window providers with sticky safe fallback."""
+
+    def __init__(self, *, frame_rate: float | None = None) -> None:
+        self._stream = (
+            _MacOSScreenCaptureKitStream(frame_rate=frame_rate)
+            if _screen_capture_kit_available()
+            else None
+        )
+        self._sck_disabled = self._stream is None
+        self._quartz_disabled = False
+
+    def capture(self, window: TargetWindow) -> "Image.Image":
+        """Capture only ``window`` and never substitute desktop pixels."""
+        failures: list[BaseException] = []
+        chain_deadline = time.monotonic() + _MACOS_PROVIDER_CHAIN_TIMEOUT_SECONDS
+        if not self._sck_disabled and self._stream is not None:
+            try:
+                return self._stream.capture(
+                    window,
+                    deadline=min(
+                        chain_deadline,
+                        time.monotonic() + _MACOS_SCK_ATTEMPT_TIMEOUT_SECONDS,
+                    ),
+                )
+            except WindowCaptureError as exc:
+                failures.append(exc)
+                self._stream.close(timeout_seconds=2.0)
+                self._sck_disabled = True
+                logger.warning(
+                    "ScreenCaptureKit exact-window stream failed; disabling it "
+                    "for this recording session"
+                )
+
+        if window.on_screen and not self._quartz_disabled:
+            try:
+                import Quartz
+
+                img_ref = Quartz.CGWindowListCreateImage(
+                    Quartz.CGRectNull,
+                    Quartz.kCGWindowListOptionIncludingWindow,
+                    window.window_id,
+                    Quartz.kCGWindowImageBoundsIgnoreFraming,
+                )
+            except Exception as exc:
+                img_ref = None
+                failures.append(
+                    WindowCaptureUnavailableError(
+                        "Quartz exact-window capture could not run"
+                    )
+                )
+                logger.debug("Quartz exact-window capture failed: {}", exc)
+            if img_ref is not None:
+                return _pil_image_from_cgimage(
+                    img_ref,
+                    source="macos-quartz-window-image",
+                )
+            self._quartz_disabled = True
+            failures.append(
+                WindowCapturePermissionError(
+                    f"Quartz returned no image for exact window {window.window_id}"
+                )
+            )
+            logger.warning(
+                "Quartz exact-window capture returned no image; disabling it "
+                "for this recording session"
+            )
+        elif not window.on_screen:
+            failures.append(
+                WindowCapturePermissionError(
+                    "Quartz was skipped because the exact target is not on screen"
+                )
+            )
+
         try:
-            return _capture_window_macos_screencapturekit(window)
+            remaining = chain_deadline - time.monotonic()
+            if remaining <= 0:
+                raise WindowCaptureUnavailableError(
+                    "the exact-window provider chain exhausted its startup budget"
+                )
+            return _capture_window_macos_utility(
+                window,
+                timeout_seconds=min(_MACOS_CAPTURE_TIMEOUT_SECONDS, remaining),
+            )
         except WindowCaptureError as exc:
             failures.append(exc)
-            logger.warning(
-                "ScreenCaptureKit exact-window capture failed; trying the "
-                "legacy exact-window providers"
-            )
-
-    img_ref = None
-    if window.on_screen:
-        img_ref = Quartz.CGWindowListCreateImage(
-            Quartz.CGRectNull,
-            Quartz.kCGWindowListOptionIncludingWindow,
-            window.window_id,
-            Quartz.kCGWindowImageBoundsIgnoreFraming,
-        )
-    if img_ref is not None:
-        return _pil_image_from_cgimage(img_ref, source="macos-quartz-window-image")
-    failures.append(
-        WindowCapturePermissionError(
-            (
-                "Quartz returned no image"
-                if window.on_screen
-                else "Quartz was skipped because the target is not on screen"
-            )
-            + f" for exact window {window.window_id}"
-        )
-    )
-    try:
-        return _capture_window_macos_utility(window)
-    except WindowCaptureError as exc:
-        failures.append(exc)
-        failure = WindowCaptureError(
-            f"all exact-window capture providers failed for window {window.window_id}"
-        )
-        for provider_failure in failures:
-            try:
-                failure.add_note(
-                    f"{type(provider_failure).__name__}: {provider_failure}"
+            failure_type = (
+                WindowCapturePermissionError
+                if failures
+                and all(
+                    isinstance(item, WindowCapturePermissionError)
+                    for item in failures
                 )
-            except AttributeError:  # Python 3.10
-                pass
-        raise failure from exc
+                else WindowCaptureError
+            )
+            failure = failure_type(
+                f"all exact-window capture providers failed for window {window.window_id}"
+            )
+            for provider_failure in failures:
+                try:
+                    failure.add_note(
+                        f"{type(provider_failure).__name__}: {provider_failure}"
+                    )
+                except AttributeError:  # Python 3.10
+                    pass
+            raise failure from exc
+
+    def close(self) -> None:
+        """Stop the owned stream, if it started."""
+        if self._stream is not None:
+            self._stream.close()
 
 
 def _resolve_window_windows(target: WindowTarget) -> TargetWindow | None:
@@ -1284,7 +1912,12 @@ def _capture_window_windows(window: TargetWindow) -> "Image.Image":
     return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
 
 
-def build_window_scope(owner: str | None, title: str | None) -> WindowCaptureScope | None:
+def build_window_scope(
+    owner: str | None,
+    title: str | None,
+    *,
+    frame_rate: float | None = None,
+) -> WindowCaptureScope | None:
     """Build a :class:`WindowCaptureScope` when a target is configured.
 
     Central place the recorder uses to turn (possibly-empty) config values
@@ -1292,5 +1925,12 @@ def build_window_scope(owner: str | None, title: str | None) -> WindowCaptureSco
     """
     if not (owner or title):
         return None
-    logger.info(f"window-scoped capture: owner={owner!r} title={title!r}")
-    return WindowCaptureScope(WindowTarget(owner=owner, title=title))
+    logger.info(
+        "window-scoped capture configured: owner_selector={} title_selector={}",
+        bool(owner),
+        bool(title),
+    )
+    return WindowCaptureScope(
+        WindowTarget(owner=owner, title=title),
+        frame_rate=frame_rate,
+    )

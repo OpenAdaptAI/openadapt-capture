@@ -1269,6 +1269,8 @@ class CaptureSession:
         result = self.window_events()
         if not result:
             raise InvalidCaptureEvent("v2 window-scoped capture has no window events")
+        previous_stream_generation: int | None = None
+        previous_stream_sequence: int | None = None
         for event in result:
             state: WindowCaptureStateV2 | None = event.window_capture_v2
             if state is None:
@@ -1283,8 +1285,35 @@ class CaptureSession:
                 or event.height != int(height)
             ):
                 raise InvalidCaptureEvent("stored WindowEvent columns differ from their v2 bounds")
-            if not state.on_screen:
-                raise InvalidCaptureEvent("v2 window event retained an off-screen target")
+            if not state.on_screen and not state.visibility_independent:
+                raise InvalidCaptureEvent(
+                    "v2 window event retained an off-screen target without a "
+                    "visibility-independent provider"
+                )
+            if state.capture_source == "macos-screencapturekit-stream":
+                generation = state.stream_generation
+                sequence = state.stream_sequence
+                if generation is None or sequence is None:
+                    raise InvalidCaptureEvent(
+                        "ScreenCaptureKit frame evidence is incomplete"
+                    )
+                if (
+                    previous_stream_generation is not None
+                    and generation < previous_stream_generation
+                ):
+                    raise InvalidCaptureEvent(
+                        "ScreenCaptureKit stream generation moved backward"
+                    )
+                if (
+                    previous_stream_generation == generation
+                    and previous_stream_sequence is not None
+                    and sequence <= previous_stream_sequence
+                ):
+                    raise InvalidCaptureEvent(
+                        "ScreenCaptureKit stream sequence is not increasing"
+                    )
+                previous_stream_generation = generation
+                previous_stream_sequence = sequence
         return result
 
     def actions(self, include_moves: bool = False) -> Iterator[Action]:

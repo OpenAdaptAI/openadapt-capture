@@ -80,6 +80,7 @@ from openadapt_capture.window_capture import (
     WindowCapturePermissionError,
     WindowCaptureScope,
     build_window_scope,
+    prepare_macos_window_capture_runtime,
 )
 
 CoordinateScope = WindowCaptureScope | DesktopCaptureScope
@@ -2693,6 +2694,7 @@ def record(
     window_scope = build_window_scope(
         window_owner or config.RECORD_WINDOW_OWNER,
         window_title or config.RECORD_WINDOW_TITLE,
+        frame_rate=config.SCREEN_CAPTURE_FPS,
     )
     initial_window_frame = None
     display_scope = DesktopCaptureScope.current()
@@ -2703,9 +2705,14 @@ def record(
             display_scope.assert_current,
         )
         initial_window_frame, _ = window_scope.capture_frame(publish=False)
+        window_snapshot = window_scope.snapshot()
         logger.info(
-            f"window-scoped capture resolved: {window_scope.snapshot()} "
-            f"initial frame {initial_window_frame.size}"
+            "window-scoped capture resolved: window_id={} provider={} "
+            "visibility_independent={} viewport={}",
+            window_snapshot.get("window_id"),
+            window_snapshot.get("capture_source"),
+            window_snapshot.get("visibility_independent"),
+            initial_window_frame.size,
         )
     else:
         # MSS monitor zero is the exact combined frame read by
@@ -3296,6 +3303,8 @@ def record(
             status_pipe.send({"type": "record.stopped"})
         return event_q.last_source_ordinal if window_scope is not None else None
     finally:
+        if window_scope is not None:
+            window_scope.close()
         _force_reap_processes(task_by_name)
         _release_queues(writer_queues)
 
@@ -3844,6 +3853,17 @@ class Recorder:
             self._finalized_event.set()
 
     def __enter__(self) -> "Recorder":
+        if (
+            sys.platform == "darwin"
+            and (
+                self._recording_config.window_owner
+                or self._recording_config.window_title
+            )
+        ):
+            # Cocoa initialization must occur on the caller's main thread.
+            # The persistent ScreenCaptureKit stream starts later in the
+            # recorder worker thread.
+            prepare_macos_window_capture_runtime()
         if self._control_enabled:
             try:
                 self._start_control_server()

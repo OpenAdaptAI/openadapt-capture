@@ -912,8 +912,52 @@ def test_window_capture_state_rejects_scales_not_derived_from_content(scope):
         WindowCaptureStateV2.model_validate(state)
 
 
+def test_window_capture_state_accepts_proven_offscreen_sck_frame(scope):
+    scope.capture_frame()
+    state = scope.window_event_data()["state"]
+    state.update(
+        {
+            "on_screen": False,
+            "visibility_independent": True,
+            "capture_source": "macos-screencapturekit-stream",
+            "frame_status": "complete",
+            "frame_display_time": 100,
+            "pixel_display_time": 100,
+            "stream_generation": 1,
+            "stream_sequence": 1,
+        }
+    )
+    state["capture_evidence_sha256"] = (
+        window_capture_module.window_capture_evidence_sha256(state)
+    )
+
+    parsed = WindowCaptureStateV2.model_validate(state)
+
+    assert parsed.on_screen is False
+    assert parsed.visibility_independent is True
+
+
+def test_window_capture_state_rejects_unproven_offscreen_frame(scope):
+    scope.capture_frame()
+    state = scope.window_event_data()["state"]
+    state.update(
+        {
+            "on_screen": False,
+            "visibility_independent": True,
+            "capture_source": "macos-quartz-window-image",
+        }
+    )
+
+    with pytest.raises(ValueError, match="proven exact-window capture source"):
+        WindowCaptureStateV2.model_validate(state)
+
+
 def test_macos_resolver_ignores_a_larger_hidden_matching_window(monkeypatch):
-    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: False)
+    monkeypatch.setattr(
+        window_capture_module,
+        "_macos_visibility_independent_capture_available",
+        lambda: False,
+    )
     hidden = {
         "kCGWindowOwnerName": "FakeApp",
         "kCGWindowName": "Document",
@@ -977,6 +1021,36 @@ def test_macos_resolver_accepts_offspace_window_with_screencapturekit(monkeypatc
     assert resolved.capture_source == "macos-exact-window-provider-chain"
 
 
+def test_macos_resolver_accepts_offspace_window_with_exact_utility(monkeypatch):
+    hidden = {
+        "kCGWindowOwnerName": "FakeApp",
+        "kCGWindowName": "Document",
+        "kCGWindowLayer": 0,
+        "kCGWindowIsOnscreen": False,
+        "kCGWindowBounds": {"X": 0, "Y": 0, "Width": 1512, "Height": 944},
+        "kCGWindowOwnerPID": 100,
+        "kCGWindowNumber": 19373,
+    }
+    quartz = SimpleNamespace(
+        kCGWindowListOptionAll=1,
+        kCGNullWindowID=0,
+        CGWindowListCopyWindowInfo=lambda *_args: [hidden],
+    )
+    monkeypatch.setitem(sys.modules, "Quartz", quartz)
+    monkeypatch.setattr(window_capture_module, "_process_start_time", lambda _pid: 123.0)
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: False)
+    monkeypatch.setattr(window_capture_module.os.path, "isfile", lambda _path: True)
+    monkeypatch.setattr(window_capture_module.os, "access", lambda *_args: True)
+
+    resolved = window_capture_module._resolve_window_macos(
+        WindowTarget(owner="FakeApp", title="Document")
+    )
+
+    assert resolved is not None
+    assert resolved.on_screen is False
+    assert resolved.visibility_independent is True
+
+
 def test_macos_resolver_refuses_ambiguous_owner_only_match(monkeypatch):
     windows = [
         {
@@ -1018,24 +1092,122 @@ def test_macos_capture_uses_exact_utility_after_sck_and_quartz_fail(monkeypatch)
     )
     quartz = SimpleNamespace()
     monkeypatch.setitem(sys.modules, "Quartz", quartz)
+    stream_calls = []
+
+    class DeniedStream:
+        def __init__(self, *, frame_rate=None):
+            assert frame_rate is None
+
+        def capture(self, _window, **_kwargs):
+            stream_calls.append("capture")
+            raise WindowCapturePermissionError("denied")
+
+        def close(self, **_kwargs):
+            stream_calls.append("close")
+
     monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: True)
     monkeypatch.setattr(
         window_capture_module,
-        "_capture_window_macos_screencapturekit",
-        lambda _window: (_ for _ in ()).throw(WindowCapturePermissionError("denied")),
+        "_MacOSScreenCaptureKitStream",
+        DeniedStream,
     )
     expected = Image.new("RGB", (3024, 1888), "white")
     expected.info["openadapt_capture_source"] = "macos-screencapture-utility"
     monkeypatch.setattr(
         window_capture_module,
         "_capture_window_macos_utility",
-        lambda _window: expected,
+        lambda _window, **_kwargs: expected,
     )
 
     captured = window_capture_module._capture_window_macos(window)
 
     assert captured.size == (3024, 1888)
     assert captured.info["openadapt_capture_source"] == "macos-screencapture-utility"
+    assert stream_calls == ["capture", "close", "close"]
+
+
+def test_macos_provider_disables_failed_stream_for_the_session(monkeypatch):
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+        coordinate_source="quartz-screen-points",
+        visibility_independent=True,
+    )
+    stream_calls = []
+
+    class FailedStream:
+        def __init__(self, *, frame_rate=None):
+            assert frame_rate is None
+
+        def capture(self, _window, **_kwargs):
+            stream_calls.append("capture")
+            raise WindowCapturePermissionError("denied")
+
+        def close(self, **_kwargs):
+            stream_calls.append("close")
+
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: True)
+    monkeypatch.setattr(
+        window_capture_module,
+        "_MacOSScreenCaptureKitStream",
+        FailedStream,
+    )
+    utility_calls = []
+
+    def utility(_window, **_kwargs):
+        utility_calls.append("capture")
+        return Image.new("RGB", (3024, 1888), "white")
+
+    monkeypatch.setattr(window_capture_module, "_capture_window_macos_utility", utility)
+    provider = window_capture_module._MacOSWindowCaptureProvider()
+
+    provider.capture(window)
+    provider.capture(window)
+
+    assert stream_calls == ["capture", "close"]
+    assert utility_calls == ["capture", "capture"]
+
+
+def test_macos_provider_disables_failed_quartz_for_the_session(monkeypatch):
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=True,
+        process_start_time=123.0,
+        coordinate_source="quartz-screen-points",
+        visibility_independent=True,
+    )
+    quartz_calls = []
+    quartz = SimpleNamespace(
+        CGRectNull=None,
+        kCGWindowListOptionIncludingWindow=1,
+        kCGWindowImageBoundsIgnoreFraming=2,
+        CGWindowListCreateImage=lambda *_args: quartz_calls.append("capture"),
+    )
+    monkeypatch.setitem(sys.modules, "Quartz", quartz)
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: False)
+    utility_calls = []
+
+    def utility(_window, **_kwargs):
+        utility_calls.append("capture")
+        return Image.new("RGB", (3024, 1888), "white")
+
+    monkeypatch.setattr(window_capture_module, "_capture_window_macos_utility", utility)
+    provider = window_capture_module._MacOSWindowCaptureProvider()
+
+    provider.capture(window)
+    provider.capture(window)
+
+    assert quartz_calls == ["capture"]
+    assert utility_calls == ["capture", "capture"]
 
 
 def test_screencapturekit_enumerates_other_spaces_and_selects_exact_id(monkeypatch):
@@ -1061,12 +1233,178 @@ def test_screencapturekit_enumerates_other_spaces_and_selects_exact_id(monkeypat
 
     fake_sck = SimpleNamespace(SCShareableContent=FakeShareableContent)
     monkeypatch.setitem(sys.modules, "ScreenCaptureKit", fake_sck)
-    window_capture_module._MACOS_SC_WINDOW_CACHE.clear()
 
     resolved = window_capture_module._screen_capture_kit_window(19373)
 
     assert resolved is expected
     assert calls == [(True, False)]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="PyObjC protocol test")
+def test_screencapturekit_output_class_has_native_protocol_signatures():
+    if not window_capture_module._screen_capture_kit_available():
+        pytest.skip("ScreenCaptureKit bindings are not installed")
+
+    output_class = window_capture_module._screen_capture_kit_output_class()
+
+    assert output_class is not None
+
+
+def _fake_screencapturekit_modules(monkeypatch, attachment):
+    fake_sck = SimpleNamespace(
+        SCStreamOutputTypeScreen=0,
+        SCStreamFrameInfoStatus="status",
+        SCStreamFrameInfoDisplayTime="display_time",
+        SCFrameStatusComplete=0,
+        SCFrameStatusIdle=1,
+        SCFrameStatusStarted=2,
+    )
+    fake_core_media = SimpleNamespace(
+        CMSampleBufferGetSampleAttachmentsArray=lambda *_args: [attachment],
+    )
+    monkeypatch.setitem(sys.modules, "ScreenCaptureKit", fake_sck)
+    monkeypatch.setitem(sys.modules, "CoreMedia", fake_core_media)
+
+
+def test_screencapturekit_stream_retains_complete_and_idle_evidence(monkeypatch):
+    _fake_screencapturekit_modules(
+        monkeypatch,
+        {"status": 0, "display_time": 100},
+    )
+    first = Image.new("RGB", (20, 10), "blue")
+    monkeypatch.setattr(
+        window_capture_module,
+        "_pil_image_from_sample_buffer",
+        lambda _sample: first,
+    )
+    stream = window_capture_module._MacOSScreenCaptureKitStream(frame_rate=2.0)
+    stream._generation = 1
+
+    stream._receive_sample(1, object(), 0)
+
+    assert stream._last_complete_image is first
+    assert stream._last_complete_display_time == 100
+    assert stream._last_status == 0
+
+    sys.modules["CoreMedia"].CMSampleBufferGetSampleAttachmentsArray = (
+        lambda *_args: [{"status": 1, "display_time": 120}]
+    )
+    stream._receive_sample(1, object(), 0)
+    assert stream._last_complete_image is first
+    assert stream._last_complete_display_time == 100
+    assert stream._last_display_time == 120
+    assert stream._last_status == 1
+
+
+def test_screencapturekit_stream_rejects_missing_frame_metadata(monkeypatch):
+    _fake_screencapturekit_modules(monkeypatch, {})
+    stream = window_capture_module._MacOSScreenCaptureKitStream()
+    stream._generation = 1
+
+    stream._receive_sample(1, object(), 0)
+
+    assert isinstance(stream._error, WindowCaptureError)
+    assert "explicit status" in str(stream._error)
+
+
+def test_screencapturekit_stream_ignores_late_generation(monkeypatch):
+    _fake_screencapturekit_modules(
+        monkeypatch,
+        {"status": 0, "display_time": 100},
+    )
+    monkeypatch.setattr(
+        window_capture_module,
+        "_pil_image_from_sample_buffer",
+        lambda _sample: Image.new("RGB", (20, 10), "blue"),
+    )
+    stream = window_capture_module._MacOSScreenCaptureKitStream()
+    stream._generation = 2
+
+    stream._receive_sample(1, object(), 0)
+
+    assert stream._sequence == 0
+    assert stream._last_complete_image is None
+
+
+def test_screencapturekit_close_wakes_waiting_capture(monkeypatch):
+    _fake_screencapturekit_modules(monkeypatch, {})
+
+    class FakeNativeStream:
+        @staticmethod
+        def stopCaptureWithCompletionHandler_(callback):
+            callback(None)
+
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 20.0, 10.0),
+        process_start_time=123.0,
+    )
+    stream = window_capture_module._MacOSScreenCaptureKitStream()
+    stream._stream = FakeNativeStream()
+    stream._window_id = window.window_id
+    stream._bounds_size = (window.bounds[2], window.bounds[3])
+    stream._generation = 1
+    errors = []
+
+    def wait_for_frame():
+        try:
+            stream.capture(window, deadline=time.monotonic() + 5)
+        except WindowCaptureError as exc:
+            errors.append(exc)
+
+    capture_thread = threading.Thread(target=wait_for_frame)
+    capture_thread.start()
+    time.sleep(0.02)
+    stream.close(timeout_seconds=0.5)
+    capture_thread.join(timeout=1)
+
+    assert not capture_thread.is_alive()
+    assert len(errors) == 1
+    assert "closed" in str(errors[0])
+
+
+def test_macos_provider_preserves_all_provider_permission_denial(monkeypatch):
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+        coordinate_source="quartz-screen-points",
+        visibility_independent=True,
+    )
+
+    class DeniedStream:
+        def __init__(self, **_kwargs):
+            pass
+
+        def capture(self, _window, **_kwargs):
+            raise WindowCapturePermissionError("denied")
+
+        def close(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: True)
+    monkeypatch.setattr(
+        window_capture_module,
+        "_MacOSScreenCaptureKitStream",
+        DeniedStream,
+    )
+    monkeypatch.setattr(
+        window_capture_module,
+        "_capture_window_macos_utility",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            WindowCapturePermissionError("denied")
+        ),
+    )
+
+    with pytest.raises(WindowCapturePermissionError, match="all exact-window"):
+        window_capture_module._MacOSWindowCaptureProvider().capture(window)
 
 
 class TestTranslatePoint:
@@ -1842,25 +2180,27 @@ def _temporary_window_geometry(window: TargetWindow):
 class TestWindowCaptureLive:
     """Capture a real window end to end (resolve -> frame -> translate)."""
 
-    def _scope(self) -> WindowCaptureScope:
+    def _scope(self, *, require_on_screen: bool = False) -> WindowCaptureScope:
         scope = WindowCaptureScope(WindowTarget(owner=_SMOKE_OWNER, title=_SMOKE_TITLE))
         try:
             resolved = scope.resolve()
         except WindowCaptureError as exc:
             if _PRODUCTION_QUALIFICATION:
                 raise AssertionError(
-                    f"production qualification requires an on-screen window "
+                    f"production qualification requires an exact window "
                     f"matching owner {_SMOKE_OWNER!r} title {_SMOKE_TITLE!r}"
                 ) from exc
             pytest.skip(
-                f"no on-screen window matching owner {_SMOKE_OWNER!r} "
+                f"no exact window matching owner {_SMOKE_OWNER!r} "
                 f"title {_SMOKE_TITLE!r} on this desktop; open one (or set "
                 "OPENADAPT_WINDOW_SMOKE_OWNER) to run the live smoke test"
             )
-        if not resolved.on_screen:
+        if require_on_screen and not resolved.on_screen:
             if _PRODUCTION_QUALIFICATION:
-                raise AssertionError("the production qualification window is not on screen")
-            pytest.skip("the matching live smoke-test window is not on screen")
+                raise AssertionError(
+                    "the live geometry qualification window is not on screen"
+                )
+            pytest.skip("the matching live geometry-test window is not on screen")
         desktop = DesktopCaptureScope.current()
         scope.bind_display_topology(desktop.snapshot(), desktop.assert_current)
         return scope
@@ -1886,6 +2226,7 @@ class TestWindowCaptureLive:
         # Bounds-timeline payload is writable as a WindowEvent.
         data = scope.window_event_data()
         assert data["state"]["viewport"] == [image.width, image.height]
+        scope.close()
 
     @pytest.mark.skipif(
         not _PRODUCTION_QUALIFICATION,
@@ -1896,7 +2237,7 @@ class TestWindowCaptureLive:
     )
     def test_live_move_resize_preserves_fixed_viewport_and_restores_window(self):
         """Prove live move/resize normalization without changing final app state."""
-        discovery_scope = self._scope()
+        discovery_scope = self._scope(require_on_screen=True)
         target = discovery_scope.resolve()
         assert target.title.strip(), (
             "production qualification requires a target with a stable window title"
@@ -1960,6 +2301,8 @@ class TestWindowCaptureLive:
         assert restored_changed is True
         assert restored_image.size == tuple(initial_viewport)
         assert restored_data["window_id"] == str(target.window_id)
+        scope.close()
+        discovery_scope.close()
 
     def test_live_missing_window_fails_loud(self):
         scope = WindowCaptureScope(WindowTarget(owner="no-such-app-obviously-not-running-xyz"))
