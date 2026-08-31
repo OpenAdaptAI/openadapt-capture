@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openadapt.ai/schemas/authoring-observe-v1.json",
+  "title": "openadapt.authoring.observe/v1",
+  "description": "PHI-safe hosted authoring observe payload. Copied from the Hosted Authoring MCP design because OpenAdaptAI/openadapt-types has no open authoring-observe PR yet. Do not reuse ComputerState. additionalProperties is false. value, title, and screenshot are forbidden.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "backend",
+    "provider",
+    "mode",
+    "agent_drive",
+    "coach_only",
+    "recording",
+    "window",
+    "tree",
+    "truncated",
+    "node_count"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "openadapt.authoring.observe/v1"
+    },
+    "backend": {
+      "type": "string",
+      "enum": ["macos", "linux", "windows", "web", "rdp", "citrix"]
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_.-]*$"
+    },
+    "mode": {
+      "const": "authoring"
+    },
+    "agent_drive": {
+      "type": "boolean"
+    },
+    "coach_only": {
+      "type": "boolean"
+    },
+    "recording": {
+      "type": "boolean"
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "process_name": { "type": "string" },
+        "role": { "type": "string" },
+        "bounds": { "$ref": "#/$defs/normalizedBounds" }
+      }
+    },
+    "tree": {
+      "type": "array",
+      "maxItems": 200,
+      "items": { "$ref": "#/$defs/wireNode" }
+    },
+    "truncated": {
+      "type": "boolean"
+    },
+    "node_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 200
+    },
+    "reason": {
+      "const": "empty_projection"
+    }
+  },
+  "$defs": {
+    "normalizedBounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "w", "h"],
+      "properties": {
+        "x": { "type": "number", "minimum": 0, "maximum": 1 },
+        "y": { "type": "number", "minimum": 0, "maximum": 1 },
+        "w": { "type": "number", "minimum": 0, "maximum": 1 },
+        "h": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "wireNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id"],
+      "properties": {
+        "node_id": {
+          "type": "string",
+          "pattern": "^n_[0-9a-f]{8}$"
+        },
+        "role": { "type": "string" },
+        "control_type": { "type": "string" },
+        "automation_id": { "type": "string" },
+        "name": { "type": "string" },
+        "class_name": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "focused": { "type": "boolean" },
+        "bounds": { "$ref": "#/$defs/normalizedBounds" }
+      }
+    }
+  }
+}

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Annotated, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -18,6 +18,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 STRUCTURAL_OBSERVATION_SCHEMA_VERSION = "openadapt.capture.structural-observation/v1"
 MAX_STRUCTURAL_TEXT_LENGTH = 512
 MAX_STRUCTURAL_ANCESTRY_DEPTH = 32
+MAX_STRUCTURAL_TREE_NODES = 1024
+StructuralQueryKind = Literal["point", "focused", "window_tree"]
 
 _PROVIDER_PATTERN = r"^[a-z][a-z0-9_.-]*$"
 _StructuralText = Annotated[str, Field(max_length=MAX_STRUCTURAL_TEXT_LENGTH)]
@@ -67,6 +69,32 @@ class StructuralElement(BaseModel):
     supported_patterns: list[_StructuralText] | None = Field(
         default=None,
         max_length=64,
+    )
+
+
+class StructuralTreeNode(BaseModel):
+    """One node of a raw window accessibility tree retained on disk.
+
+    The tree may include provider values for compile. It is not the vendor-wire
+    payload; :mod:`openadapt_capture.authoring_project` projects a PHI-safe
+    subset for ``openadapt.authoring.observe/v1``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_runtime_id: _StructuralText | None = None
+    automation_id: _StructuralText | None = None
+    role: _StructuralText | None = None
+    control_type: _StructuralText | None = None
+    name: _StructuralText | None = None
+    class_name: _StructuralText | None = None
+    value: _StructuralText | None = None
+    enabled: bool | None = None
+    focused: bool | None = None
+    bounds: StructuralBounds | None = None
+    children: list[StructuralTreeNode] | None = Field(
+        default=None,
+        max_length=MAX_STRUCTURAL_TREE_NODES,
     )
 
 
@@ -130,7 +158,7 @@ class StructuralObservation(BaseModel):
     )
     event_timestamp: float
     observed_at: float
-    query_kind: Literal["point", "focused"]
+    query_kind: StructuralQueryKind
     element: StructuralElement
     process: StructuralProcessIdentity | None = None
     window: StructuralWindowIdentity | None = None
@@ -140,6 +168,23 @@ class StructuralObservation(BaseModel):
     )
     candidate_count: int | None = Field(default=None, ge=0)
     candidate_context: StructuralCandidateContext | None = None
+    tree: list[StructuralTreeNode] | None = Field(
+        default=None,
+        max_length=MAX_STRUCTURAL_TREE_NODES,
+        description="Raw window accessibility tree. Only valid for window_tree.",
+    )
+    tree_truncated: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_window_tree_fields(self) -> "StructuralObservation":
+        """Keep the raw tree off point and focused action evidence."""
+        if self.query_kind == "window_tree":
+            return self
+        if self.tree is not None:
+            raise ValueError("tree is only valid for window_tree observations")
+        if self.tree_truncated:
+            raise ValueError("tree_truncated is only valid for window_tree observations")
+        return self
 
 
 @dataclass(frozen=True)
@@ -150,6 +195,7 @@ class StructuralObservationRequest:
     action_name: str
     x: float | None = None
     y: float | None = None
+    query_kind: StructuralQueryKind | None = None
 
 
 @runtime_checkable
@@ -224,9 +270,21 @@ def observe_structural_action(
         return None
 
 
+def observe_window_tree(
+    observer: StructuralObserver | None,
+    request: StructuralObservationRequest,
+) -> StructuralObservation | None:
+    """Observe the top-level window tree for authoring or compile."""
+
+    if request.query_kind != "window_tree":
+        request = replace(request, query_kind="window_tree")
+    return observe_structural_action(observer, request)
+
+
 __all__ = [
     "MAX_STRUCTURAL_ANCESTRY_DEPTH",
     "MAX_STRUCTURAL_TEXT_LENGTH",
+    "MAX_STRUCTURAL_TREE_NODES",
     "STRUCTURAL_OBSERVATION_SCHEMA_VERSION",
     "StructuralAncestor",
     "StructuralBounds",
@@ -236,7 +294,10 @@ __all__ = [
     "StructuralObservationRequest",
     "StructuralObserver",
     "StructuralProcessIdentity",
+    "StructuralQueryKind",
+    "StructuralTreeNode",
     "StructuralWindowIdentity",
     "create_structural_observer",
     "observe_structural_action",
+    "observe_window_tree",
 ]

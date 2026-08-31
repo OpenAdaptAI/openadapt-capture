@@ -212,6 +212,14 @@ typelib/runtime, and an interactive desktop accessibility bus.
 The native provider describes the local accessibility tree. It does not
 describe controls inside an RDP or Citrix pixel stream.
 
+Authoring adds `query_kind: "window_tree"`. The raw tree may persist on disk
+for compile. `openadapt_capture.authoring_project` projects that tree into
+`openadapt.authoring.observe/v1` for a vendor wire: no values, titles,
+screenshots, or extra keys. Names and automation ids that fail the coach-hint
+bar (length, `://`, `@`, six or more digits, phone, SSN, email) are dropped.
+RDP and Citrix observe payloads are coach-only with an empty tree. Capture
+still drops OS-injected input; there is no `record_injected` API.
+
 ## Video and frame timing
 
 Capture does not import, link, or bundle FFmpeg, and it downloads nothing on
