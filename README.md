@@ -219,7 +219,9 @@ another Space. It does not need to be frontmost or reported as on screen. The
 recorder accepts complete frames and proven idle frames. A failed provider is
 disabled for the rest of that recording, so each frame does not repeat a slow
 failure. The recorder still needs a logged-in desktop session. A minimized
-window must return a valid exact frame.
+window is refused because macOS can expose stale backing pixels for it. For an
+off-Space window, macOS Accessibility must confirm that the exact window is not
+minimized.
 
 Linux window mode needs X11 with EWMH and XComposite. It refuses to start under
 native Wayland or XWayland-only.

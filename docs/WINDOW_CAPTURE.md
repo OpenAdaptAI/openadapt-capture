@@ -52,8 +52,9 @@ In this mode:
   image API and `/usr/sbin/screencapture -o -l` remain exact-window
   compatibility paths. A failed provider stays disabled for that recording.
   This supports an occluded window and a window on another Space. It also
-  supports a window that macOS does not report as on screen. A minimized window
-  must still return a valid exact frame or the session fails.
+  supports a window that macOS does not report as on screen. macOS Accessibility
+  must confirm that an off-screen exact window is not minimized. The recorder
+  refuses a minimized window because its backing pixels can be stale.
   Linux X11 reads an XComposite named-window pixmap. It doesn't use a root
   screenshot, so another window cannot replace the target pixels. Windows
   grabs the window's screen region, so keep the window unoccluded.

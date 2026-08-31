@@ -2696,123 +2696,132 @@ def record(
         window_title or config.RECORD_WINDOW_TITLE,
         frame_rate=config.SCREEN_CAPTURE_FPS,
     )
-    initial_window_frame = None
-    display_scope = DesktopCaptureScope.current()
-    desktop_scope = None
-    if window_scope is not None:
-        window_scope.bind_display_topology(
-            display_scope.snapshot(),
-            display_scope.assert_current,
-        )
-        initial_window_frame, _ = window_scope.capture_frame(publish=False)
-        window_snapshot = window_scope.snapshot()
-        logger.info(
-            "window-scoped capture resolved: window_id={} provider={} "
-            "visibility_independent={} viewport={}",
-            window_snapshot.get("window_id"),
-            window_snapshot.get("capture_source"),
-            window_snapshot.get("visibility_independent"),
-            initial_window_frame.size,
-        )
-    else:
-        # MSS monitor zero is the exact combined frame read by
-        # ``utils.take_screenshot``. Retain its origin and translate native
-        # input into that same pixel space so secondary monitors with negative
-        # global coordinates remain aligned with the video.
-        desktop_scope = display_scope
-        logger.info(f"virtual desktop capture resolved: {desktop_scope.snapshot()}")
-
-    if structural_observer is None:
-        structural_observer = create_structural_observer(
-            enabled=config.RECORD_STRUCTURAL_OBSERVATIONS,
-        )
-
-    if capture_dir is None:
-        capture_dir = os.path.join(os.getcwd(), "capture")
-    recording, db_path = create_recording(
-        task_description,
-        capture_dir,
-        window_capture_info=(window_scope.snapshot() if window_scope is not None else None),
-        desktop_capture_info=(desktop_scope.snapshot() if desktop_scope is not None else None),
-    )
-    recording_timestamp = recording.timestamp
-
-    # create_recording() established the one shared clock epoch for this
-    # capture. Every thread producer inherits that epoch. A thread must not
-    # call set_start_time() again because doing so can place a later frame
-    # before the retained initial frame in capture time.
-
-    event_q = OrderedEventJournal()
-    producers_finished = threading.Event()
-    input_finished = threading.Event()
-    terminal_frame_finished = threading.Event()
-    terminal_frame_cancelled = threading.Event()
-    input_frame_boundary = NativeInputFrameBoundary()
-    processing_aborted = threading.Event()
-    if window_scope is not None:
-        # The preflight frame sizes the fixed stream. Capture again after the
-        # recording clock starts, then publish pixels and geometry atomically
-        # before any input observer can bind an action to the epoch.
-        initial_window_frame, _ = window_scope.capture_frame(publish=False)
-        initial_generation = window_scope.current_generation()
-        initial_timestamp = utils.get_timestamp()
-        event_q.commit_window_frame(
-            Event(
-                initial_timestamp,
-                "screen",
-                WindowScopedFrame(
-                    image=initial_window_frame,
-                    window_event_data=window_scope.window_event_data(),
-                    geometry_generation=initial_generation,
-                ),
-            ),
-            window_scope,
-            initial_generation,
-        )
-    else:
-        assert desktop_scope is not None
-        # Publish one clean before-frame before the native observer can accept
-        # input. The screen thread attaches to the observer boundary for every
-        # later frame, but it cannot safely win that startup race by itself.
-        desktop_scope.assert_current(force=True)
-        initial_desktop_frame = utils.take_screenshot()
-        desktop_scope.assert_current(force=True)
-        if initial_desktop_frame is None:
-            raise WindowCaptureError("the initial desktop screenshot was empty")
-        event_q.put(
-            Event(
-                utils.get_timestamp(),
-                "screen",
-                initial_desktop_frame,
-            )
-        )
-    screen_write_q = sq.SynchronizedQueue()
-    action_write_q = sq.SynchronizedQueue()
-    window_write_q = sq.SynchronizedQueue()
-    browser_write_q = sq.SynchronizedQueue()
-    video_write_q = sq.SynchronizedQueue()
-    terminate_writers = multiprocessing.Event()
-    # TODO: save write times to DB; display performance plot in visualize.py
-    perf_q = sq.SynchronizedQueue()
-    if terminate_processing is None:
-        terminate_processing = multiprocessing.Event()
-    writer_queues = [
-        screen_write_q,
-        action_write_q,
-        window_write_q,
-        browser_write_q,
-        video_write_q,
-        perf_q,
-    ]
     # The caller keeps this dict so it can reap anything this recording leaves
     # behind, even when record() itself raises.
     task_by_name = {} if child_registry is None else child_registry
-    task_started_events = {}
-    task_errors: queue.Queue = queue.Queue()
-    # Writes are synchronous, so a child's traceback reaches this queue before
-    # the child exits, and reading it is never a race against the child.
-    process_errors = multiprocessing.SimpleQueue()
-    _screen_timing = _ScreenTimingStats()  # running stats, no unbounded list
+    writer_queues = []
+    try:
+        initial_window_frame = None
+        display_scope = DesktopCaptureScope.current()
+        desktop_scope = None
+        if window_scope is not None:
+            window_scope.bind_display_topology(
+                display_scope.snapshot(),
+                display_scope.assert_current,
+            )
+            initial_window_frame, _ = window_scope.capture_frame(publish=False)
+            window_snapshot = window_scope.snapshot()
+            logger.info(
+                "window-scoped capture resolved: window_id={} provider={} "
+                "visibility_independent={} viewport={}",
+                window_snapshot.get("window_id"),
+                window_snapshot.get("capture_source"),
+                window_snapshot.get("visibility_independent"),
+                initial_window_frame.size,
+            )
+        else:
+            # MSS monitor zero is the exact combined frame read by
+            # ``utils.take_screenshot``. Retain its origin and translate native
+            # input into that same pixel space so secondary monitors with negative
+            # global coordinates remain aligned with the video.
+            desktop_scope = display_scope
+            logger.info(f"virtual desktop capture resolved: {desktop_scope.snapshot()}")
+
+        if structural_observer is None:
+            structural_observer = create_structural_observer(
+                enabled=config.RECORD_STRUCTURAL_OBSERVATIONS,
+            )
+
+        if capture_dir is None:
+            capture_dir = os.path.join(os.getcwd(), "capture")
+        recording, db_path = create_recording(
+            task_description,
+            capture_dir,
+            window_capture_info=(
+                window_scope.snapshot() if window_scope is not None else None
+            ),
+            desktop_capture_info=(
+                desktop_scope.snapshot() if desktop_scope is not None else None
+            ),
+        )
+        recording_timestamp = recording.timestamp
+
+        # create_recording() established the one shared clock epoch for this
+        # capture. Every thread producer inherits that epoch. A thread must not
+        # call set_start_time() again because doing so can place a later frame
+        # before the retained initial frame in capture time.
+
+        event_q = OrderedEventJournal()
+        producers_finished = threading.Event()
+        input_finished = threading.Event()
+        terminal_frame_finished = threading.Event()
+        terminal_frame_cancelled = threading.Event()
+        input_frame_boundary = NativeInputFrameBoundary()
+        processing_aborted = threading.Event()
+        if window_scope is not None:
+            # The preflight frame sizes the fixed stream. Capture again after the
+            # recording clock starts, then publish pixels and geometry atomically
+            # before any input observer can bind an action to the epoch.
+            initial_window_frame, _ = window_scope.capture_frame(publish=False)
+            initial_generation = window_scope.current_generation()
+            initial_timestamp = utils.get_timestamp()
+            event_q.commit_window_frame(
+                Event(
+                    initial_timestamp,
+                    "screen",
+                    WindowScopedFrame(
+                        image=initial_window_frame,
+                        window_event_data=window_scope.window_event_data(),
+                        geometry_generation=initial_generation,
+                    ),
+                ),
+                window_scope,
+                initial_generation,
+            )
+        else:
+            assert desktop_scope is not None
+            # Publish one clean before-frame before the native observer can accept
+            # input. The screen thread attaches to the observer boundary for every
+            # later frame, but it cannot safely win that startup race by itself.
+            desktop_scope.assert_current(force=True)
+            initial_desktop_frame = utils.take_screenshot()
+            desktop_scope.assert_current(force=True)
+            if initial_desktop_frame is None:
+                raise WindowCaptureError("the initial desktop screenshot was empty")
+            event_q.put(
+                Event(
+                    utils.get_timestamp(),
+                    "screen",
+                    initial_desktop_frame,
+                )
+            )
+        screen_write_q = sq.SynchronizedQueue()
+        writer_queues.append(screen_write_q)
+        action_write_q = sq.SynchronizedQueue()
+        writer_queues.append(action_write_q)
+        window_write_q = sq.SynchronizedQueue()
+        writer_queues.append(window_write_q)
+        browser_write_q = sq.SynchronizedQueue()
+        writer_queues.append(browser_write_q)
+        video_write_q = sq.SynchronizedQueue()
+        writer_queues.append(video_write_q)
+        terminate_writers = multiprocessing.Event()
+        # TODO: save write times to DB; display performance plot in visualize.py
+        perf_q = sq.SynchronizedQueue()
+        writer_queues.append(perf_q)
+        if terminate_processing is None:
+            terminate_processing = multiprocessing.Event()
+        task_started_events = {}
+        task_errors: queue.Queue = queue.Queue()
+        # Writes are synchronous, so a child's traceback reaches this queue before
+        # the child exits, and reading it is never a race against the child.
+        process_errors = multiprocessing.SimpleQueue()
+        _screen_timing = _ScreenTimingStats()  # running stats, no unbounded list
+    except BaseException:
+        if window_scope is not None:
+            window_scope.close()
+        _release_queues(writer_queues)
+        raise
 
     # Nothing this recording starts may outlive it. A surviving child keeps
     # the standard output it inherited open, and multiprocessing joins live

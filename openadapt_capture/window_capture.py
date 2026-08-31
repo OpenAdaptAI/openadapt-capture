@@ -457,6 +457,11 @@ class WindowCaptureScope:
                 "the target moved or resized while a frame was captured; "
                 "no action can bind to mixed frame geometry"
             )
+        if pre.on_screen and not post.on_screen:
+            raise WindowCaptureError(
+                "the target stopped being visible while a frame was captured; "
+                "the frame's minimized state cannot be proven"
+            )
         win = post
         if source_image.width <= 0 or source_image.height <= 0:
             raise WindowCaptureError("window capture returned an empty frame")
@@ -924,6 +929,8 @@ def _process_start_time(pid: int) -> float:
 _MACOS_CAPTURE_TIMEOUT_SECONDS = 15.0
 _MACOS_PROVIDER_CHAIN_TIMEOUT_SECONDS = 20.0
 _MACOS_SCK_ATTEMPT_TIMEOUT_SECONDS = 12.0
+_MACOS_AX_STATE_TIMEOUT_SECONDS = 1.0
+_MACOS_AX_GEOMETRY_TOLERANCE_POINTS = 2.0
 _MACOS_RUNTIME_LOCK = threading.Lock()
 _MACOS_RUNTIME_READY = False
 _MACOS_SC_OUTPUT_CLASS: type | None = None
@@ -1410,6 +1417,8 @@ class _MacOSScreenCaptureKitStream:
                 + (f" (error {code})" if code is not None else "")
             )
         with self._condition:
+            if self._closed:
+                raise WindowCaptureError("ScreenCaptureKit stream is closed")
             self._stream = stream
             self._delegate = delegate
             self._queue = queue
@@ -1479,26 +1488,35 @@ class _MacOSScreenCaptureKitStream:
                             "ScreenCaptureKit timed out waiting for an exact-window frame"
                         )
                     self._condition.wait(remaining)
-                if self._error is not None:
-                    raise self._error
-                self._delivered_sequence = self._sequence
-                image = self._last_complete_image.copy()
-                image.info["openadapt_capture_source"] = (
-                    "macos-screencapturekit-stream"
-                )
-                image.info["openadapt_frame_status"] = (
-                    "complete"
-                    if self._last_status
-                    == int(ScreenCaptureKit.SCFrameStatusComplete)
-                    else "idle"
-                )
-                image.info["openadapt_frame_display_time"] = self._last_display_time
-                image.info["openadapt_pixel_display_time"] = (
-                    self._last_complete_display_time
-                )
-                image.info["openadapt_stream_sequence"] = self._sequence
-                image.info["openadapt_stream_generation"] = self._generation
-                return image
+                captured_error = self._error
+                if captured_error is None:
+                    self._delivered_sequence = self._sequence
+                    image = self._last_complete_image.copy()
+                    image.info["openadapt_capture_source"] = (
+                        "macos-screencapturekit-stream"
+                    )
+                    image.info["openadapt_frame_status"] = (
+                        "complete"
+                        if self._last_status
+                        == int(ScreenCaptureKit.SCFrameStatusComplete)
+                        else "idle"
+                    )
+                    image.info["openadapt_frame_display_time"] = (
+                        self._last_display_time
+                    )
+                    image.info["openadapt_pixel_display_time"] = (
+                        self._last_complete_display_time
+                    )
+                    image.info["openadapt_stream_sequence"] = self._sequence
+                    image.info["openadapt_stream_generation"] = self._generation
+            if captured_error is not None:
+                if self._closed:
+                    self._stop_stream(
+                        suppress_errors=True,
+                        deadline=time.monotonic() + _MACOS_CAPTURE_TIMEOUT_SECONDS,
+                    )
+                raise captured_error
+            return image
 
     def _stop_stream(
         self,
@@ -1541,15 +1559,25 @@ class _MacOSScreenCaptureKitStream:
 
     def close(self, *, timeout_seconds: float = _MACOS_CAPTURE_TIMEOUT_SECONDS) -> None:
         """Stop the stream and wake any waiting capture."""
+        deadline = time.monotonic() + max(0.001, timeout_seconds)
         with self._condition:
             self._closed = True
             self._error = WindowCaptureError("ScreenCaptureKit stream was closed")
             self._condition.notify_all()
-        with self._capture_lock:
+        remaining = max(0.0, deadline - time.monotonic())
+        if not self._capture_lock.acquire(timeout=remaining):
+            logger.warning(
+                "ScreenCaptureKit close timed out waiting for active frame capture; "
+                "the capture owner will stop the stream"
+            )
+            return
+        try:
             self._stop_stream(
                 suppress_errors=True,
-                deadline=time.monotonic() + max(0.001, timeout_seconds),
+                deadline=deadline,
             )
+        finally:
+            self._capture_lock.release()
 
 
 def _capture_window_macos_utility(
@@ -1594,6 +1622,113 @@ def _capture_window_macos_utility(
             ) from exc
     captured.info["openadapt_capture_source"] = "macos-screencapture-utility"
     return captured
+
+
+def _macos_window_minimized(
+    window: TargetWindow,
+    *,
+    deadline: float | None = None,
+) -> bool | None:
+    """Return the exact AX window's minimized state, or ``None`` if unknown.
+
+    Quartz reports both minimized and other-Space windows as not on screen.
+    A minimized window can expose stale backing pixels through an exact-window
+    API. Off-screen capture therefore requires Accessibility to distinguish a
+    normal window on another Space from a minimized window.
+    """
+    deadline = deadline or (time.monotonic() + _MACOS_AX_STATE_TIMEOUT_SECONDS)
+    try:
+        import ApplicationServices
+
+        set_timeout = ApplicationServices.AXUIElementSetMessagingTimeout
+
+        def attribute(element: object, name: str) -> object | None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            timeout_error = set_timeout(
+                element,
+                min(_MACOS_AX_STATE_TIMEOUT_SECONDS, remaining),
+            )
+            if timeout_error != ApplicationServices.kAXErrorSuccess:
+                return None
+            error, value = ApplicationServices.AXUIElementCopyAttributeValue(
+                element,
+                name,
+                None,
+            )
+            if error != ApplicationServices.kAXErrorSuccess:
+                return None
+            return value
+
+        application = ApplicationServices.AXUIElementCreateApplication(window.pid)
+        candidates = attribute(application, "AXWindows")
+        if candidates is None:
+            return None
+    except Exception:
+        return None
+
+    id_matches = []
+    title_candidates = []
+    for candidate in candidates or []:
+        try:
+            number = attribute(candidate, "AXWindowNumber")
+            if number is not None:
+                if int(number) == window.window_id:
+                    id_matches.append(candidate)
+                continue
+            title = attribute(candidate, "AXTitle")
+            if title is not None and str(title) == window.title:
+                title_candidates.append(candidate)
+        except Exception:
+            continue
+
+    title_matches = []
+    if not id_matches:
+        for candidate in title_candidates:
+            try:
+                position_value = attribute(candidate, "AXPosition")
+                size_value = attribute(candidate, "AXSize")
+                if position_value is None or size_value is None:
+                    continue
+                position_ok, position = ApplicationServices.AXValueGetValue(
+                    position_value,
+                    ApplicationServices.kAXValueCGPointType,
+                    None,
+                )
+                size_ok, size = ApplicationServices.AXValueGetValue(
+                    size_value,
+                    ApplicationServices.kAXValueCGSizeType,
+                    None,
+                )
+                if not position_ok or not size_ok:
+                    continue
+                expected = window.bounds
+                actual = (
+                    float(position.x),
+                    float(position.y),
+                    float(size.width),
+                    float(size.height),
+                )
+                if all(
+                    abs(actual[index] - expected[index])
+                    <= _MACOS_AX_GEOMETRY_TOLERANCE_POINTS
+                    for index in range(4)
+                ):
+                    title_matches.append(candidate)
+            except Exception:
+                continue
+
+    matches = id_matches if id_matches else title_matches
+    if len(matches) != 1:
+        return None
+    try:
+        minimized = attribute(matches[0], "AXMinimized")
+    except Exception:
+        return None
+    if minimized is None:
+        return None
+    return bool(minimized)
 
 
 def _resolve_window_macos(target: WindowTarget) -> TargetWindow | None:
@@ -1685,6 +1820,8 @@ class _MacOSWindowCaptureProvider:
     """Session-owned exact-window providers with sticky safe fallback."""
 
     def __init__(self, *, frame_rate: float | None = None) -> None:
+        self._state_lock = threading.Lock()
+        self._closed = False
         self._stream = (
             _MacOSScreenCaptureKitStream(frame_rate=frame_rate)
             if _screen_capture_kit_available()
@@ -1693,13 +1830,35 @@ class _MacOSWindowCaptureProvider:
         self._sck_disabled = self._stream is None
         self._quartz_disabled = False
 
+    def _assert_open(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise WindowCaptureError("the exact-window capture provider is closed")
+
     def capture(self, window: TargetWindow) -> "Image.Image":
         """Capture only ``window`` and never substitute desktop pixels."""
         failures: list[BaseException] = []
         chain_deadline = time.monotonic() + _MACOS_PROVIDER_CHAIN_TIMEOUT_SECONDS
+        self._assert_open()
+
+        def assert_offscreen_target_is_safe() -> None:
+            if window.on_screen:
+                return
+            minimized = _macos_window_minimized(window, deadline=chain_deadline)
+            if minimized is True:
+                raise WindowCaptureUnavailableError(
+                    "the exact target window is minimized; restore it before recording"
+                )
+            if minimized is None:
+                raise WindowCaptureUnavailableError(
+                    "the exact off-screen target could not be proven non-minimized; "
+                    "grant Accessibility access or move the window to the active Space"
+                )
+
+        assert_offscreen_target_is_safe()
         if not self._sck_disabled and self._stream is not None:
             try:
-                return self._stream.capture(
+                captured = self._stream.capture(
                     window,
                     deadline=min(
                         chain_deadline,
@@ -1707,6 +1866,7 @@ class _MacOSWindowCaptureProvider:
                     ),
                 )
             except WindowCaptureError as exc:
+                self._assert_open()
                 failures.append(exc)
                 self._stream.close(timeout_seconds=2.0)
                 self._sck_disabled = True
@@ -1714,8 +1874,13 @@ class _MacOSWindowCaptureProvider:
                     "ScreenCaptureKit exact-window stream failed; disabling it "
                     "for this recording session"
                 )
+            else:
+                self._assert_open()
+                assert_offscreen_target_is_safe()
+                return captured
 
         if window.on_screen and not self._quartz_disabled:
+            self._assert_open()
             try:
                 import Quartz
 
@@ -1726,6 +1891,7 @@ class _MacOSWindowCaptureProvider:
                     Quartz.kCGWindowImageBoundsIgnoreFraming,
                 )
             except Exception as exc:
+                self._assert_open()
                 img_ref = None
                 failures.append(
                     WindowCaptureUnavailableError(
@@ -1734,11 +1900,14 @@ class _MacOSWindowCaptureProvider:
                 )
                 logger.debug("Quartz exact-window capture failed: {}", exc)
             if img_ref is not None:
-                return _pil_image_from_cgimage(
+                captured = _pil_image_from_cgimage(
                     img_ref,
                     source="macos-quartz-window-image",
                 )
+                self._assert_open()
+                return captured
             self._quartz_disabled = True
+            self._assert_open()
             failures.append(
                 WindowCapturePermissionError(
                     f"Quartz returned no image for exact window {window.window_id}"
@@ -1756,16 +1925,22 @@ class _MacOSWindowCaptureProvider:
             )
 
         try:
+            self._assert_open()
+            assert_offscreen_target_is_safe()
             remaining = chain_deadline - time.monotonic()
             if remaining <= 0:
                 raise WindowCaptureUnavailableError(
                     "the exact-window provider chain exhausted its startup budget"
                 )
-            return _capture_window_macos_utility(
+            captured = _capture_window_macos_utility(
                 window,
                 timeout_seconds=min(_MACOS_CAPTURE_TIMEOUT_SECONDS, remaining),
             )
+            self._assert_open()
+            assert_offscreen_target_is_safe()
+            return captured
         except WindowCaptureError as exc:
+            self._assert_open()
             failures.append(exc)
             failure_type = (
                 WindowCapturePermissionError
@@ -1790,6 +1965,10 @@ class _MacOSWindowCaptureProvider:
 
     def close(self) -> None:
         """Stop the owned stream, if it started."""
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
         if self._stream is not None:
             self._stream.close()
 

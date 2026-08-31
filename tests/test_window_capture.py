@@ -52,6 +52,65 @@ from openadapt_capture.window_capture import (
     translate_point,
 )
 
+
+def test_record_closes_window_scope_when_startup_fails(monkeypatch, tmp_path):
+    """A preflight stream must not survive a later recorder setup failure."""
+
+    class FakeWindowScope:
+        def __init__(self):
+            self.close_calls = 0
+
+        def bind_display_topology(self, _snapshot, _guard):
+            return None
+
+        def capture_frame(self, *, publish=False):
+            assert publish is False
+            return Image.new("RGB", (100, 80), "white"), True
+
+        def snapshot(self):
+            return {
+                "window_id": 42,
+                "capture_source": "test-exact-window-stream",
+                "visibility_independent": True,
+            }
+
+        def close(self):
+            self.close_calls += 1
+
+    fake_scope = FakeWindowScope()
+    fake_display_scope = SimpleNamespace(
+        snapshot=lambda: {"topology_sha256": "test-topology"},
+        assert_current=lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(recorder_module.config, "RECORD_BROWSER_EVENTS", False)
+    monkeypatch.setattr(recorder_module.config, "RECORD_VIDEO", False)
+    monkeypatch.setattr(recorder_module.config, "RECORD_IMAGES", True)
+    monkeypatch.setattr(
+        recorder_module,
+        "build_window_scope",
+        lambda *_args, **_kwargs: fake_scope,
+    )
+    monkeypatch.setattr(
+        recorder_module.DesktopCaptureScope,
+        "current",
+        lambda: fake_display_scope,
+    )
+    monkeypatch.setattr(
+        recorder_module,
+        "create_recording",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("setup failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        recorder_module.record(
+            "startup failure cleanup",
+            capture_dir=str(tmp_path),
+            structural_observer=object(),
+        )
+
+    assert fake_scope.close_calls == 1
+
+
 # ---------------------------------------------------------------------------
 # translate_point: exact inverse of flow's replay mapping
 # ---------------------------------------------------------------------------
@@ -1108,6 +1167,11 @@ def test_macos_capture_uses_exact_utility_after_sck_and_quartz_fail(monkeypatch)
     monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: True)
     monkeypatch.setattr(
         window_capture_module,
+        "_macos_window_minimized",
+        lambda _window, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        window_capture_module,
         "_MacOSScreenCaptureKitStream",
         DeniedStream,
     )
@@ -1152,6 +1216,11 @@ def test_macos_provider_disables_failed_stream_for_the_session(monkeypatch):
             stream_calls.append("close")
 
     monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: True)
+    monkeypatch.setattr(
+        window_capture_module,
+        "_macos_window_minimized",
+        lambda _window, **_kwargs: False,
+    )
     monkeypatch.setattr(
         window_capture_module,
         "_MacOSScreenCaptureKitStream",
@@ -1366,6 +1435,83 @@ def test_screencapturekit_close_wakes_waiting_capture(monkeypatch):
     assert "closed" in str(errors[0])
 
 
+def test_screencapturekit_close_budget_includes_capture_lock_wait():
+    stream = window_capture_module._MacOSScreenCaptureKitStream()
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_capture_lock():
+        with stream._capture_lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=1)
+
+    holder = threading.Thread(target=hold_capture_lock)
+    holder.start()
+    assert lock_held.wait(timeout=1)
+    started = time.monotonic()
+    stream.close(timeout_seconds=0.02)
+    elapsed = time.monotonic() - started
+    release_lock.set()
+    holder.join(timeout=1)
+
+    assert elapsed < 0.2
+    assert stream._closed is True
+    assert not holder.is_alive()
+
+
+def test_screencapturekit_capture_owner_stops_stream_after_close_timeout(monkeypatch):
+    _fake_screencapturekit_modules(monkeypatch, {})
+    stop_called = threading.Event()
+    allow_stop = threading.Event()
+    stop_calls = 0
+
+    class FakeNativeStream:
+        @staticmethod
+        def stopCaptureWithCompletionHandler_(callback):
+            nonlocal stop_calls
+            stop_calls += 1
+            stop_called.set()
+            assert allow_stop.wait(timeout=1)
+            callback(None)
+
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 20.0, 10.0),
+        process_start_time=123.0,
+    )
+    stream = window_capture_module._MacOSScreenCaptureKitStream()
+    stream._stream = FakeNativeStream()
+    stream._window_id = window.window_id
+    stream._bounds_size = (window.bounds[2], window.bounds[3])
+    stream._generation = 1
+    errors = []
+
+    def wait_for_frame():
+        try:
+            stream.capture(window, deadline=time.monotonic() + 5)
+        except WindowCaptureError as exc:
+            errors.append(exc)
+
+    capture_thread = threading.Thread(target=wait_for_frame)
+    capture_thread.start()
+    time.sleep(0.02)
+    started = time.monotonic()
+    stream.close(timeout_seconds=0.02)
+    elapsed = time.monotonic() - started
+    assert stop_called.wait(timeout=1)
+    allow_stop.set()
+    capture_thread.join(timeout=1)
+
+    assert elapsed < 0.2
+    assert not capture_thread.is_alive()
+    assert len(errors) == 1
+    assert stream._stream is None
+    assert stop_calls == 1
+
+
 def test_macos_provider_preserves_all_provider_permission_denial(monkeypatch):
     window = TargetWindow(
         window_id=19373,
@@ -1392,6 +1538,11 @@ def test_macos_provider_preserves_all_provider_permission_denial(monkeypatch):
     monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: True)
     monkeypatch.setattr(
         window_capture_module,
+        "_macos_window_minimized",
+        lambda _window, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        window_capture_module,
         "_MacOSScreenCaptureKitStream",
         DeniedStream,
     )
@@ -1405,6 +1556,393 @@ def test_macos_provider_preserves_all_provider_permission_denial(monkeypatch):
 
     with pytest.raises(WindowCapturePermissionError, match="all exact-window"):
         window_capture_module._MacOSWindowCaptureProvider().capture(window)
+
+
+def test_macos_provider_refuses_minimized_window_before_capture(monkeypatch):
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+        coordinate_source="quartz-screen-points",
+        visibility_independent=True,
+    )
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: False)
+    monkeypatch.setattr(
+        window_capture_module,
+        "_macos_window_minimized",
+        lambda _window, **_kwargs: True,
+    )
+    utility_calls = []
+    monkeypatch.setattr(
+        window_capture_module,
+        "_capture_window_macos_utility",
+        lambda *_args, **_kwargs: utility_calls.append("capture"),
+    )
+
+    with pytest.raises(WindowCaptureError, match="minimized"):
+        window_capture_module._MacOSWindowCaptureProvider().capture(window)
+
+    assert utility_calls == []
+
+
+def test_macos_provider_refuses_unproven_offscreen_capture(monkeypatch):
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+        coordinate_source="quartz-screen-points",
+        visibility_independent=True,
+    )
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: False)
+    monkeypatch.setattr(
+        window_capture_module,
+        "_macos_window_minimized",
+        lambda _window, **_kwargs: None,
+    )
+    utility_calls = []
+    monkeypatch.setattr(
+        window_capture_module,
+        "_capture_window_macos_utility",
+        lambda *_args, **_kwargs: utility_calls.append("capture"),
+    )
+
+    with pytest.raises(WindowCaptureError, match="proven non-minimized"):
+        window_capture_module._MacOSWindowCaptureProvider().capture(window)
+
+    assert utility_calls == []
+
+
+def test_macos_provider_refuses_capture_after_close(monkeypatch):
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: False)
+    provider = window_capture_module._MacOSWindowCaptureProvider()
+    provider.close()
+    utility_calls = []
+    monkeypatch.setattr(
+        window_capture_module,
+        "_capture_window_macos_utility",
+        lambda *_args, **_kwargs: utility_calls.append("capture"),
+    )
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=True,
+        process_start_time=123.0,
+    )
+
+    with pytest.raises(WindowCaptureError, match="provider is closed"):
+        provider.capture(window)
+
+    assert utility_calls == []
+
+
+def test_macos_provider_close_during_stream_capture_cannot_fallback(monkeypatch):
+    capture_started = threading.Event()
+    release_capture = threading.Event()
+    utility_calls = []
+
+    class BlockingStream:
+        def __init__(self, **_kwargs):
+            pass
+
+        def capture(self, _window, **_kwargs):
+            capture_started.set()
+            assert release_capture.wait(timeout=1)
+            return Image.new("RGB", (20, 10), "white")
+
+        def close(self, **_kwargs):
+            release_capture.set()
+
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: True)
+    monkeypatch.setattr(
+        window_capture_module,
+        "_MacOSScreenCaptureKitStream",
+        BlockingStream,
+    )
+    monkeypatch.setattr(
+        window_capture_module,
+        "_capture_window_macos_utility",
+        lambda *_args, **_kwargs: utility_calls.append("capture"),
+    )
+    provider = window_capture_module._MacOSWindowCaptureProvider()
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 20.0, 10.0),
+        on_screen=True,
+        process_start_time=123.0,
+    )
+    errors = []
+
+    def capture():
+        try:
+            provider.capture(window)
+        except WindowCaptureError as exc:
+            errors.append(exc)
+
+    capture_thread = threading.Thread(target=capture)
+    capture_thread.start()
+    assert capture_started.wait(timeout=1)
+    provider.close()
+    capture_thread.join(timeout=1)
+
+    assert not capture_thread.is_alive()
+    assert len(errors) == 1
+    assert "provider is closed" in str(errors[0])
+    assert utility_calls == []
+
+
+def test_macos_provider_rechecks_minimized_state_before_utility(monkeypatch):
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+        coordinate_source="quartz-screen-points",
+        visibility_independent=True,
+    )
+    states = iter((False, True))
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: False)
+    monkeypatch.setattr(
+        window_capture_module,
+        "_macos_window_minimized",
+        lambda _window, **_kwargs: next(states),
+    )
+    utility_calls = []
+    monkeypatch.setattr(
+        window_capture_module,
+        "_capture_window_macos_utility",
+        lambda *_args, **_kwargs: utility_calls.append("capture"),
+    )
+
+    with pytest.raises(WindowCaptureError, match="all exact-window") as exc_info:
+        window_capture_module._MacOSWindowCaptureProvider().capture(window)
+
+    assert utility_calls == []
+    assert any("minimized" in note for note in exc_info.value.__notes__)
+
+
+def test_macos_provider_refuses_utility_frame_if_window_becomes_minimized(
+    monkeypatch,
+):
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+        coordinate_source="quartz-screen-points",
+        visibility_independent=True,
+    )
+    states = iter((False, False, True))
+    monkeypatch.setattr(window_capture_module, "_screen_capture_kit_available", lambda: False)
+    monkeypatch.setattr(
+        window_capture_module,
+        "_macos_window_minimized",
+        lambda _window, **_kwargs: next(states),
+    )
+    utility_calls = []
+
+    def utility(*_args, **_kwargs):
+        utility_calls.append("capture")
+        return Image.new("RGB", (3024, 1888), "white")
+
+    monkeypatch.setattr(window_capture_module, "_capture_window_macos_utility", utility)
+
+    with pytest.raises(WindowCaptureError, match="all exact-window") as exc_info:
+        window_capture_module._MacOSWindowCaptureProvider().capture(window)
+
+    assert utility_calls == ["capture"]
+    assert any("minimized" in note for note in exc_info.value.__notes__)
+
+
+def test_macos_minimized_state_matches_exact_ax_window_number(monkeypatch):
+    exact = object()
+    other = object()
+    attributes = {
+        (exact, "AXWindowNumber"): 19373,
+        (exact, "AXTitle"): "Document",
+        (exact, "AXMinimized"): False,
+        (other, "AXWindowNumber"): 99,
+        (other, "AXTitle"): "Document",
+    }
+
+    def copy_attribute(element, name, _value):
+        if element == "application" and name == "AXWindows":
+            return 0, [other, exact]
+        value = attributes.get((element, name))
+        return (0, value) if value is not None else (1, None)
+
+    application_services = SimpleNamespace(
+        kAXErrorSuccess=0,
+        AXUIElementCreateApplication=lambda _pid: "application",
+        AXUIElementSetMessagingTimeout=lambda _element, _timeout: 0,
+        AXUIElementCopyAttributeValue=copy_attribute,
+    )
+    monkeypatch.setitem(sys.modules, "ApplicationServices", application_services)
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+    )
+
+    assert window_capture_module._macos_window_minimized(window) is False
+
+
+def test_macos_minimized_title_fallback_requires_matching_geometry(monkeypatch):
+    candidate = object()
+    attributes = {
+        (candidate, "AXTitle"): "Document",
+        (candidate, "AXPosition"): SimpleNamespace(x=50.0, y=50.0),
+        (candidate, "AXSize"): SimpleNamespace(width=1512.0, height=944.0),
+        (candidate, "AXMinimized"): False,
+    }
+
+    def copy_attribute(element, name, _value):
+        if element == "application" and name == "AXWindows":
+            return 0, [candidate]
+        value = attributes.get((element, name))
+        return (0, value) if value is not None else (1, None)
+
+    application_services = SimpleNamespace(
+        kAXErrorSuccess=0,
+        kAXValueCGPointType=1,
+        kAXValueCGSizeType=2,
+        AXUIElementCreateApplication=lambda _pid: "application",
+        AXUIElementSetMessagingTimeout=lambda _element, _timeout: 0,
+        AXUIElementCopyAttributeValue=copy_attribute,
+        AXValueGetValue=lambda value, _type, _output: (True, value),
+    )
+    monkeypatch.setitem(sys.modules, "ApplicationServices", application_services)
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+    )
+
+    assert window_capture_module._macos_window_minimized(window) is None
+
+
+def test_macos_minimized_title_fallback_rejects_known_different_window_id(
+    monkeypatch,
+):
+    candidate = object()
+    attributes = {
+        (candidate, "AXWindowNumber"): 99,
+        (candidate, "AXTitle"): "Document",
+        (candidate, "AXPosition"): SimpleNamespace(x=0.0, y=0.0),
+        (candidate, "AXSize"): SimpleNamespace(width=1512.0, height=944.0),
+        (candidate, "AXMinimized"): False,
+    }
+
+    def copy_attribute(element, name, _value):
+        if element == "application" and name == "AXWindows":
+            return 0, [candidate]
+        value = attributes.get((element, name))
+        return (0, value) if value is not None else (1, None)
+
+    application_services = SimpleNamespace(
+        kAXErrorSuccess=0,
+        kAXValueCGPointType=1,
+        kAXValueCGSizeType=2,
+        AXUIElementCreateApplication=lambda _pid: "application",
+        AXUIElementSetMessagingTimeout=lambda _element, _timeout: 0,
+        AXUIElementCopyAttributeValue=copy_attribute,
+        AXValueGetValue=lambda value, _type, _output: (True, value),
+    )
+    monkeypatch.setitem(sys.modules, "ApplicationServices", application_services)
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+    )
+
+    assert window_capture_module._macos_window_minimized(window) is None
+
+
+def test_macos_minimized_lookup_sets_bounded_ax_timeout(monkeypatch):
+    timeouts = []
+
+    def set_timeout(_element, timeout):
+        timeouts.append(timeout)
+        return 0
+
+    application_services = SimpleNamespace(
+        kAXErrorSuccess=0,
+        AXUIElementCreateApplication=lambda _pid: "application",
+        AXUIElementSetMessagingTimeout=set_timeout,
+        AXUIElementCopyAttributeValue=lambda *_args: (1, None),
+    )
+    monkeypatch.setitem(sys.modules, "ApplicationServices", application_services)
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+    )
+    deadline = time.monotonic() + 0.05
+
+    assert window_capture_module._macos_window_minimized(
+        window,
+        deadline=deadline,
+    ) is None
+    assert len(timeouts) == 1
+    assert 0 < timeouts[0] <= 0.05
+
+
+def test_macos_minimized_lookup_refuses_rejected_ax_timeout(monkeypatch):
+    reads = []
+    application_services = SimpleNamespace(
+        kAXErrorSuccess=0,
+        AXUIElementCreateApplication=lambda _pid: "application",
+        AXUIElementSetMessagingTimeout=lambda _element, _timeout: 1,
+        AXUIElementCopyAttributeValue=lambda *_args: reads.append("read"),
+    )
+    monkeypatch.setitem(sys.modules, "ApplicationServices", application_services)
+    window = TargetWindow(
+        window_id=19373,
+        owner="FakeApp",
+        title="Document",
+        pid=100,
+        bounds=(0.0, 0.0, 1512.0, 944.0),
+        on_screen=False,
+        process_start_time=123.0,
+    )
+
+    assert window_capture_module._macos_window_minimized(window) is None
+    assert reads == []
 
 
 class TestTranslatePoint:
@@ -1504,6 +2042,8 @@ class FakePlatform:
         self.window_id = 42
         self.title = "Fake Window"
         self.missing = False
+        self.on_screen = True
+        self.visibility_independent = False
         self.process_start_time = 123.5
 
     def resolver(self, target: WindowTarget):
@@ -1515,6 +2055,8 @@ class FakePlatform:
             title=self.title,
             pid=1234,
             bounds=self.bounds,
+            on_screen=self.on_screen,
+            visibility_independent=self.visibility_independent,
             process_start_time=self.process_start_time,
             coordinate_source="test-screen-points",
         )
@@ -1554,6 +2096,30 @@ class TestWindowCaptureScope:
         image, changed = scope.capture_frame()
         assert changed is True  # first frame always establishes the timeline
         assert image.size == (1600, 1200)  # 800x600 points at 2x
+
+    def test_visible_window_cannot_become_offscreen_during_capture(self, fake):
+        fake.visibility_independent = True
+
+        def capturer(window):
+            image = fake.capturer(window)
+            fake.on_screen = False
+            return image
+
+        capture_scope = WindowCaptureScope(
+            WindowTarget(owner="FakeApp"),
+            resolver=fake.resolver,
+            capturer=capturer,
+        )
+        capture_scope.bind_display_topology(
+            {
+                "schema_version": "openadapt.capture.display-topology/v1",
+                "topology_sha256": "a" * 64,
+            },
+            lambda **_kwargs: None,
+        )
+
+        with pytest.raises(WindowCaptureError, match="stopped being visible"):
+            capture_scope.capture_frame()
 
     def test_scale_computed_from_frame_and_bounds(self, scope):
         scope.capture_frame()
