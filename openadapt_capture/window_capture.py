@@ -1951,8 +1951,13 @@ class _MacOSWindowCaptureProvider:
                 )
                 else WindowCaptureError
             )
+            provider_details = "; ".join(
+                f"{type(provider_failure).__name__}: {provider_failure}"
+                for provider_failure in failures
+            )
             failure = failure_type(
-                f"all exact-window capture providers failed for window {window.window_id}"
+                f"all exact-window capture providers failed for window "
+                f"{window.window_id}: {provider_details}"
             )
             for provider_failure in failures:
                 try:

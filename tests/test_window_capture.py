@@ -1734,7 +1734,7 @@ def test_macos_provider_rechecks_minimized_state_before_utility(monkeypatch):
         window_capture_module._MacOSWindowCaptureProvider().capture(window)
 
     assert utility_calls == []
-    assert any("minimized" in note for note in exc_info.value.__notes__)
+    assert "minimized" in str(exc_info.value)
 
 
 def test_macos_provider_refuses_utility_frame_if_window_becomes_minimized(
@@ -1770,7 +1770,7 @@ def test_macos_provider_refuses_utility_frame_if_window_becomes_minimized(
         window_capture_module._MacOSWindowCaptureProvider().capture(window)
 
     assert utility_calls == ["capture"]
-    assert any("minimized" in note for note in exc_info.value.__notes__)
+    assert "minimized" in str(exc_info.value)
 
 
 def test_macos_minimized_state_matches_exact_ax_window_number(monkeypatch):
