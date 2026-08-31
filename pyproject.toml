@@ -74,7 +74,7 @@ share = [
 # Native Linux AT-SPI observation. The host must also provide the AT-SPI
 # typelib/runtime (for example gir1.2-atspi-2.0 on Debian/Ubuntu).
 linux = [
-    "PyGObject>=3.46,<3.50; sys_platform == 'linux'",
+    "PyGObject>=3.46,<3.59; sys_platform == 'linux'",
 ]
 
 # Everything
