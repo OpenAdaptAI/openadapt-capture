@@ -43,6 +43,7 @@ from openadapt_capture.structural import (
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "openadapt_capture"
+# Pinned from OpenAdaptAI/openadapt-types#35 @ 3abf298b.
 SCHEMA_PATH = ROOT / "tests" / "fixtures" / "authoring-observe-v1.json"
 TEST_HMAC_KEY = bytes.fromhex("11" * 32)
 TEST_LEASE_NONCE = b"test-lease-nonce"
@@ -67,6 +68,8 @@ def _viewport() -> StructuralBounds:
 
 def _raw_node(**kwargs) -> AuthoringRawNode:
     bounds = kwargs.pop("bounds", StructuralBounds(left=720, top=880, right=860, bottom=930))
+    kwargs.setdefault("enabled", True)
+    kwargs.setdefault("focused", False)
     return AuthoringRawNode(bounds=bounds, **kwargs)
 
 
@@ -93,14 +96,26 @@ def _project(raw_tree: list[AuthoringRawNode], *, backend: str = "web", **kwargs
 
 def test_schema_fixture_forbids_value_title_screenshot_and_extra_keys() -> None:
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    assert schema["title"] == "AuthoringObserveV1"
     assert schema["additionalProperties"] is False
-    assert schema["$defs"]["wireNode"]["additionalProperties"] is False
-    assert schema["$defs"]["normalizedBounds"]["additionalProperties"] is False
-    assert schema["properties"]["window"]["additionalProperties"] is False
+    node = schema["$defs"]["AuthoringNodeV1"]
+    window = schema["$defs"]["AuthoringWindowV1"]
+    bounds = schema["$defs"]["AuthoringNormalizedBoundsV1"]
+    assert node["additionalProperties"] is False
+    assert window["additionalProperties"] is False
+    assert bounds["additionalProperties"] is False
     for forbidden in ("value", "title", "screenshot"):
         assert forbidden not in schema["properties"]
-        assert forbidden not in schema["properties"]["window"]["properties"]
-        assert forbidden not in schema["$defs"]["wireNode"]["properties"]
+        assert forbidden not in window["properties"]
+        assert forbidden not in node["properties"]
+    assert set(node["required"]) == {"node_id", "role", "enabled", "focused", "bounds"}
+    assert schema["$defs"]["AuthoringProviderV1"]["enum"] == [
+        "playwright_ax",
+        "macos_ax",
+        "windows_uia",
+        "linux_atspi",
+        "none",
+    ]
 
 
 def test_wire_models_reject_value_title_screenshot_and_extra_keys() -> None:
@@ -188,9 +203,11 @@ def test_value_title_and_screenshot_never_appear_on_the_wire() -> None:
         tree=[
             StructuralTreeNode(
                 provider_runtime_id="ax-1",
-                role="AXTextField",
+                role="text_input",
                 name="Note",
                 value="typed secret",
+                enabled=True,
+                focused=False,
                 bounds=StructuralBounds(left=10, top=10, right=110, bottom=40),
             )
         ],
@@ -333,8 +350,8 @@ def test_invalid_process_name_is_dropped() -> None:
             bounds=_viewport(),
         ),
     )
-    assert projection.observe.window.process_name is None
-    assert "title" not in projection.wire_dict()["window"]
+    assert projection.observe.window is None
+    assert "window" not in projection.wire_dict()
 
 
 def test_normalized_bounds_use_the_top_level_viewport() -> None:
@@ -418,4 +435,40 @@ def test_playwright_shaped_tree_projects_without_native_capture() -> None:
     assert wire["tree"][0]["automation_id"] == "btnContinue"
     assert wire["window"]["process_name"] == "Chromium"
     assert MAX_AUTHORING_WIRE_BYTES == 32 * 1024
+
+
+def test_unmapped_native_role_fail_closes_to_empty_projection() -> None:
+    projection = _project(
+        [_raw_node(provider_runtime_id="ax", role="AXButton", name="Save")]
+    )
+    wire = projection.wire_dict()
+    assert wire["tree"] == []
+    assert wire["reason"] == "empty_projection"
+    assert FORBIDDEN_WIRE_KEYS.isdisjoint(_all_keys(wire))
+
+
+def test_projected_wire_keys_match_pinned_types_schema() -> None:
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    projection = _project(
+        [
+            _raw_node(
+                provider_runtime_id="btnContinue",
+                role="button",
+                control_type="button",
+                automation_id="btnContinue",
+            )
+        ]
+    )
+    wire = projection.wire_dict()
+    assert set(wire) <= set(schema["properties"])
+    node_schema = schema["$defs"]["AuthoringNodeV1"]
+    window_schema = schema["$defs"]["AuthoringWindowV1"]
+    assert set(wire["window"]) <= set(window_schema["properties"])
+    for required in window_schema["required"]:
+        assert required in wire["window"]
+    for node in wire["tree"]:
+        assert set(node) <= set(node_schema["properties"])
+        for required in node_schema["required"]:
+            assert required in node
+    AuthoringObserve.model_validate(wire)
 

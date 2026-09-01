@@ -215,10 +215,12 @@ describe controls inside an RDP or Citrix pixel stream.
 Authoring adds `query_kind: "window_tree"`. The raw tree may persist on disk
 for compile. `openadapt_capture.authoring_project` projects that tree into
 `openadapt.authoring.observe/v1` for a vendor wire: no values, titles,
-screenshots, or extra keys. Names and automation ids that fail the coach-hint
-bar (length, `://`, `@`, six or more digits, phone, SSN, email) are dropped.
-RDP and Citrix observe payloads are coach-only with an empty tree. Capture
-still drops OS-injected input; there is no `record_injected` API.
+screenshots, or extra keys. The observe fixture is pinned to
+`openadapt-types` PR 35. Names and automation ids that fail the coach-hint
+bar (length, `://`, `@`, six or more digits, phone, SSN, email) or the types
+projected-label grammar are dropped. Unmapped native roles never reach the
+wire. RDP and Citrix observe payloads are coach-only with an empty tree.
+Capture still drops OS-injected input; there is no `record_injected` API.
 
 ## Video and frame timing
 

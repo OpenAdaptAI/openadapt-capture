@@ -29,15 +29,88 @@ MAX_AUTHORING_NODES = 200
 MAX_AUTHORING_WIRE_BYTES = 32 * 1024
 MAX_AUTHORING_LABEL_LENGTH = 80
 NODE_ID_PATTERN = r"^n_[0-9a-f]{8}$"
+PROCESS_NAME_PATTERN = r"^[A-Za-z0-9 ._-]{1,64}$"
+PROJECTED_LABEL_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$"
 
 AuthoringBackend = Literal["macos", "linux", "windows", "web", "rdp", "citrix"]
+AuthoringProvider = Literal[
+    "playwright_ax",
+    "macos_ax",
+    "windows_uia",
+    "linux_atspi",
+    "none",
+]
+AuthoringRole = Literal[
+    "button",
+    "text_input",
+    "text_static",
+    "label",
+    "link",
+    "checkbox",
+    "radio",
+    "combobox",
+    "list_item",
+    "menu",
+    "menu_item",
+    "tab",
+    "tree_item",
+    "image",
+    "icon",
+    "toolbar",
+    "scrollbar",
+    "slider",
+    "window",
+    "dialog",
+    "group",
+    "table",
+    "table_cell",
+    "table_row",
+    "heading",
+    "paragraph",
+    "unknown",
+]
 
 _AGENT_DRIVE_BACKENDS = frozenset({"macos", "linux", "web"})
 _COACH_ONLY_BACKENDS = frozenset({"windows", "rdp", "citrix"})
 _EMPTY_TREE_BACKENDS = frozenset({"rdp", "citrix"})
 _KNOWN_BACKENDS = frozenset({"macos", "linux", "windows", "web", "rdp", "citrix"})
+_KNOWN_PROVIDERS = frozenset(
+    {"playwright_ax", "macos_ax", "windows_uia", "linux_atspi", "none"}
+)
+_AUTHORING_ROLES = frozenset(
+    {
+        "button",
+        "text_input",
+        "text_static",
+        "label",
+        "link",
+        "checkbox",
+        "radio",
+        "combobox",
+        "list_item",
+        "menu",
+        "menu_item",
+        "tab",
+        "tree_item",
+        "image",
+        "icon",
+        "toolbar",
+        "scrollbar",
+        "slider",
+        "window",
+        "dialog",
+        "group",
+        "table",
+        "table_cell",
+        "table_row",
+        "heading",
+        "paragraph",
+        "unknown",
+    }
+)
 
-_PROCESS_NAME = re.compile(r"^[A-Za-z0-9 ._-]{1,64}$")
+_PROCESS_NAME = re.compile(PROCESS_NAME_PATTERN)
+_PROJECTED_LABEL = re.compile(PROJECTED_LABEL_PATTERN)
 _SIX_DIGITS = re.compile(r"\d{6,}")
 _SSN = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
 _PHONE = re.compile(
@@ -66,6 +139,8 @@ class AuthoringNormalizedBounds(BaseModel):
             raise ValueError("normalized bounds must be finite")
         if any(value < 0 or value > 1 for value in values):
             raise ValueError("normalized bounds must lie in [0, 1]")
+        if self.x + self.w > 1 + 1e-9 or self.y + self.h > 1 + 1e-9:
+            raise ValueError("normalized bounds exceed the viewport")
         return self
 
 
@@ -96,14 +171,14 @@ class AuthoringWireNode(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     node_id: str = Field(pattern=NODE_ID_PATTERN)
-    role: str | None = None
-    control_type: str | None = None
-    automation_id: str | None = None
-    name: str | None = None
-    class_name: str | None = None
-    enabled: bool | None = None
-    focused: bool | None = None
-    bounds: AuthoringNormalizedBounds | None = None
+    role: AuthoringRole
+    control_type: str | None = Field(default=None, pattern=PROJECTED_LABEL_PATTERN)
+    automation_id: str | None = Field(default=None, pattern=PROJECTED_LABEL_PATTERN)
+    name: str | None = Field(default=None, pattern=PROJECTED_LABEL_PATTERN)
+    class_name: str | None = Field(default=None, pattern=PROJECTED_LABEL_PATTERN)
+    enabled: bool
+    focused: bool
+    bounds: AuthoringNormalizedBounds
 
 
 class AuthoringWindow(BaseModel):
@@ -111,9 +186,9 @@ class AuthoringWindow(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    process_name: str | None = None
-    role: str | None = None
-    bounds: AuthoringNormalizedBounds | None = None
+    process_name: str = Field(pattern=PROCESS_NAME_PATTERN)
+    role: Literal["window"] = "window"
+    bounds: AuthoringNormalizedBounds
 
 
 class AuthoringObserve(BaseModel):
@@ -125,12 +200,12 @@ class AuthoringObserve(BaseModel):
         AUTHORING_OBSERVE_SCHEMA_VERSION
     )
     backend: AuthoringBackend
-    provider: str
+    provider: AuthoringProvider
     mode: Literal["authoring"] = "authoring"
     agent_drive: bool
     coach_only: bool
     recording: bool = False
-    window: AuthoringWindow
+    window: AuthoringWindow | None = None
     tree: list[AuthoringWireNode] = Field(default_factory=list, max_length=MAX_AUTHORING_NODES)
     truncated: bool = False
     node_count: int = Field(default=0, ge=0, le=MAX_AUTHORING_NODES)
@@ -225,6 +300,8 @@ def project_text(value: str | None) -> str | None:
         return None
     if _SSN.search(collapsed) or _PHONE.search(collapsed) or _EMAIL.search(collapsed):
         return None
+    if not _PROJECTED_LABEL.fullmatch(collapsed):
+        return None
     return collapsed
 
 
@@ -300,6 +377,8 @@ def project_authoring_observe(
             observed_at_ms = int(observation.observed_at * 1000)
     if not resolved_provider:
         raise ValueError("provider is required")
+    if resolved_provider not in _KNOWN_PROVIDERS:
+        raise ValueError(f"unknown authoring provider: {resolved_provider!r}")
     nonce = lease_nonce.encode("utf-8") if isinstance(lease_nonce, str) else lease_nonce
     if not nonce:
         raise ValueError("lease_nonce is required")
@@ -337,7 +416,7 @@ def project_authoring_observe(
 
     observe = AuthoringObserve(
         backend=backend,  # type: ignore[arg-type]
-        provider=resolved_provider,
+        provider=resolved_provider,  # type: ignore[arg-type]
         agent_drive=agent_drive,
         coach_only=coach_only,
         recording=recording,
@@ -368,16 +447,25 @@ def _raw_from_structural(node: StructuralTreeNode) -> AuthoringRawNode:
     )
 
 
-def _project_window(raw_window: AuthoringRawWindow | None) -> AuthoringWindow:
-    if raw_window is None:
-        return AuthoringWindow()
-    bounds = None
-    if raw_window.bounds is not None:
-        bounds = AuthoringNormalizedBounds(x=0.0, y=0.0, w=1.0, h=1.0)
+def _project_role(value: str | None) -> AuthoringRole | None:
+    if not isinstance(value, str):
+        return None
+    collapsed = " ".join(value.split())
+    if collapsed not in _AUTHORING_ROLES:
+        return None
+    return collapsed  # type: ignore[return-value]
+
+
+def _project_window(raw_window: AuthoringRawWindow | None) -> AuthoringWindow | None:
+    if raw_window is None or raw_window.bounds is None:
+        return None
+    process_name = project_process_name(raw_window.process_name)
+    if process_name is None:
+        return None
     return AuthoringWindow(
-        process_name=project_process_name(raw_window.process_name),
-        role=project_text(raw_window.role),
-        bounds=bounds,
+        process_name=process_name,
+        role="window",
+        bounds=AuthoringNormalizedBounds(x=0.0, y=0.0, w=1.0, h=1.0),
     )
 
 
@@ -401,13 +489,16 @@ def _normalize_bounds(
     height = viewport.bottom - viewport.top
     if width <= 0 or height <= 0:
         return None
+    x = _clamp01((bounds.left - viewport.left) / width)
+    y = _clamp01((bounds.top - viewport.top) / height)
+    w = _clamp01((bounds.right - bounds.left) / width)
+    h = _clamp01((bounds.bottom - bounds.top) / height)
+    if x + w > 1:
+        w = 1.0 - x
+    if y + h > 1:
+        h = 1.0 - y
     try:
-        return AuthoringNormalizedBounds(
-            x=_clamp01((bounds.left - viewport.left) / width),
-            y=_clamp01((bounds.top - viewport.top) / height),
-            w=_clamp01((bounds.right - bounds.left) / width),
-            h=_clamp01((bounds.bottom - bounds.top) / height),
-        )
+        return AuthoringNormalizedBounds(x=x, y=y, w=w, h=h)
     except (TypeError, ValueError):
         return None
 
@@ -434,26 +525,10 @@ def _clamp01(value: float) -> float:
     return float(value)
 
 
-def _has_projected_fields(node: AuthoringWireNode) -> bool:
-    return any(
-        value is not None
-        for value in (
-            node.role,
-            node.control_type,
-            node.automation_id,
-            node.name,
-            node.class_name,
-            node.enabled,
-            node.focused,
-            node.bounds,
-        )
-    )
-
-
 def _wire_size(
     *,
     tree: list[AuthoringWireNode],
-    window: AuthoringWindow,
+    window: AuthoringWindow | None,
     backend: str,
     provider: str,
     agent_drive: bool,
@@ -461,7 +536,7 @@ def _wire_size(
     recording: bool,
     truncated: bool,
 ) -> int:
-    payload = {
+    payload: dict[str, Any] = {
         "schema_version": AUTHORING_OBSERVE_SCHEMA_VERSION,
         "backend": backend,
         "provider": provider,
@@ -469,11 +544,12 @@ def _wire_size(
         "agent_drive": agent_drive,
         "coach_only": coach_only,
         "recording": recording,
-        "window": window.model_dump(mode="json", exclude_none=True),
         "tree": [node.model_dump(mode="json", exclude_none=True) for node in tree],
         "truncated": truncated,
         "node_count": len(tree),
     }
+    if window is not None:
+        payload["window"] = window.model_dump(mode="json", exclude_none=True)
     return len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
 
@@ -484,7 +560,7 @@ def _project_tree(
     lease_nonce: bytes,
     viewport: StructuralBounds | None,
     observed_at_ms: int,
-    window: AuthoringWindow,
+    window: AuthoringWindow | None,
     backend: str,
     provider: str,
     agent_drive: bool,
@@ -496,6 +572,15 @@ def _project_tree(
     table: list[AuthoringNodeTableEntry] = []
     truncated = raw_truncated
     for index, raw in enumerate(_flatten(raw_tree)):
+        role = _project_role(raw.role)
+        bounds = _normalize_bounds(raw.bounds, viewport)
+        if (
+            role is None
+            or raw.enabled is None
+            or raw.focused is None
+            or bounds is None
+        ):
+            continue
         runtime_id = raw.provider_runtime_id or f"anon:{index}"
         node = AuthoringWireNode(
             node_id=mint_node_id(
@@ -503,17 +588,15 @@ def _project_tree(
                 lease_nonce=lease_nonce,
                 provider_runtime_id=runtime_id,
             ),
-            role=project_text(raw.role),
+            role=role,
             control_type=project_text(raw.control_type),
             automation_id=project_text(raw.automation_id),
             name=project_text(raw.name),
             class_name=project_text(raw.class_name),
             enabled=raw.enabled,
             focused=raw.focused,
-            bounds=_normalize_bounds(raw.bounds, viewport),
+            bounds=bounds,
         )
-        if not _has_projected_fields(node):
-            continue
         candidate_tree = [*tree, node]
         if len(candidate_tree) > MAX_AUTHORING_NODES:
             truncated = True
@@ -548,6 +631,8 @@ __all__ = [
     "AUTHORING_OBSERVE_SCHEMA_VERSION",
     "AuthoringBackend",
     "AuthoringNodeTableEntry",
+    "AuthoringProvider",
+    "AuthoringRole",
     "AuthoringNormalizedBounds",
     "AuthoringObserve",
     "AuthoringPixelBounds",
