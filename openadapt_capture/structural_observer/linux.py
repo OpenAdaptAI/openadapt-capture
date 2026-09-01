@@ -25,6 +25,7 @@ from openadapt_capture.structural import (
     StructuralProcessIdentity,
     StructuralTreeNode,
     StructuralWindowIdentity,
+    omit_tree_value,
 )
 
 _logger = logging.getLogger(__name__)
@@ -476,7 +477,11 @@ def _as_tree_node(
         control_type=fields.get("control_type"),
         name=fields.get("name"),
         class_name=fields.get("class_name"),
-        value=_tree_value(runtime, element),
+        value=(
+            None
+            if omit_tree_value(fields.get("role"), fields.get("control_type"))
+            else _tree_value(runtime, element)
+        ),
         enabled=_bool_state(runtime, element, "ENABLED"),
         focused=_bool_state(runtime, element, "FOCUSED"),
         bounds=fields.get("bounds"),

@@ -117,6 +117,77 @@ _PHONE = re.compile(
     r"(?<!\d)(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}(?!\d)"
 )
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}")
+_COMPACT_AUTHORING_ROLES = {role.replace("_", ""): role for role in _AUTHORING_ROLES}
+_ROLE_ALIASES = {
+    "alert": "dialog",
+    "cell": "table_cell",
+    "columnheader": "table_cell",
+    "datagrid": "table",
+    "dataitem": "table_cell",
+    "disclosuretriangle": "button",
+    "document": "text_input",
+    "edit": "text_input",
+    "entry": "text_input",
+    "filler": "group",
+    "frame": "window",
+    "gridcell": "table_cell",
+    "header": "table_row",
+    "headeritem": "table_cell",
+    "helpbutton": "button",
+    "hyperlink": "link",
+    "img": "image",
+    "incrementor": "slider",
+    "layeredpane": "group",
+    "list": "group",
+    "menubar": "menu",
+    "menubaritem": "menu_item",
+    "menubutton": "button",
+    "option": "list_item",
+    "outline": "table",
+    "pagetab": "tab",
+    "pagetablist": "tab",
+    "pane": "group",
+    "panel": "group",
+    "password": "text_input",
+    "passwordtext": "text_input",
+    "popupbutton": "combobox",
+    "pushbutton": "button",
+    "radiobutton": "radio",
+    "radiogroup": "group",
+    "row": "table_row",
+    "rowheader": "table_cell",
+    "scrollarea": "group",
+    "scrollpane": "group",
+    "searchbox": "text_input",
+    "section": "group",
+    "securetextfield": "text_input",
+    "sheet": "dialog",
+    "spinbutton": "slider",
+    "spinner": "slider",
+    "splitbutton": "button",
+    "splitgroup": "group",
+    "splitpane": "group",
+    "static": "text_static",
+    "statictext": "text_static",
+    "switch": "checkbox",
+    "systemdialog": "dialog",
+    "tabbutton": "tab",
+    "tabgroup": "tab",
+    "tabitem": "tab",
+    "terminal": "text_input",
+    "textarea": "text_input",
+    "textbox": "text_input",
+    "textfield": "text_input",
+    "thumb": "slider",
+    "tree": "group",
+    "webarea": "group",
+}
+_PROVIDER_TEXT_ROLE: dict[str, AuthoringRole] = {
+    "linux_atspi": "text_input",
+    "macos_ax": "text_static",
+    "playwright_ax": "text_static",
+    "windows_uia": "text_static",
+}
 
 _logger = logging.getLogger(__name__)
 
@@ -447,13 +518,44 @@ def _raw_from_structural(node: StructuralTreeNode) -> AuthoringRawNode:
     )
 
 
-def _project_role(value: str | None) -> AuthoringRole | None:
+def _role_lookup_keys(value: str) -> list[str]:
+    collapsed = " ".join(value.split())
+    folded = collapsed.casefold()
+    dotted = folded.rsplit(".", 1)[-1]
+    compact = dotted.replace("_", "").replace(" ", "").replace("-", "")
+    keys = [collapsed, folded, dotted, compact]
+    if compact.startswith("ax") and len(compact) > 2:
+        keys.append(compact[2:])
+    return list(dict.fromkeys(keys))
+
+
+def _map_one_role(value: str | None, *, provider: str) -> AuthoringRole | None:
     if not isinstance(value, str):
         return None
-    collapsed = " ".join(value.split())
-    if collapsed not in _AUTHORING_ROLES:
-        return None
-    return collapsed  # type: ignore[return-value]
+    for key in _role_lookup_keys(value):
+        if key in _AUTHORING_ROLES:
+            return key  # type: ignore[return-value]
+        compact = key.replace("_", "").replace(" ", "").replace("-", "")
+        if compact in _COMPACT_AUTHORING_ROLES:
+            return _COMPACT_AUTHORING_ROLES[compact]  # type: ignore[return-value]
+        if compact == "text":
+            return _PROVIDER_TEXT_ROLE.get(provider)
+        aliased = _ROLE_ALIASES.get(compact)
+        if aliased is not None:
+            return aliased  # type: ignore[return-value]
+    return None
+
+
+def _project_role(
+    value: str | None,
+    *,
+    provider: str,
+    control_type: str | None = None,
+) -> AuthoringRole | None:
+    mapped = _map_one_role(value, provider=provider)
+    if mapped is not None:
+        return mapped
+    return _map_one_role(control_type, provider=provider)
 
 
 def _project_window(raw_window: AuthoringRawWindow | None) -> AuthoringWindow | None:
@@ -572,7 +674,11 @@ def _project_tree(
     table: list[AuthoringNodeTableEntry] = []
     truncated = raw_truncated
     for index, raw in enumerate(_flatten(raw_tree)):
-        role = _project_role(raw.role)
+        role = _project_role(
+            raw.role,
+            provider=provider,
+            control_type=raw.control_type,
+        )
         bounds = _normalize_bounds(raw.bounds, viewport)
         if (
             role is None

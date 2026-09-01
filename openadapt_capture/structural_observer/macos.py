@@ -25,6 +25,7 @@ from openadapt_capture.structural import (
     StructuralProcessIdentity,
     StructuralTreeNode,
     StructuralWindowIdentity,
+    omit_tree_value,
 )
 
 _logger = logging.getLogger(__name__)
@@ -268,14 +269,17 @@ def _as_tree_node(
             children.append(node)
         if state["truncated"]:
             break
+    value = None
+    if not omit_tree_value(fields.get("role"), fields.get("control_type")):
+        value = _ax_value(runtime, element)
     return StructuralTreeNode(
-        provider_runtime_id=None,
+        provider_runtime_id=fields.get("automation_id"),
         automation_id=fields.get("automation_id"),
         role=fields.get("role"),
         control_type=fields.get("control_type"),
         name=fields.get("name"),
         class_name=fields.get("class_name"),
-        value=_ax_value(runtime, element),
+        value=value,
         enabled=_ax_bool(runtime, element, "AXEnabled"),
         focused=_ax_bool(runtime, element, "AXFocused"),
         bounds=fields.get("bounds"),

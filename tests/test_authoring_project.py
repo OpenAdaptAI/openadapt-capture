@@ -31,7 +31,7 @@ from openadapt_capture.input_observer.windows import (
     WM_LBUTTONDOWN,
     _mouse_event,
 )
-from openadapt_capture.recorder import on_click
+from openadapt_capture.recorder import on_click, on_move, on_scroll
 from openadapt_capture.structural import (
     StructuralBounds,
     StructuralElement,
@@ -397,6 +397,17 @@ def test_injected_clicks_still_do_not_persist() -> None:
         injected=True,
         timestamp=101.0,
     )
+    on_move(events, None, 26, 36, injected=True, timestamp=101.1)
+    on_scroll(
+        events,
+        None,
+        26,
+        36,
+        0,
+        1,
+        injected=True,
+        timestamp=101.2,
+    )
     assert events.empty()
 
 
@@ -437,13 +448,72 @@ def test_playwright_shaped_tree_projects_without_native_capture() -> None:
     assert MAX_AUTHORING_WIRE_BYTES == 32 * 1024
 
 
+def test_native_roles_map_onto_element_role() -> None:
+    macos = _project(
+        [_raw_node(provider_runtime_id="ax", role="AXButton", name="Save")],
+        backend="macos",
+        provider="macos_ax",
+    )
+    assert macos.observe.tree[0].role == "button"
+    assert macos.observe.tree[0].name == "Save"
+
+    windows = _project(
+        [
+            _raw_node(
+                provider_runtime_id="edit",
+                role="Edit",
+                control_type="Edit",
+                name="Note",
+            )
+        ],
+        backend="windows",
+        provider="windows_uia",
+    )
+    assert windows.observe.tree[0].role == "text_input"
+
+    linux = _project(
+        [_raw_node(provider_runtime_id="btn", role="push button", name="Save")],
+        backend="linux",
+        provider="linux_atspi",
+    )
+    assert linux.observe.tree[0].role == "button"
+
+    web = _project(
+        [_raw_node(provider_runtime_id="box", role="textbox", name="Note")],
+        backend="web",
+        provider="playwright_ax",
+    )
+    assert web.observe.tree[0].role == "text_input"
+
+
 def test_unmapped_native_role_fail_closes_to_empty_projection() -> None:
     projection = _project(
-        [_raw_node(provider_runtime_id="ax", role="AXButton", name="Save")]
+        [_raw_node(provider_runtime_id="ax", role="AXPrivateMysteryRole", name="Save")]
     )
     wire = projection.wire_dict()
     assert wire["tree"] == []
     assert wire["reason"] == "empty_projection"
+    assert FORBIDDEN_WIRE_KEYS.isdisjoint(_all_keys(wire))
+
+
+def test_credentials_never_appear_as_values_on_the_wire() -> None:
+    projection = _project(
+        [
+            _raw_node(
+                provider_runtime_id="password",
+                role="AXSecureTextField",
+                name="Password",
+                value="typed-secret",
+            )
+        ],
+        backend="macos",
+        provider="macos_ax",
+    )
+    wire = projection.wire_dict()
+    assert wire["tree"][0]["role"] == "text_input"
+    assert "value" not in wire["tree"][0]
+    dumped = json.dumps(wire)
+    assert "typed-secret" not in dumped
     assert FORBIDDEN_WIRE_KEYS.isdisjoint(_all_keys(wire))
 
 

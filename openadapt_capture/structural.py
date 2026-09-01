@@ -27,8 +27,34 @@ _ProviderIdentifier = Annotated[
     str,
     Field(min_length=1, max_length=64, pattern=_PROVIDER_PATTERN),
 ]
+_SECRET_VALUE_ROLE_KEYS = frozenset(
+    {
+        "password",
+        "passwordbox",
+        "passwordtext",
+        "password text",
+        "securetextfield",
+        "axsecuretextfield",
+        "secureedit",
+    }
+)
 
 _logger = logging.getLogger(__name__)
+
+
+def omit_tree_value(*roles: str | None, is_password: bool = False) -> bool:
+    """Return True when a password or secure-field value must not be retained."""
+
+    if is_password:
+        return True
+    for role in roles:
+        if not isinstance(role, str):
+            continue
+        collapsed = " ".join(role.replace("_", " ").casefold().split())
+        compact = collapsed.replace(" ", "")
+        if collapsed in _SECRET_VALUE_ROLE_KEYS or compact in _SECRET_VALUE_ROLE_KEYS:
+            return True
+    return False
 
 
 class StructuralBounds(BaseModel):
@@ -75,9 +101,10 @@ class StructuralElement(BaseModel):
 class StructuralTreeNode(BaseModel):
     """One node of a raw window accessibility tree retained on disk.
 
-    The tree may include provider values for compile. It is not the vendor-wire
-    payload; :mod:`openadapt_capture.authoring_project` projects a PHI-safe
-    subset for ``openadapt.authoring.observe/v1``.
+    Non-secret provider values may persist for compile. Password and
+    secure-field values are omitted. This is not the vendor-wire payload;
+    :mod:`openadapt_capture.authoring_project` projects a PHI-safe subset for
+    ``openadapt.authoring.observe/v1``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -300,4 +327,5 @@ __all__ = [
     "create_structural_observer",
     "observe_structural_action",
     "observe_window_tree",
+    "omit_tree_value",
 ]

@@ -29,6 +29,7 @@ from openadapt_capture.structural import (
     StructuralProcessIdentity,
     StructuralTreeNode,
     StructuralWindowIdentity,
+    omit_tree_value,
 )
 
 _logger = logging.getLogger(__name__)
@@ -409,7 +410,26 @@ def _focused(wrapper: Any, info: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-def _value(wrapper: Any) -> str | None:
+def _is_password(wrapper: Any, fields: dict[str, Any] | None = None) -> bool:
+    info = _element_info(wrapper)
+    if info is not None:
+        for attr in ("is_password", "IsPassword"):
+            if _safe_value(info, attr) is True:
+                return True
+        element = _safe_value(info, "element")
+        if _safe_value(element, "CurrentIsPassword") is True:
+            return True
+    resolved = fields if fields is not None else _element_fields(wrapper)
+    return omit_tree_value(
+        resolved.get("role"),
+        resolved.get("control_type"),
+        resolved.get("class_name"),
+    )
+
+
+def _value(wrapper: Any, fields: dict[str, Any] | None = None) -> str | None:
+    if _is_password(wrapper, fields):
+        return None
     value = _present_string(_safe_call(wrapper, "get_value"))
     if value is not None:
         return value
@@ -449,7 +469,7 @@ def _as_tree_node(wrapper: Any, state: dict[str, int | bool]) -> StructuralTreeN
         control_type=fields.get("control_type"),
         name=fields.get("name"),
         class_name=fields.get("class_name"),
-        value=_value(wrapper),
+        value=_value(wrapper, fields),
         enabled=_enabled(wrapper),
         focused=_focused(wrapper, info),
         bounds=fields.get("bounds"),
