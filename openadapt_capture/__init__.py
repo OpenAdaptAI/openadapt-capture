@@ -15,6 +15,22 @@ except PackageNotFoundError:
 # still be inspected. The repository-only Chrome-extension bridge is not part
 # of the production package or API. Supported browser recording is owned by
 # openadapt-flow's Playwright launch and attach paths.
+from openadapt_capture.authentication import (
+    AUTHENTICATION_HANDOFF_FILENAME,
+    AuthenticationBoundaryError,
+    AuthenticationHandoff,
+    AuthenticationHandoffError,
+    AuthenticationHandoffHandle,
+    AuthenticationHandoffManifest,
+    FreshFrameProof,
+    load_authentication_handoffs,
+)
+from openadapt_capture.authoring_project import (
+    AUTHORING_OBSERVE_SCHEMA_VERSION,
+    AuthoringObserve,
+    AuthoringProjection,
+    project_authoring_observe,
+)
 from openadapt_capture.browser_events import (
     BoundingBox,
     BrowserClickEvent,
@@ -47,7 +63,9 @@ from openadapt_capture.control import (
     CaptureControlError,
     CaptureControlUnavailable,
     RecorderStatus,
+    begin_authentication_handoff,
     discover_recorders,
+    end_authentication_handoff,
     status_recording,
     stop_recording,
 )
@@ -123,9 +141,11 @@ from openadapt_capture.structural import (
     StructuralObservationRequest,
     StructuralObserver,
     StructuralProcessIdentity,
+    StructuralTreeNode,
     StructuralWindowIdentity,
     create_structural_observer,
     observe_structural_action,
+    observe_window_tree,
 )
 
 # Visualization
@@ -147,15 +167,25 @@ __all__ = [
     "Recorder",
     "RecordingConfig",
     "RecorderStatus",
+    "begin_authentication_handoff",
     "CaptureControlError",
     "CaptureControlUnavailable",
     "CaptureControlAuthenticationError",
     "discover_recorders",
+    "end_authentication_handoff",
     "status_recording",
     "stop_recording",
     "Capture",
     "CaptureSession",
     "Action",
+    "AUTHENTICATION_HANDOFF_FILENAME",
+    "AuthenticationBoundaryError",
+    "AuthenticationHandoff",
+    "AuthenticationHandoffError",
+    "AuthenticationHandoffHandle",
+    "AuthenticationHandoffManifest",
+    "FreshFrameProof",
+    "load_authentication_handoffs",
     # Native structural observation
     "STRUCTURAL_OBSERVATION_SCHEMA_VERSION",
     "StructuralAncestor",
@@ -166,9 +196,16 @@ __all__ = [
     "StructuralObservationRequest",
     "StructuralObserver",
     "StructuralProcessIdentity",
+    "StructuralTreeNode",
     "StructuralWindowIdentity",
     "create_structural_observer",
     "observe_structural_action",
+    "observe_window_tree",
+    # Authoring observe projector (vendor wire; no values/titles/screenshots)
+    "AUTHORING_OBSERVE_SCHEMA_VERSION",
+    "AuthoringObserve",
+    "AuthoringProjection",
+    "project_authoring_observe",
     # Window-scoped capture
     "WindowTarget",
     "TargetWindow",
