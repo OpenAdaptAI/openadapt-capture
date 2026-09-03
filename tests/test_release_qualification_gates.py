@@ -7,14 +7,21 @@ from pathlib import Path
 
 import pytest
 
-from scripts.candidate_lifecycle import CandidateLifecycleError, verify_manifest
+from scripts.candidate_lifecycle import (
+    CONSUMER_RELEASES,
+    CandidateLifecycleError,
+    _wheel_requirement,
+    verify_manifest,
+)
 from scripts.check_display_topology import DisplayTopologyError, qualify_topology
 from scripts.check_junit_no_skips import JUnitQualificationError, check_reports
 from scripts.check_release_ci import (
     EXPECTED_QUALIFICATION_JOBS,
     ReleaseEvidenceError,
     check_once,
+    dispatch_missing_qualifications,
     validate_qualification_jobs,
+    validate_test_jobs,
 )
 
 
@@ -49,6 +56,20 @@ def test_candidate_manifest_rejects_unaccounted_archive(tmp_path: Path) -> None:
 
     with pytest.raises(CandidateLifecycleError, match="manifest and candidate archives differ"):
         verify_manifest(tmp_path, manifest)
+
+
+def test_linux_extra_is_installed_from_the_exact_candidate_wheel(tmp_path: Path) -> None:
+    wheel = tmp_path / "openadapt_capture-1.3.0-py3-none-any.whl"
+
+    assert _wheel_requirement(wheel, with_linux_extra=True) == f"{wheel.resolve()}[linux]"
+    assert _wheel_requirement(wheel, with_linux_extra=False) == str(wheel.resolve())
+
+
+def test_candidate_contract_names_the_current_flow_and_desktop_releases() -> None:
+    assert CONSUMER_RELEASES == {
+        "openadapt-desktop": "0.16.0",
+        "openadapt-flow": "1.34.0",
+    }
 
 
 def test_display_topology_requires_stable_multiple_monitors() -> None:
@@ -146,6 +167,20 @@ def test_release_gate_rejects_skipped_qualification_job() -> None:
         validate_qualification_jobs(jobs)
 
 
+def test_release_gate_requires_successful_package_contract() -> None:
+    with pytest.raises(ReleaseEvidenceError, match="one package-contract"):
+        validate_test_jobs([])
+
+    with pytest.raises(ReleaseEvidenceError, match="package-contract is incomplete"):
+        validate_test_jobs(
+            [{"name": "package-contract", "status": "completed", "conclusion": "failure"}]
+        )
+
+    validate_test_jobs(
+        [{"name": "package-contract", "status": "completed", "conclusion": "success"}]
+    )
+
+
 def test_release_gate_binds_both_workflows_and_jobs_to_exact_sha() -> None:
     sha = "a" * 40
 
@@ -178,6 +213,16 @@ def test_release_gate_binds_both_workflows_and_jobs_to_exact_sha() -> None:
             }
         if "/actions/runs/20/jobs?" in url:
             return {"jobs": _successful_jobs()}
+        if "/actions/runs/10/jobs?" in url:
+            return {
+                "jobs": [
+                    {
+                        "name": "package-contract",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ]
+            }
         raise AssertionError(f"unexpected URL {url}")
 
     assert check_once(
@@ -186,3 +231,38 @@ def test_release_gate_binds_both_workflows_and_jobs_to_exact_sha() -> None:
         token="test",
         get_json=get_json,
     ) == {"test.yml": 10, "production-qualification.yml": 20}
+
+
+def test_release_orchestrator_starts_only_missing_exact_sha_workflows() -> None:
+    sha = "a" * 40
+    calls: list[tuple[str, str, str, str]] = []
+
+    def get_json(url: str, _token: str):
+        if "/test.yml/runs?" in url:
+            return {
+                "workflow_runs": [
+                    {"head_sha": sha, "event": "push", "id": 10}
+                ]
+            }
+        if "/production-qualification.yml/runs?" in url:
+            return {"workflow_runs": []}
+        raise AssertionError(f"unexpected URL {url}")
+
+    def dispatch(repository, requirement, *, ref, sha, token):  # type: ignore[no-untyped-def]
+        calls.append((repository, requirement.file_name, ref, sha))
+        assert token == "token"
+        assert requirement.dispatch_inputs == {"candidate_sha": "{sha}"}
+
+    started = dispatch_missing_qualifications(
+        repository="OpenAdaptAI/openadapt-capture",
+        sha=sha,
+        ref="main",
+        token="token",
+        get_json=get_json,
+        dispatch=dispatch,
+    )
+
+    assert started == ("production-qualification.yml",)
+    assert calls == [
+        ("OpenAdaptAI/openadapt-capture", "production-qualification.yml", "main", sha)
+    ]

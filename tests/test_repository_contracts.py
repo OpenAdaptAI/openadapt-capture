@@ -43,6 +43,7 @@ def test_release_tag_requires_reviewed_exact_main_and_release_app() -> None:
     )
     artifact_index = release.index("- name: Build and verify the exact release artifacts")
     tag_index = release.index("- name: Create and push one annotated release tag")
+    tag_block = release[tag_index:]
 
     assert "  workflow_dispatch:" in triggers
     assert "      version:" in triggers
@@ -56,13 +57,27 @@ def test_release_tag_requires_reviewed_exact_main_and_release_app() -> None:
     assert "token: ${{ steps.release-app.outputs.token }}" in release
     assert current_main_index < qualification_index < artifact_index < tag_index
     assert "python scripts/check_release_ci.py" in release
+    assert "--dispatch-missing" in release
+    assert '--ref "${GITHUB_REF_NAME}"' in release
+    assert "actions: write" in release
     assert "python scripts/check_changelog.py" in release
     assert "python scripts/verify_distribution.py dist/*" in release
     assert "python scripts/check_source_boundary.py --require-dist" in release
     assert "git tag --annotate" in release
+    assert 'current_main="$(git rev-parse refs/remotes/origin/main)"' in tag_block
+    assert 'if [ "${current_main}" != "${GITHUB_SHA}" ]' in tag_block
     assert 'git push origin "refs/tags/${release_tag}"' in release
     assert "python-semantic-release/python-semantic-release" not in workflow
     assert "ADMIN_TOKEN" not in workflow
+
+
+def test_exact_test_workflow_can_be_started_by_the_release_orchestrator() -> None:
+    workflow = (ROOT / ".github/workflows/test.yml").read_text(encoding="utf-8")
+    triggers = workflow[workflow.index("\non:\n") : workflow.index("\njobs:\n")]
+
+    assert "  workflow_dispatch:" in triggers
+    assert "  push:" in triggers
+    assert "  pull_request:" in triggers
 
 
 def test_tag_publication_requires_exact_tag_oidc_and_digest_verification() -> None:

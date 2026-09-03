@@ -12,6 +12,7 @@ import argparse
 import io
 import json
 import re
+import stat
 import subprocess
 import sys
 import tarfile
@@ -24,6 +25,9 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / "source-policy.public.json"
 SCHEMA_VERSION = 1
 CONTENT_SCAN_LIMIT = 5 * 1024 * 1024
+ARCHIVE_MEMBER_LIMIT = 10_000
+ARCHIVE_MEMBER_SIZE_LIMIT = 64 * 1024 * 1024
+ARCHIVE_EXPANDED_SIZE_LIMIT = 256 * 1024 * 1024
 EXEMPT_TREE_PATHS = {
     "scripts/check_source_boundary.py",
     "source-policy.public.json",
@@ -49,6 +53,7 @@ class Policy:
     private_segments: frozenset[str]
     path_prefixes: tuple[str, ...]
     content_patterns: re.Pattern[str]
+    archive_content_patterns: re.Pattern[str]
     signatures: tuple[bytes, ...]
     repository: str
     digest: str
@@ -92,9 +97,18 @@ def load_policy(path: Path, repository: str) -> Policy:
     if not isinstance(tree, dict) or not isinstance(archives, dict):
         raise BoundaryError("the rendered source policy has no tree or archive rules")
     patterns = _strings(tree, "content_patterns", where="repository_tree")
+    archive_pattern_values = archives.get("content_patterns", list(patterns))
+    if not isinstance(archive_pattern_values, list) or not archive_pattern_values:
+        raise BoundaryError("built_artifacts.content_patterns must be a non-empty list")
+    if any(not isinstance(item, str) or not item.strip() for item in archive_pattern_values):
+        raise BoundaryError("built_artifacts.content_patterns must contain non-empty strings")
     try:
         content_patterns = re.compile(
             "|".join(f"(?:{pattern})" for pattern in patterns), re.IGNORECASE
+        )
+        archive_content_patterns = re.compile(
+            "|".join(f"(?:{pattern})" for pattern in archive_pattern_values),
+            re.IGNORECASE,
         )
     except re.error as exc:
         raise BoundaryError(f"the source-policy content patterns are invalid: {exc}") from exc
@@ -115,6 +129,7 @@ def load_policy(path: Path, repository: str) -> Policy:
         ),
         path_prefixes=_strings(archives, "path_prefixes", where="built_artifacts"),
         content_patterns=content_patterns,
+        archive_content_patterns=archive_content_patterns,
         signatures=tuple(signatures),
         repository=repository,
         digest=str(document.get("policy_digest", "")),
@@ -159,6 +174,33 @@ def _contains_signature(stream: BinaryIO, signatures: tuple[bytes, ...]) -> bool
     return False
 
 
+def _inspect_archive_content(
+    stream: BinaryIO,
+    policy: Policy,
+) -> tuple[bool, re.Match[str] | None, str]:
+    """Apply the canonical signature and text-pattern rules to one member."""
+
+    overlap = max(len(value) for value in policy.signatures) - 1
+    tail = b""
+    payload = bytearray()
+    total = 0
+    carries_signature = False
+    while chunk := stream.read(1024 * 1024):
+        total += len(chunk)
+        candidate = tail + chunk
+        if any(value in candidate for value in policy.signatures):
+            carries_signature = True
+        tail = candidate[-overlap:] if overlap else b""
+        if total <= CONTENT_SCAN_LIMIT:
+            payload.extend(chunk)
+        else:
+            payload.clear()
+    if total > CONTENT_SCAN_LIMIT:
+        return carries_signature, None, ""
+    text = payload.decode("utf-8", errors="ignore")
+    return carries_signature, policy.archive_content_patterns.search(text), text
+
+
 def _self_test(policy: Policy) -> None:
     if _path_violation(f"fixture/{policy.path_tokens[0]}/item.json", policy) is None:
         raise BoundaryError("the path-token guard failed its self-test")
@@ -191,20 +233,73 @@ def scan_tree(root: Path, policy: Policy) -> list[str]:
     return violations
 
 
+def _safe_archive_name(name: str) -> bool:
+    if "\\" in name or re.match(r"^[A-Za-z]:", name):
+        return False
+    normalized = name.replace("\\", "/")
+    candidate = PurePosixPath(normalized)
+    return bool(normalized) and not candidate.is_absolute() and not any(
+        part in {"", ".", ".."} for part in candidate.parts
+    )
+
+
 def _archive_members(path: Path) -> Iterator[tuple[str, BinaryIO]]:
+    seen: set[str] = set()
+    expanded_size = 0
     if path.suffix in {".whl", ".zip"}:
         with zipfile.ZipFile(path) as archive:
-            for info in archive.infolist():
-                if not info.is_dir():
-                    with archive.open(info) as stream:
-                        yield info.filename, stream
+            members = archive.infolist()
+            if len(members) > ARCHIVE_MEMBER_LIMIT:
+                raise BoundaryError(f"{path}: archive has too many members")
+            for info in members:
+                name = info.filename
+                normalized_name = PurePosixPath(name).as_posix()
+                if normalized_name in seen:
+                    raise BoundaryError(f"{path}: duplicate archive member {name!r}")
+                seen.add(normalized_name)
+                if not _safe_archive_name(name):
+                    raise BoundaryError(f"{path}: unsafe archive member path {name!r}")
+                if info.is_dir():
+                    continue
+                mode = info.external_attr >> 16
+                file_type = stat.S_IFMT(mode)
+                if file_type and file_type != stat.S_IFREG:
+                    raise BoundaryError(f"{path}: non-regular archive member {name!r}")
+                if info.file_size > ARCHIVE_MEMBER_SIZE_LIMIT:
+                    raise BoundaryError(f"{path}: archive member {name!r} is too large")
+                expanded_size += info.file_size
+                if expanded_size > ARCHIVE_EXPANDED_SIZE_LIMIT:
+                    raise BoundaryError(f"{path}: expanded archive is too large")
+                with archive.open(info) as stream:
+                    yield name, stream
         return
     if path.name.endswith(".tar.gz"):
         with tarfile.open(path, "r:gz") as archive:
-            for member in archive.getmembers():
-                if member.isfile() and (stream := archive.extractfile(member)) is not None:
-                    with stream:
-                        yield member.name, stream
+            members = archive.getmembers()
+            if len(members) > ARCHIVE_MEMBER_LIMIT:
+                raise BoundaryError(f"{path}: archive has too many members")
+            for member in members:
+                name = member.name
+                normalized_name = PurePosixPath(name).as_posix()
+                if normalized_name in seen:
+                    raise BoundaryError(f"{path}: duplicate archive member {name!r}")
+                seen.add(normalized_name)
+                if not _safe_archive_name(name):
+                    raise BoundaryError(f"{path}: unsafe archive member path {name!r}")
+                if member.isdir():
+                    continue
+                if not member.isfile():
+                    raise BoundaryError(f"{path}: non-regular archive member {name!r}")
+                if member.size > ARCHIVE_MEMBER_SIZE_LIMIT:
+                    raise BoundaryError(f"{path}: archive member {name!r} is too large")
+                expanded_size += member.size
+                if expanded_size > ARCHIVE_EXPANDED_SIZE_LIMIT:
+                    raise BoundaryError(f"{path}: expanded archive is too large")
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise BoundaryError(f"{path}: cannot read archive member {name!r}")
+                with stream:
+                    yield name, stream
         return
     raise BoundaryError(f"unsupported distribution archive: {path}")
 
@@ -214,8 +309,14 @@ def scan_archive(path: Path, policy: Policy) -> list[str]:
     for name, stream in _archive_members(path):
         if problem := _path_violation(name, policy):
             violations.append(f"{path.name}:{name}: {problem}")
-        if _contains_signature(stream, policy.signatures):
+        carries_signature, match, text = _inspect_archive_content(stream, policy)
+        if carries_signature:
             violations.append(f"{path.name}:{name}: content carries a private-artifact signature")
+        elif match is not None:
+            line = text.count("\n", 0, match.start()) + 1
+            violations.append(
+                f"{path.name}:{name}:{line}: content matches a forbidden pattern"
+            )
     return violations
 
 

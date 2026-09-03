@@ -30,8 +30,11 @@
 #
 #   - one wheel and one source archive build, validate, and respect the source
 #     boundary;
-#   - that exact wheel installs, imports, exposes its CLI, and uninstalls on
-#     clean Linux, macOS, and Windows machines;
+#   - that exact wheel installs, imports, preserves the current Flow and Desktop
+#     consumer API, installs and probes the pinned FFmpeg runtime, and
+#     uninstalls on clean Linux, macOS, and Windows machines;
+#   - the Linux wheel extra resolves with the host AT-SPI runtime and imports
+#     its native provider;
 #   - the real recorder starts against a real display on hosted macOS and
 #     Windows, produces a real first frame, creates its capture database,
 #     holds memory bounded, and shuts down cleanly, three counted trials per
@@ -144,15 +147,34 @@ jobs:
           name: capture-candidate-${{ github.sha }}
           path: dist
 
+      - name: Install Linux AT-SPI build and runtime dependencies
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc \
+            gir1.2-atspi-2.0 \
+            libcairo2-dev \
+            libgirepository1.0-dev \
+            pkg-config \
+            python3-dev
+
       - name: Run the clean install and uninstall lifecycle
         shell: bash
         run: |
           set -euo pipefail
+          lifecycle_args=(--with-ffmpeg-runtime)
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            lifecycle_args+=(--with-linux-extra)
+          fi
           python scripts/candidate_lifecycle.py \
             --dist dist \
             --manifest dist/SHA256SUMS \
             --candidate-sha "${GITHUB_SHA}" \
-            --output "evidence/clean-${{ matrix.os }}.json"
+            --output "evidence/clean-${{ matrix.os }}.json" \
+            "${lifecycle_args[@]}"
 
       - name: Upload clean-machine evidence
         if: always()
