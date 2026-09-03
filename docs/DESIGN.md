@@ -212,17 +212,11 @@ typelib/runtime, and an interactive desktop accessibility bus.
 The native provider describes the local accessibility tree. It does not
 describe controls inside an RDP or Citrix pixel stream.
 
-Authoring adds `query_kind: "window_tree"`. The raw tree may persist on disk
-for compile. Password and secure-field values are omitted from that tree.
-`openadapt_capture.authoring_project` projects the tree into
-`openadapt.authoring.observe/v1` for a vendor wire: no values, titles,
-screenshots, or extra keys. Native AX, UIA, AT-SPI, and ARIA roles map onto
-the types `ElementRole` enum; unmapped roles never reach the wire. The
-observe fixture is pinned to `openadapt-types` PR 35. Names and automation
-ids that fail the coach-hint bar (length, `://`, `@`, six or more digits,
-phone, SSN, email) or the types projected-label grammar are dropped. RDP and
-Citrix observe payloads are coach-only with an empty tree. Capture still
-drops OS-injected input; there is no `record_injected` API.
+`query_kind: "window_tree"` retains a bounded raw accessibility tree for local
+persistence and compilation. Password and secure-field values are omitted.
+Capture does not decide authoring policy or emit a vendor payload. That policy
+belongs with the consumer that owns the remote boundary. Capture still drops
+OS-injected input; there is no `record_injected` API.
 
 ## Video and frame timing
 
