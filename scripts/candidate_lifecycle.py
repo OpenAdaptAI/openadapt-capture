@@ -57,7 +57,9 @@ def verify_manifest(dist_dir: Path, manifest_path: Path) -> dict[str, str]:
         expected[name] = digest
 
     archives = sorted(
-        path for path in dist_dir.iterdir() if path.suffix == ".whl" or path.name.endswith(".tar.gz")
+        path
+        for path in dist_dir.iterdir()
+        if path.suffix == ".whl" or path.name.endswith(".tar.gz")
     )
     names = {path.name for path in archives}
     if len([path for path in archives if path.suffix == ".whl"]) != 1:
@@ -133,7 +135,8 @@ def run_lifecycle(
                 str(python),
                 "-c",
                 (
-                    "import json; "
+                    "import inspect, json, tempfile; "
+                    "from pathlib import Path; "
                     "from importlib.metadata import distribution; "
                     "from openadapt_capture import CaptureSession, Recorder; "
                     "from openadapt_capture.capture import Action; "
@@ -147,8 +150,23 @@ def run_lifecycle(
                     "eps=[ep for ep in dist.entry_points "
                     "if ep.group == 'console_scripts' and ep.name == 'capture']; "
                     "assert len(eps) == 1 and eps[0].value == 'openadapt_capture.cli:main'; "
+                    "recorder_parameters=inspect.signature(Recorder).parameters; "
+                    "assert all(name in recorder_parameters for name in "
+                    "('capture_dir', 'task_description', 'window')); "
                     "assert all(hasattr(Recorder, name) for name in "
-                    "('__enter__', '__exit__', 'stop', 'wait_for_ready')); "
+                    "('__enter__', '__exit__', 'stop', 'wait_for_ready', "
+                    "'is_recording', 'event_count')); "
+                    "consumer_dir=Path(tempfile.mkdtemp()) / 'consumer-capture'; "
+                    "recorder=Recorder(capture_dir=str(consumer_dir), "
+                    "task_description='consumer contract', window=None, "
+                    "control_enabled=False); "
+                    "assert recorder.capture_dir == str(consumer_dir.resolve()); "
+                    "assert recorder.task_description == 'consumer contract'; "
+                    "assert recorder.is_recording is False; "
+                    "assert all(callable(getattr(CaptureSession, name)) for name in "
+                    "('load', 'actions', 'get_frame_at')); "
+                    "assert all(isinstance(getattr(CaptureSession, name), property) "
+                    "for name in ('pixel_ratio', 'window_capture', 'desktop_capture')); "
                     "assert all(callable(item) for item in (create_db, process_events)); "
                     "chord=process_events(["
                     "KeyDownEvent(timestamp=1.00, key_name='ctrl'), "
@@ -162,6 +180,10 @@ def run_lifecycle(
                     "'database_models': [ActionEvent.__name__, Recording.__name__, "
                     "WindowEvent.__name__], "
                     "'events': [KeyDownEvent.__name__, KeyUpEvent.__name__], "
+                    "'recorder_parameters': sorted(recorder_parameters), "
+                    "'capture_session_contract': "
+                    "['load', 'actions', 'get_frame_at', 'pixel_ratio', "
+                    "'window_capture', 'desktop_capture'], "
                     "'video_writer': VideoWriter.__name__, "
                     "'cli': main.__name__}, sort_keys=True))"
                 ),
@@ -281,8 +303,10 @@ def run_lifecycle(
         },
         "consumer_contract": {
             "action": inspected["action"],
+            "capture_session": inspected["capture_session_contract"],
             "database_models": inspected["database_models"],
             "events": inspected["events"],
+            "recorder_parameters": inspected["recorder_parameters"],
             "video_writer": inspected["video_writer"],
             "consumer_releases": CONSUMER_RELEASES,
             "demonstrated_chord": "key.shortcut",

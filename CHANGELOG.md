@@ -143,6 +143,9 @@ _This release uses the MIT License._
   and recheck protected `main` immediately before the release tag. Clean-wheel
   qualification now installs and probes the pinned FFmpeg runtime on all three
   operating systems. The Linux lane also installs the wheel's `linux` extra.
+  Publication requires three live trials on a qualified Linux desktop for the
+  same commit. Separate runner flags prevent a Linux release check from waiting
+  for absent macOS or Windows runners.
 - **windows**: Fail when ffmpeg install is absent
   ([#99](https://github.com/OpenAdaptAI/openadapt-capture/pull/99),
   [`682f77d`](https://github.com/OpenAdaptAI/openadapt-capture/commit/682f77d168bdff60d55285a1682a7c0ebf726847))

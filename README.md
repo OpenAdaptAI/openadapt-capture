@@ -111,6 +111,12 @@ capability never reaches command arguments, logs, or the capture directory.
 
 ## Authentication inside a recording
 
+This handoff API requires Capture 1.3.0 or newer:
+
+```bash
+python -m pip install "openadapt-capture>=1.3.0,<1.4"
+```
+
 Authenticate before recording when the demonstration does not need the login.
 When login belongs inside the workflow, start an authentication handoff. Capture
 then drops screen, input, structural, window, browser-category, and microphone

@@ -13,12 +13,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
-# The exact job set production-qualification.yml produces. Every job runs on a
-# GitHub-hosted runner. The three self-hosted interactive lanes that used to be
-# in this set moved to live-qualification.yml on 2026-08-28: no runner carrying
-# their label was ever registered, so they were cancelled in every dispatch and
-# this gate could never pass. The header of production-qualification.yml names
-# what the release gate no longer proves as a result.
+# The hosted workflow proves the portable package lifecycle. The live workflow
+# separately proves the exact candidate on a qualified Linux desktop.
 EXPECTED_QUALIFICATION_JOBS = frozenset(
     {
         "Build candidate distributions",
@@ -27,6 +23,15 @@ EXPECTED_QUALIFICATION_JOBS = frozenset(
         "Clean candidate wheel (windows-latest)",
         "Hosted live recorder qualification (macos-latest)",
         "Hosted live recorder qualification (windows-latest)",
+    }
+)
+EXPECTED_LIVE_QUALIFICATION_JOBS = frozenset(
+    {
+        "Select live qualification platforms",
+        "Build candidate distributions",
+        "Interactive qualification (Linux X64)",
+        "Interactive qualification (macOS ARM64)",
+        "Interactive qualification (Windows X64)",
     }
 )
 ACTIVE_STATES = frozenset({"queued", "in_progress", "waiting", "pending", "requested"})
@@ -53,6 +58,11 @@ REQUIREMENTS = (
         "production-qualification.yml",
         ("workflow_dispatch",),
         {"candidate_sha": "{sha}"},
+    ),
+    WorkflowRequirement(
+        "live-qualification.yml",
+        ("workflow_dispatch",),
+        {"candidate_sha": "{sha}", "platform": "linux"},
     ),
 )
 
@@ -85,8 +95,7 @@ def _github_dispatch(
     payload: dict[str, Any] = {"ref": ref}
     if requirement.dispatch_inputs:
         payload["inputs"] = {
-            key: value.format(sha=sha)
-            for key, value in requirement.dispatch_inputs.items()
+            key: value.format(sha=sha) for key, value in requirement.dispatch_inputs.items()
         }
     request = urllib.request.Request(
         f"https://api.github.com/repos/{repository}/actions/workflows/"
@@ -117,11 +126,7 @@ def _github_dispatch(
 def select_exact_run(
     runs: list[dict[str, Any]], *, sha: str, events: tuple[str, ...]
 ) -> dict[str, Any]:
-    exact = [
-        run
-        for run in runs
-        if run.get("head_sha") == sha and run.get("event") in events
-    ]
+    exact = [run for run in runs if run.get("head_sha") == sha and run.get("event") in events]
     if not exact:
         raise EvidencePending(
             f"no {' or '.join(events)} workflow run exists for exact commit {sha}"
@@ -131,13 +136,9 @@ def select_exact_run(
     status = run.get("status")
     conclusion = run.get("conclusion")
     if status in ACTIVE_STATES or status != "completed":
-        raise EvidencePending(
-            f"workflow run {run.get('id')} for {sha} is {status}/{conclusion}"
-        )
+        raise EvidencePending(f"workflow run {run.get('id')} for {sha} is {status}/{conclusion}")
     if conclusion != "success":
-        raise ReleaseEvidenceError(
-            f"workflow run {run.get('id')} for {sha} concluded {conclusion}"
-        )
+        raise ReleaseEvidenceError(f"workflow run {run.get('id')} for {sha} concluded {conclusion}")
     return run
 
 
@@ -145,9 +146,7 @@ def validate_qualification_jobs(jobs: list[dict[str, Any]]) -> None:
     names = [str(job.get("name")) for job in jobs]
     duplicates = sorted({name for name in names if names.count(name) > 1})
     if duplicates:
-        raise ReleaseEvidenceError(
-            f"production qualification has duplicate jobs: {duplicates}"
-        )
+        raise ReleaseEvidenceError(f"production qualification has duplicate jobs: {duplicates}")
     actual = set(names)
     if actual != EXPECTED_QUALIFICATION_JOBS:
         missing = sorted(EXPECTED_QUALIFICATION_JOBS - actual)
@@ -172,18 +171,65 @@ def validate_test_jobs(jobs: list[dict[str, Any]]) -> None:
 
     package_jobs = [job for job in jobs if job.get("name") == "package-contract"]
     if len(package_jobs) != 1:
-        raise ReleaseEvidenceError(
-            "exact test run must contain one package-contract job"
-        )
+        raise ReleaseEvidenceError("exact test run must contain one package-contract job")
     package_job = package_jobs[0]
-    if (
-        package_job.get("status") != "completed"
-        or package_job.get("conclusion") != "success"
-    ):
+    if package_job.get("status") != "completed" or package_job.get("conclusion") != "success":
         raise ReleaseEvidenceError(
             "package-contract is incomplete: "
             f"{package_job.get('status')}/{package_job.get('conclusion')}"
         )
+
+
+def validate_live_linux_jobs(jobs: list[dict[str, Any]]) -> None:
+    """Require exact-candidate evidence from the qualified Linux runner."""
+
+    names = [str(job.get("name")) for job in jobs]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ReleaseEvidenceError(f"live qualification has duplicate jobs: {duplicates}")
+    actual = set(names)
+    if actual != EXPECTED_LIVE_QUALIFICATION_JOBS:
+        missing = sorted(EXPECTED_LIVE_QUALIFICATION_JOBS - actual)
+        unexpected = sorted(actual - EXPECTED_LIVE_QUALIFICATION_JOBS)
+        raise ReleaseEvidenceError(
+            "live qualification job set differs from the release contract: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    required = {
+        "Select live qualification platforms",
+        "Build candidate distributions",
+        "Interactive qualification (Linux X64)",
+    }
+    incomplete = [
+        f"{job.get('name')}={job.get('status')}/{job.get('conclusion')}"
+        for job in jobs
+        if job.get("name") in required
+        and (job.get("status") != "completed" or job.get("conclusion") != "success")
+    ]
+    if incomplete:
+        raise ReleaseEvidenceError(
+            "live Linux qualification has incomplete jobs: " + ", ".join(incomplete)
+        )
+
+
+def _run_has_live_linux_job(
+    *,
+    base: str,
+    run: dict[str, Any],
+    token: str,
+    get_json: Callable[[str, str], dict[str, Any]],
+) -> bool:
+    """Return true when a run selected Linux instead of another live platform."""
+
+    payload = get_json(
+        f"{base}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100",
+        token,
+    )
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, list):
+        return False
+    linux = [job for job in jobs if job.get("name") == "Interactive qualification (Linux X64)"]
+    return len(linux) == 1 and linux[0].get("conclusion") != "skipped"
 
 
 def _workflow_runs(
@@ -195,14 +241,10 @@ def _workflow_runs(
     get_json: Callable[[str, str], dict[str, Any]],
 ) -> list[dict[str, Any]]:
     query = urllib.parse.urlencode({"head_sha": sha, "per_page": "100"})
-    payload = get_json(
-        f"{base}/actions/workflows/{requirement.file_name}/runs?{query}", token
-    )
+    payload = get_json(f"{base}/actions/workflows/{requirement.file_name}/runs?{query}", token)
     runs = payload.get("workflow_runs")
     if not isinstance(runs, list):
-        raise EvidencePending(
-            f"GitHub returned no workflow_runs list for {requirement.file_name}"
-        )
+        raise EvidencePending(f"GitHub returned no workflow_runs list for {requirement.file_name}")
     return runs
 
 
@@ -229,9 +271,25 @@ def dispatch_missing_qualifications(
             token=token,
             get_json=get_json,
         )
+        matching = [
+            run
+            for run in runs
+            if run.get("head_sha") == sha and run.get("event") in requirement.events
+        ]
+        if requirement.file_name == "live-qualification.yml":
+            matching = [
+                run
+                for run in matching
+                if _run_has_live_linux_job(
+                    base=base,
+                    run=run,
+                    token=token,
+                    get_json=get_json,
+                )
+            ]
         if not any(
             run.get("head_sha") == sha and run.get("event") in requirement.events
-            for run in runs
+            for run in matching
         ):
             missing.append(requirement)
     for requirement in missing:
@@ -262,9 +320,7 @@ def check_once(
             token=token,
             get_json=get_json,
         )
-        selected[requirement.file_name] = select_exact_run(
-            runs, sha=sha, events=requirement.events
-        )
+        selected[requirement.file_name] = select_exact_run(runs, sha=sha, events=requirement.events)
 
     tests = selected["test.yml"]
     test_jobs_payload = get_json(
@@ -285,6 +341,16 @@ def check_once(
     if not isinstance(jobs, list):
         raise EvidencePending("GitHub returned no production qualification jobs list")
     validate_qualification_jobs(jobs)
+
+    live = selected["live-qualification.yml"]
+    live_jobs_payload = get_json(
+        f"{base}/actions/runs/{live['id']}/jobs?filter=latest&per_page=100",
+        token,
+    )
+    live_jobs = live_jobs_payload.get("jobs")
+    if not isinstance(live_jobs, list):
+        raise EvidencePending("GitHub returned no live qualification jobs list")
+    validate_live_linux_jobs(live_jobs)
     return {name: int(run["id"]) for name, run in selected.items()}
 
 

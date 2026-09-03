@@ -8,9 +8,7 @@ ROOT = Path(__file__).parents[1]
 
 def test_docs_dispatch_targets_canonical_repo_with_pinned_action() -> None:
     """Avoid redirecting a signed dispatch body and pin the secret-using action."""
-    workflow = (ROOT / ".github/workflows/notify-docs.yml").read_text(
-        encoding="utf-8"
-    )
+    workflow = (ROOT / ".github/workflows/notify-docs.yml").read_text(encoding="utf-8")
 
     assert "repository: OpenAdaptAI/openadapt-ops" in workflow
     assert "OpenAdaptAI/openadapt-maintenance" not in workflow
@@ -39,7 +37,7 @@ def test_release_tag_requires_reviewed_exact_main_and_release_app() -> None:
         "- name: Require the reviewed release candidate on current main"
     )
     qualification_index = release.index(
-        "- name: Require exact-main test and production qualification evidence"
+        "- name: Require exact-main test, hosted, and live Linux evidence"
     )
     artifact_index = release.index("- name: Build and verify the exact release artifacts")
     tag_index = release.index("- name: Create and push one annotated release tag")
@@ -82,9 +80,7 @@ def test_exact_test_workflow_can_be_started_by_the_release_orchestrator() -> Non
 
 def test_tag_publication_requires_exact_tag_oidc_and_digest_verification() -> None:
     workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
-    validate = workflow[
-        workflow.index("\n  validate-tag:") : workflow.index("\n  publish-tag:")
-    ]
+    validate = workflow[workflow.index("\n  validate-tag:") : workflow.index("\n  publish-tag:")]
     publish = workflow[workflow.index("\n  publish-tag:") :]
 
     assert "GITHUB_EVENT_NAME" in validate
@@ -108,21 +104,22 @@ def test_tag_publication_requires_exact_tag_oidc_and_digest_verification() -> No
 
 
 def test_native_observers_are_part_of_each_interactive_qualification() -> None:
-    workflow = (ROOT / ".github/workflows/live-qualification.yml").read_text(
-        encoding="utf-8"
-    )
+    workflow = (ROOT / ".github/workflows/live-qualification.yml").read_text(encoding="utf-8")
     linux = workflow[
-        workflow.index("\n  interactive-linux:") : workflow.index(
-            "\n  interactive-macos:"
-        )
+        workflow.index("\n  interactive-linux:") : workflow.index("\n  interactive-macos:")
     ]
     macos = workflow[
-        workflow.index("\n  interactive-macos:") : workflow.index(
-            "\n  interactive-windows:"
-        )
+        workflow.index("\n  interactive-macos:") : workflow.index("\n  interactive-windows:")
     ]
     windows = workflow[workflow.index("\n  interactive-windows:") :]
 
+    assert "      candidate_sha:" in workflow
+    assert "      platform:" in workflow
+    assert "CAPTURE_SELF_HOSTED_QUALIFIED_LINUX_RUNNERS" in workflow
+    assert "CAPTURE_SELF_HOSTED_QUALIFIED_MACOS_RUNNERS" in workflow
+    assert "CAPTURE_SELF_HOSTED_QUALIFIED_WINDOWS_RUNNERS" in workflow
+    assert "CAPTURE_SELF_HOSTED_QUALIFIED_RUNNERS" not in workflow
+    assert "ref: ${{ needs.runner-availability.outputs.candidate_sha }}" in workflow
     assert '"${candidate_wheels[0]}[linux]"' in linux
     for job in (linux, macos, windows):
         assert 'tests/test_structural_observation.py"' in job
@@ -137,9 +134,7 @@ def test_the_release_gate_runs_only_on_github_hosted_runners() -> None:
     cancelled them and the gate never passed once. They live in
     live-qualification.yml now.
     """
-    workflow = (ROOT / ".github/workflows/production-qualification.yml").read_text(
-        encoding="utf-8"
-    )
+    workflow = (ROOT / ".github/workflows/production-qualification.yml").read_text(encoding="utf-8")
     targets = re.findall(r"^\s*runs-on: (.+)$", workflow, flags=re.M)
     assert targets
     assert not [target for target in targets if "self-hosted" in target]
@@ -153,9 +148,7 @@ def test_the_release_gate_job_set_matches_the_qualification_workflow() -> None:
     """
     from scripts.check_release_ci import EXPECTED_QUALIFICATION_JOBS
 
-    workflow = (ROOT / ".github/workflows/production-qualification.yml").read_text(
-        encoding="utf-8"
-    )
+    workflow = (ROOT / ".github/workflows/production-qualification.yml").read_text(encoding="utf-8")
     blocks = re.split(r"^  (?=\S)", workflow[workflow.index("\njobs:\n") :], flags=re.M)
     produced: set[str] = set()
     for block in blocks:
@@ -170,3 +163,13 @@ def test_the_release_gate_job_set_matches_the_qualification_workflow() -> None:
         for value in operating_systems.group(1).split(","):
             produced.add(name.replace("${{ matrix.os }}", value.strip()))
     assert produced == set(EXPECTED_QUALIFICATION_JOBS)
+
+
+def test_live_release_gate_job_set_matches_the_live_workflow() -> None:
+    """The exact-SHA Linux release check must name every live workflow job."""
+    from scripts.check_release_ci import EXPECTED_LIVE_QUALIFICATION_JOBS
+
+    workflow = (ROOT / ".github/workflows/live-qualification.yml").read_text(encoding="utf-8")
+    produced = set(re.findall(r"^    name: (.+)$", workflow, flags=re.M))
+
+    assert produced == set(EXPECTED_LIVE_QUALIFICATION_JOBS)
