@@ -22,7 +22,7 @@ def test_native_atspi_reads_a_gtk_button() -> None:
     gi.require_version("GLib", "2.0")
     from gi.repository import GLib
 
-    from openadapt_capture.structural_observer.linux import _fields, _GIAtspiRuntime
+    from openadapt_capture.structural_observer.linux import _ancestry, _fields, _GIAtspiRuntime
 
     print(f"PyGObject {gi.__version__}; GLib {GLib.MAJOR_VERSION}.{GLib.MINOR_VERSION}")
     fixture = """
@@ -68,6 +68,9 @@ Gtk.main()
         assert bounds is not None
         assert bounds.right > bounds.left and bounds.bottom > bounds.top
         assert runtime.parent(button) is not None
+        ancestry = _ancestry(runtime, button, 12)
+        assert ancestry is not None
+        assert any(ancestor.name == "Capture native dependency smoke" for ancestor in ancestry)
         assert runtime.process_id(button) == process.pid
     finally:
         process.terminate()
