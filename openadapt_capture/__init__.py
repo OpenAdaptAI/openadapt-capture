@@ -135,9 +135,11 @@ from openadapt_capture.structural import (
     StructuralObservationRequest,
     StructuralObserver,
     StructuralProcessIdentity,
+    StructuralTreeNode,
     StructuralWindowIdentity,
     create_structural_observer,
     observe_structural_action,
+    observe_window_tree,
 )
 
 # Visualization
@@ -188,9 +190,11 @@ __all__ = [
     "StructuralObservationRequest",
     "StructuralObserver",
     "StructuralProcessIdentity",
+    "StructuralTreeNode",
     "StructuralWindowIdentity",
     "create_structural_observer",
     "observe_structural_action",
+    "observe_window_tree",
     # Window-scoped capture
     "WindowTarget",
     "TargetWindow",
