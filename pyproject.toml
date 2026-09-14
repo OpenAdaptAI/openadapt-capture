@@ -76,7 +76,7 @@ share = [
 # PyGObject 3.50.x retains GLib >=2.64 and gobject-introspection >=1.64;
 # 3.52+ requires GLib/girepository-2.0 >=2.80, which older LTS hosts lack.
 linux = [
-    "PyGObject>=3.46,<3.51; sys_platform == 'linux'",
+    "PyGObject>=3.46,<3.59; sys_platform == 'linux'",
 ]
 
 # Everything
