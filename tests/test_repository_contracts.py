@@ -274,3 +274,12 @@ def test_release_dispatch_selects_only_the_linux_lane(tmp_path) -> None:
         "false",
     )
     assert "::warning::" not in completed.stdout
+
+
+def test_ci_runs_every_test_file() -> None:
+    """CI once skipped the browser bridge tests with --ignore while they hung."""
+    workflow = (ROOT / ".github/workflows/test.yml").read_text(encoding="utf-8")
+    runs = re.findall(r"^\s*run: (?:.* )?uv run(?: --no-sync)? pytest .*$", workflow, flags=re.M)
+
+    assert runs
+    assert not [run for run in runs if "--ignore" in run or "--deselect" in run]
