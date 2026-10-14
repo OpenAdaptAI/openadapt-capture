@@ -18,13 +18,26 @@ programs.
 
 ## Quick start
 
+You need Python 3.10 or later, and before the first recording:
+
+- **FFmpeg.** Capture writes video with the `ffmpeg` executable on your
+  `PATH`. If you don't have one, install FFmpeg with your package manager. On
+  Capture 1.3.0 or later, `capture install-ffmpeg` can instead install a
+  pinned, checksum-verified build for your user account.
+- **macOS.** In System Settings > Privacy & Security, allow your terminal app
+  under Screen Recording, Input Monitoring, and Accessibility. Then quit and
+  reopen the terminal.
+- **Windows.** Run from a signed-in desktop session.
+
 ```bash
 pip install openadapt-capture
 capture record ./my-capture --description "Rename a file"
 ```
 
-Do the task. To stop, press Ctrl+C in the terminal, or press Ctrl three times
-in any app. Then look at what you recorded:
+If FFmpeg or a permission is missing, `capture record` stops before it records
+and says what to fix. Otherwise, do the task. To stop, press Ctrl+C in the
+terminal, or press Ctrl three times in any app. Then look at what you
+recorded:
 
 ```bash
 capture info ./my-capture
@@ -39,28 +52,16 @@ with CaptureSession.load("./my-capture") as capture:
         frame = action.screenshot  # PIL image of the screen at that moment
 ```
 
-Before the first recording:
-
-- **FFmpeg.** Capture writes video with an `ffmpeg` executable. It uses the
-  one on your `PATH`, or run `capture install-ffmpeg` to install a pinned,
-  checksum-verified build for your user account.
-- **macOS.** In System Settings > Privacy & Security, allow your terminal app
-  under Screen Recording, Input Monitoring, and Accessibility. Then quit and
-  reopen the terminal.
-- **Windows.** Run from a signed-in desktop session.
-
-`capture record` checks for FFmpeg and the input permissions before the
-recording starts, and prints what to fix if one is missing. Capture needs
-Python 3.10 or later.
-
 ## What a recording contains
 
 ```text
 my-capture/
-├── recording.db          # actions, raw input events, window metadata (SQLite)
-├── oa_recording-*.mp4    # screen video
-├── capture-state.json    # whether the session finished and passed its integrity check
-└── *.json                # authentication markers and profiling data
+├── recording.db                     # actions, raw input events, window metadata (SQLite)
+├── oa_recording-*.mp4               # screen video
+├── capture-state.json               # whether the session finished and passed its integrity check
+├── capture-artifact-manifest.json   # size and SHA-256 of every other file
+├── capture-terminal.json            # completion record that covers the manifest
+└── *.json                           # profiling data, and sign-in markers if you used them
 ```
 
 Each action has a type (click, double-click, drag, scroll, typed text, or
@@ -120,7 +121,8 @@ See [docs/AUTHENTICATION_HANDOFF.md](https://github.com/OpenAdaptAI/openadapt-ca
 ## Use it with OpenAdapt
 
 To compile a recording into a program that replays the task, install
-OpenAdapt with this package as an extra:
+OpenAdapt with this package as an extra. OpenAdapt needs Python 3.10, 3.11,
+or 3.12.
 
 ```bash
 pip install "openadapt[capture]"
@@ -166,10 +168,10 @@ is installed, and it deletes the audio after transcription unless you set
 ## Privacy
 
 A recording can contain anything that was on screen or typed, including
-passwords and personal data. It stays on your computer: Capture doesn't upload
-anything. The only transfers are `capture share` and `send_profile=True`, and
-both run only when you ask. The `privacy` extra installs `openadapt-privacy`
-but doesn't remove anything from a recording by itself.
+passwords and personal data. It stays on your computer. Capture uploads
+nothing unless you run `capture share` or set `send_profile=True`. The
+`privacy` extra installs `openadapt-privacy` but doesn't remove anything from
+a recording by itself.
 
 How Capture handles sensitive data, its licensing boundaries, and how releases
 are qualified are covered in [docs/COMPLIANCE.md](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/COMPLIANCE.md).
@@ -178,18 +180,20 @@ are qualified are covered in [docs/COMPLIANCE.md](https://github.com/OpenAdaptAI
 
 - Recording needs a signed-in desktop session and the permissions listed in
   the quick start.
-- Recording on Linux doesn't work yet. On an X11 display the recorder stops
-  at the first mouse or keyboard event and doesn't save a usable recording
+- Recording on Linux doesn't work yet. On an X11 display the recorder
+  starts, but after the first mouse or keyboard event it either fails or
+  stops responding, and it doesn't save a usable recording
   (`scripts/linux_xvfb_quickstart.sh` reproduces this). Loading and
   inspecting recordings works on every platform.
 - Accessibility data appears only where the application exposes it. Across a
   remote-desktop connection, Capture sees pixels only.
 - Changing a display (connecting a monitor, rotating, or changing resolution
-  or scale) ends the recording. Start a new one afterwards.
-- `capture install-ffmpeg`, `capture status`, `capture stop`, and
-  authentication handoffs need Capture 1.3.0 or later. If
-  `pip install --upgrade openadapt-capture` gives you an earlier version,
-  install from GitHub:
+  or scale) ends the recording. Start a new one afterward.
+- These need Capture 1.3.0 or later: `capture install-ffmpeg`,
+  `capture status` and `capture stop` (and `status_recording` and
+  `stop_recording`), authentication handoffs, `action.after_screenshot`, and
+  the `capture-*.json` files. If `pip install --upgrade openadapt-capture`
+  gives you an earlier version, install from GitHub:
   `pip install "git+https://github.com/OpenAdaptAI/openadapt-capture"`.
 - For web apps, use OpenAdapt's browser recorder. The Chrome extension in
   [`experimental/`](https://github.com/OpenAdaptAI/openadapt-capture/tree/main/experimental) is an unfinished prototype and isn't

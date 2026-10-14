@@ -33,7 +33,7 @@ capture. Content retained before or after that interval remains sensitive.
 See [AUTHENTICATION_HANDOFF.md](AUTHENTICATION_HANDOFF.md).
 
 Capture doesn't upload a session. The sharing command (`capture share`) and the
-profiling transfer (`send_profile`) are the only two transfers, and both run
+profiling transfer (`send_profile`) are the only two uploads, and both run
 only when the operator asks for them. Installing the `privacy` extra doesn't
 scrub anything by itself.
 
