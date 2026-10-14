@@ -30,6 +30,9 @@ BREAKING_FOOTER = re.compile(r"^BREAKING[ -]CHANGE:", re.MULTILINE)
 ACTIVE_RUN_STATES = {"queued", "in_progress", "waiting", "pending", "requested"}
 # The release.yml step that asks the release GitHub App for a token. It fails
 # when the App is not installed on this repository or its credentials are wrong.
+# The publish-tag job has a step with the same name, but it reads the pypi
+# environment, so the advice below names only the tag-creation job.
+APP_TOKEN_JOB = "create-release-tag"
 APP_TOKEN_STEP = "Create the exact release App token"
 FAILED_CONCLUSIONS = {"failure", "timed_out"}
 ALLOWED_COMMIT_KINDS = frozenset("build chore ci docs feat fix perf refactor style test".split())
@@ -208,7 +211,7 @@ def failed_steps(run_id: Any) -> list[dict[str, str]] | None:
             for step in job.get("steps") or []
             if step.get("conclusion") in FAILED_CONCLUSIONS
         ]
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError, AttributeError):
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError, AttributeError):
         return None
 
 
@@ -226,7 +229,9 @@ def release_blocker(run: dict[str, Any] | None) -> tuple[str | None, str | None]
             f"The check couldn't read the steps of release run {run.get('id')}, "
             "so it doesn't say why that run failed."
         )
-    if any(step.get("step") == APP_TOKEN_STEP for step in steps):
+    if any(
+        step.get("job") == APP_TOKEN_JOB and step.get("step") == APP_TOKEN_STEP for step in steps
+    ):
         return (
             f"**Release blocked:** The latest release run, {run.get('id')}{when}, "
             f'failed at "{APP_TOKEN_STEP}". That step fails when the release '
@@ -241,7 +246,11 @@ def release_blocker(run: dict[str, Any] | None) -> tuple[str | None, str | None]
             f"**Last release run failed:** Release run {run.get('id')}{when} failed "
             f"at {where}. Fix that step, then dispatch release.yml again."
         ), None
-    return None, None
+    return (
+        f"**Last release run failed:** Release run {run.get('id')}{when} concluded "
+        f"{run.get('conclusion')}, and GitHub listed no failed step. Open that run, "
+        "fix the cause, then dispatch release.yml again."
+    ), None
 
 
 def collect_live_state() -> dict[str, Any]:
@@ -625,6 +634,16 @@ def self_test() -> int:
                 ]
             },
             0,
+        ),
+        (
+            "release failure with no failed step is still named",
+            {
+                "release_runs": [
+                    {**release_run(19, sha="c" * 40, conclusion="failure"), "failed_steps": []}
+                ],
+                "commits_since_tag": [commit("fix: pending", "2026-07-20T00:00:00+00:00")],
+            },
+            2,
         ),
         (
             "unreadable release steps add no alert",

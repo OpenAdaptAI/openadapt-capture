@@ -168,6 +168,39 @@ def test_other_failed_release_step_is_named_without_app_advice():
     assert not any("GitHub App" in alert for alert in alerts)
 
 
+def test_app_token_failure_in_the_publish_job_gets_no_release_identity_advice():
+    health = _load()
+    # publish-tag has a step with the same name, but it reads the pypi environment.
+    run = _failed_release_run(
+        failed_steps=[{"job": "publish-tag", "step": "Create the exact release App token"}]
+    )
+
+    alerts, _ = health.evaluate(
+        _state(release_runs=[run], commits_since_tag=[_unreleased_commit()])
+    )
+
+    assert not any("release-identity" in alert for alert in alerts), alerts
+    failed = [alert for alert in alerts if "Last release run failed" in alert]
+    assert len(failed) == 1, alerts
+    assert '"Create the exact release App token" in job publish-tag' in failed[0]
+
+
+def test_failed_release_run_with_no_failed_step_is_still_named():
+    health = _load()
+    # A job can fail before any step runs, for example on an environment rule.
+    run = _failed_release_run(failed_steps=[])
+
+    alerts, _ = health.evaluate(
+        _state(release_runs=[run], commits_since_tag=[_unreleased_commit()])
+    )
+
+    failed = [alert for alert in alerts if "Last release run failed" in alert]
+    assert len(failed) == 1, alerts
+    assert "33195841524" in failed[0]
+    assert "no failed step" in failed[0]
+    assert not any("Release blocked" in alert for alert in alerts), alerts
+
+
 def test_release_failure_is_quiet_when_nothing_waits_for_release():
     health = _load()
 
@@ -284,9 +317,31 @@ def test_live_state_survives_unreadable_release_jobs(monkeypatch):
     assert state["release_runs"][0]["failed_steps"] is None
 
 
+def test_live_state_survives_malformed_release_jobs(monkeypatch):
+    health = _load()
+    run = _failed_release_run()
+    del run["failed_steps"]
+    responses = _live_responses(
+        health, [run], {run["id"]: {"jobs": [{"name": "create-release-tag", "steps": 7}]}}
+    )
+    monkeypatch.setattr(health, "github_get", lambda path, params=None: responses[path])
+    monkeypatch.setattr(health, "fetch_pypi_versions", lambda: {"reachable": True, "versions": []})
+
+    state = health.collect_live_state()
+
+    assert state["release_runs"][0]["failed_steps"] is None
+
+
 def test_release_workflow_still_has_the_app_token_step_the_check_names():
     health = _load()
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    create_tag = workflow.split("\n  create-release-tag:\n", 1)[1].split("\n  validate-tag:\n")[0]
+    marker = f"\n  {health.APP_TOKEN_JOB}:\n"
+    assert marker in workflow
+    create_tag = workflow.split(marker, 1)[1].split("\n  validate-tag:\n")[0]
+    job_keys = create_tag.split("\n    steps:\n", 1)[0]
 
     assert f"- name: {health.APP_TOKEN_STEP}\n" in create_tag
+    # The Actions API reports a job by its id only while the job has no name.
+    assert "\n    name:" not in "\n" + job_keys
+    # The alert tells people to check the credentials in this environment.
+    assert "\n    environment: release-identity" in "\n" + job_keys
