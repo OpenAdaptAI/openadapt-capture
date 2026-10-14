@@ -6,7 +6,9 @@ import pytest
 
 from openadapt_capture.cli import record, status, stop
 from openadapt_capture.control import CaptureControlUnavailable, RecorderStatus
+from openadapt_capture.desktop_capture import DesktopCaptureError
 from openadapt_capture.input_observer import (
+    InputObserverError,
     InputObserverPermissionError,
     InputObserverUnavailableError,
 )
@@ -77,6 +79,9 @@ class _RecorderThatFailsStartup(_RecorderThatNeverBecomesReady):
         InputObserverUnavailableError(
             "X RECORD requires an X11 desktop and DISPLAY is not set"
         ),
+        DesktopCaptureError(
+            "MSS did not report a combined desktop and a physical monitor"
+        ),
     ],
 )
 def test_record_prints_the_setup_fix_instead_of_a_traceback(
@@ -104,6 +109,83 @@ def test_record_prints_the_setup_fix_instead_of_a_traceback(
     assert f"Recording did not start: {error}" in output
     assert "No successful capture was saved." in output
     assert "Saved to:" not in output
+    assert ("Unlock the screen" in output) is isinstance(error, DesktopCaptureError)
+
+
+class _RecorderThatFailsAfterStart(_RecorderThatNeverBecomesReady):
+    """Recorder double that starts, then fails while recording."""
+
+    control_session_id = "7fce2c55-5391-47d4-96bf-b3c90feaa69f"
+
+    def wait_for_ready(self):
+        return True
+
+    @property
+    def is_recording(self):
+        raise InputObserverError(
+            "the input consumer returned without completing its native receipt "
+            "reservation"
+        )
+
+
+def test_record_does_not_call_a_failure_after_start_a_setup_error(
+    monkeypatch, tmp_path, capsys
+):
+    import openadapt_capture.recorder as recorder_module
+
+    monkeypatch.setattr(recorder_module, "Recorder", _RecorderThatFailsAfterStart)
+
+    with pytest.raises(SystemExit) as raised:
+        record(str(tmp_path / "capture"), video=False)
+
+    assert raised.value.code == 1
+    assert isinstance(raised.value.__cause__, InputObserverError)
+    output = capsys.readouterr().out
+    assert "Capture session:" in output
+    assert "Recording failed: the input consumer returned" in output
+    assert "did not start" not in output
+    assert "Saved to:" not in output
+
+
+def _record_log_for(monkeypatch, tmp_path, error):
+    """Run recorder.record() until the FFmpeg check raises, and return its log."""
+    from loguru import logger
+
+    import openadapt_capture.recorder as recorder_module
+    from openadapt_capture.config import config
+
+    def unavailable(**kwargs):
+        raise error
+
+    monkeypatch.setattr(config, "RECORD_BROWSER_EVENTS", False)
+    monkeypatch.setattr(config, "RECORD_VIDEO", True)
+    monkeypatch.setattr(recorder_module.video, "require_video_encoder", unavailable)
+    messages: list[str] = []
+    sink = logger.add(messages.append, level="ERROR", format="{message}")
+    try:
+        with pytest.raises(type(error)):
+            recorder_module.record("setup check", capture_dir=str(tmp_path))
+    finally:
+        logger.remove(sink)
+    return "".join(messages)
+
+
+def test_recorder_logs_a_setup_error_without_a_traceback(monkeypatch, tmp_path):
+    log = _record_log_for(
+        monkeypatch,
+        tmp_path,
+        FFmpegUnavailableError("Video capture needs an FFmpeg executable."),
+    )
+
+    assert "Error in record: Video capture needs an FFmpeg executable." in log
+    assert "Traceback" not in log
+
+
+def test_recorder_still_logs_a_traceback_for_an_unexpected_error(monkeypatch, tmp_path):
+    log = _record_log_for(monkeypatch, tmp_path, RuntimeError("encoder probe crashed"))
+
+    assert "Error in record: encoder probe crashed" in log
+    assert "Traceback" in log
 
 
 def test_record_names_the_configured_stop_sequences(monkeypatch, tmp_path, capsys):

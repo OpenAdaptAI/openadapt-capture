@@ -116,6 +116,7 @@ def record(
         )
         print()
 
+    from openadapt_capture.desktop_capture import DesktopCaptureError
     from openadapt_capture.input_observer import InputObserverError
     from openadapt_capture.video import FFmpegUnavailableError
 
@@ -125,6 +126,7 @@ def record(
     print(_stop_instructions())
     print()
 
+    ready = False
     try:
         with Recorder(
             output_dir,
@@ -138,6 +140,7 @@ def record(
             if not recorder.wait_for_ready():
                 print("Recording did not become ready. No successful capture was saved.")
                 raise SystemExit(1)
+            ready = True
             print(f"Capture session: {recorder.control_session_id}")
             print(
                 "Stop from another terminal: "
@@ -148,11 +151,21 @@ def record(
                     time.sleep(1)
             except KeyboardInterrupt:
                 pass
-    except (FFmpegUnavailableError, InputObserverError) as exc:
-        # A missing FFmpeg or a denied OS permission is a setup step, not a
-        # crash: print the fix instead of a traceback.
+    except (FFmpegUnavailableError, InputObserverError, DesktopCaptureError) as exc:
         print()
+        if ready:
+            # The recording started, so this is a failure, not a setup step.
+            print(f"Recording failed: {exc}")
+            print("No successful capture was saved.")
+            raise SystemExit(1) from exc
+        # A missing FFmpeg, a denied OS permission, or no usable display is a
+        # setup step, not a crash: print the fix instead of a traceback.
         print(f"Recording did not start: {exc}")
+        if isinstance(exc, DesktopCaptureError):
+            print(
+                "Capture couldn't read the screen layout. Unlock the screen and "
+                "wake the display, then try again."
+            )
         print("No successful capture was saved.")
         raise SystemExit(1) from exc
 
