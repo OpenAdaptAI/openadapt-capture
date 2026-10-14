@@ -108,9 +108,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["openadapt_capture"]
-exclude = [
-    "openadapt_capture/browser_bridge.py",
-]
 
 [tool.hatch.build.targets.sdist]
 ignore-vcs = true
@@ -121,7 +118,6 @@ only-include = [
     "docs",
 ]
 exclude = [
-    "/openadapt_capture/browser_bridge.py",
     "/docs/images/demo.gif",
     "/docs/whisper-integration-plan.md",
 ]
