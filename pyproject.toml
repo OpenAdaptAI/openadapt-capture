@@ -69,7 +69,7 @@ privacy = [
 # Shadow-mode pattern mining: AES-GCM for the on-disk buffer and the OS
 # credential store for its key. Shadow mining itself is off by default.
 shadow = [
-    "cryptography>=42.0.0",
+    "cryptography>=50.0.2",
     "keyring>=24.0.0",
 ]
 
@@ -99,7 +99,7 @@ dev = [
     "ruff>=0.1.0",
     "numpy>=1.21.0",
     # Shadow-mining tests exercise the encrypted buffer.
-    "cryptography>=42.0.0",
+    "cryptography>=50.0.2",
     "keyring>=24.0.0",
 ]
 
