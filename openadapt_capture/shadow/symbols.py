@@ -20,7 +20,7 @@ import hashlib
 import hmac
 import re
 import secrets
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -103,6 +103,36 @@ _NAMED_KEYS = frozenset(
     }
     | {f"f{i}" for i in range(1, 25)}
 )
+#: Modifiers that make a key press a command rather than typing. Shift and
+#: Alt (Option, AltGr) alone produce characters, so a chord of only those is
+#: typing and its character must not be kept.
+_COMMAND_MODIFIERS = frozenset({"ctrl", "control", "cmd", "command", "meta", "super", "win"})
+_SHORTCUT_CHAR = re.compile(r"^[a-z0-9]$")
+
+
+class ShadowTokenizeError(RuntimeError):
+    """Tokenizing failed. Carries no event content, and no chained exception,
+    so a log or crash report of it can't show a typed value or a label."""
+
+
+def shortcut_key(key: str | None, modifiers: tuple[str, ...], *, secure: bool) -> str:
+    """The key part of a chord that is safe to keep in plain text.
+
+    A named key (Tab, F5) or one ASCII letter or digit is kept, and only for a
+    chord with Ctrl, Cmd, or Meta held. Anything else, and anything in a
+    secure field, becomes ``other``: Option and AltGr chords type characters
+    (``@``, ``é``), and a character in a password box is part of the password.
+    """
+
+    name = (key or "").casefold()
+    if secure:
+        return "other"
+    if name in _NAMED_KEYS:
+        return name
+    mods = {m.casefold() for m in modifiers}
+    if mods & _COMMAND_MODIFIERS and _SHORTCUT_CHAR.match(name):
+        return name
+    return "other"
 
 
 def normalize_role(role: str | None) -> str:
@@ -252,24 +282,47 @@ class Tokenizer:
     def feed(self, event: ShadowEvent) -> list[ShadowSymbol]:
         """Tokenize one event. Returns zero, one, or two symbols."""
 
+        try:
+            return self._feed(event)
+        except Exception as exc:
+            self._pending = None
+            name = type(exc).__name__
+        # Raised outside the handler so nothing is chained: the original
+        # exception and its frames may hold typed text.
+        raise ShadowTokenizeError(f"could not tokenize a {event.kind} event ({name})")
+
+    def flush(self) -> list[ShadowSymbol]:
+        """Emit a pending merged ``type`` symbol, if any, and forget its text."""
+
+        try:
+            return self._flush()
+        except Exception as exc:
+            self._pending = None
+            name = type(exc).__name__
+        raise ShadowTokenizeError(f"could not tokenize typed text ({name})")
+
+    def _feed(self, event: ShadowEvent) -> list[ShadowSymbol]:
         out: list[ShadowSymbol] = []
-        if event.kind == "type" and not self._is_secure(event):
+        if event.kind == "type":
+            # Secret typing is merged too, with its text dropped at once, so
+            # the buffer can't count a password's characters.
+            if self._is_secure(event):
+                event = replace(event, text=None, secure=True)
+            chunk = "" if event.secure else (event.text or "")
             if self._pending is not None and self._same_field(self._pending, event):
-                self._pending[1].append(event.text or "")
+                self._pending[1].append(chunk)
                 self._pending[2][0] = event.timestamp
                 return out
-            out.extend(self.flush())
-            self._pending = (event, [event.text or ""], [event.timestamp])
+            out.extend(self._flush())
+            self._pending = (event, [chunk], [event.timestamp])
             return out
-        out.extend(self.flush())
+        out.extend(self._flush())
         symbol = self._symbol(event, None)
         if symbol is not None:
             out.append(symbol)
         return out
 
-    def flush(self) -> list[ShadowSymbol]:
-        """Emit a pending merged ``type`` symbol, if any, and forget its text."""
-
+    def _flush(self) -> list[ShadowSymbol]:
         if self._pending is None:
             return []
         event, chunks, _last = self._pending
@@ -292,6 +345,7 @@ class Tokenizer:
         first, _chunks, last = pending
         return (
             first.app == second.app
+            and first.secure == second.secure
             and first.role == second.role
             and first.label == second.label
             and 0.0 <= second.timestamp - last[0] <= _TYPE_MERGE_GAP_S
@@ -367,9 +421,11 @@ class Tokenizer:
             return ShadowSymbol(token=f"key|{app}|{name}", key=name, **common)
         if kind in ("shortcut", "copy", "paste"):
             mods = tuple(sorted({m.casefold() for m in event.modifiers}))
-            key = (event.key or "").casefold()
-            if len(key) > 1 and key not in _NAMED_KEYS:
-                key = "other"
+            if kind == "shortcut":
+                key = shortcut_key(event.key, mods, secure=secure)
+            else:
+                key = (event.key or "").casefold()
+                key = key if key in ("c", "x", "v") else "other"
             if kind == "shortcut":
                 token = f"shortcut|{app}|{'+'.join(mods)}+{key}"
             else:

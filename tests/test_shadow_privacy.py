@@ -34,13 +34,14 @@ from openadapt_capture.shadow.keys import (
     destroy_keys,
     load_or_create_keys,
 )
+from openadapt_capture.shadow.live import MODIFIER_HOLD_S
 from openadapt_capture.shadow.scrub import (
     PLACEHOLDER_ID,
     PLACEHOLDER_LABEL,
     scrub_label,
     scrub_path_segment,
 )
-from openadapt_capture.shadow.symbols import url_pattern
+from openadapt_capture.shadow.symbols import ShadowTokenizeError, shortcut_key, url_pattern
 from tests.shadow_support.streams import SECRET_VALUES, repeated_task_stream
 
 DAY = 24 * 3600.0
@@ -605,10 +606,15 @@ def test_secret_values_never_reach_a_live_fed_buffer(tmp_path):
                 },
             )
         )
-    obs.symbols()
+    stored = obs.symbols()
     obs.close()
-    raw = (tmp_path / "r.db").read_bytes().decode("latin-1")
-    assert SECRET_VALUES[4] not in raw and "SSN" not in raw
+    # The file is ciphertext, so check what was sealed into it, not its bytes.
+    (sym,) = stored
+    assert sym.secure and sym.value_digest is None and sym.value_shape is None
+    blob = json.dumps([s.to_dict() for s in stored])
+    assert SECRET_VALUES[4] not in blob and "SSN" not in blob
+    for ch in set(SECRET_VALUES[4]):
+        assert f'"key": "{ch}"' not in blob
 
 
 def test_acknowledgement_of_the_old_notice_no_longer_counts(tmp_path):
@@ -638,6 +644,87 @@ def test_acknowledgement_of_the_old_notice_no_longer_counts(tmp_path):
 # ---------------------------------------------------------------------------
 # Review fixes
 # ---------------------------------------------------------------------------
+
+
+def _press(bridge, t, **data):
+    return bridge.translate(LiveEvent(t, "action", {"name": "press", **data}))
+
+
+def test_option_and_altgr_chords_are_typing_not_plain_text_shortcuts():
+    bridge = RecorderShadowBridge(observer=None)
+    field = _ax("AXTextField", "Email")
+    _press(bridge, 1.0, key_name="alt_r")
+    (at,) = _press(bridge, 1.1, key_char="@", key_name="q", structural_observation=field)
+    assert at.kind == "type" and at.key is None
+    # Windows reports AltGr as Ctrl+Alt: the chord stays a shortcut, but its
+    # character is not kept.
+    _press(bridge, 2.0, key_name="ctrl_l")
+    (chord,) = _press(bridge, 2.1, key_char="@", key_name="q", structural_observation=field)
+    tok = Tokenizer(ShadowConfig(), digest_key=b"k" * 32)
+    (sym,) = tok.feed(chord)
+    assert sym.key == "other" and "@" not in sym.token
+
+
+def test_shortcut_keys_keep_only_command_letters_and_never_in_a_secret_field():
+    assert shortcut_key("s", ("cmd",), secure=False) == "s"
+    assert shortcut_key("tab", ("ctrl",), secure=False) == "tab"
+    for key, mods in (("@", ("ctrl", "alt")), ("é", ("cmd",)), ("a", ("alt",)), ("A", ("shift",))):
+        assert shortcut_key(key, mods, secure=False) == "other"
+    assert shortcut_key("v", ("cmd",), secure=True) == "other"
+    tok = Tokenizer(ShadowConfig(), digest_key=b"k" * 32)
+    (sym,) = tok.feed(
+        ShadowEvent(
+            1,
+            "shortcut",
+            app="A",
+            role="AXSecureTextField",
+            key="x",
+            modifiers=("ctrl",),
+            secure=True,
+        )
+    )
+    assert sym.secure and sym.key == "other" and sym.token.endswith("+other")
+
+
+def test_a_missed_modifier_release_does_not_turn_typing_into_shortcuts():
+    bridge = RecorderShadowBridge(observer=None)
+    field = _ax("AXTextField", "Note")
+    _press(bridge, 1.0, key_name="cmd")  # its release is never seen
+    (late,) = _press(
+        bridge, 1.0 + MODIFIER_HOLD_S + 0.1, key_char="h", structural_observation=field
+    )
+    assert late.kind == "type"
+    _press(bridge, 20.0, key_name="ctrl")
+    bridge.translate(LiveEvent(20.5, "window", {"state": {"owner": "Mail"}}))
+    (after_switch,) = _press(bridge, 21.0, key_char="i", structural_observation=field)
+    assert after_switch.kind == "type"
+
+
+def test_typing_into_an_unnamed_control_is_treated_as_secret():
+    bridge = RecorderShadowBridge(observer=None)
+    no_element = {"provider": "macos_ax", "process": {"process_name": "Login"}}
+    (typed,) = _press(bridge, 1.0, key_char="7", structural_observation=no_element)
+    assert typed.secure
+    roleless = {**no_element, "element": {"name": "Field"}}
+    (typed,) = _press(bridge, 2.0, key_char="7", structural_observation=roleless)
+    assert typed.secure
+
+
+def test_a_tokenizer_failure_carries_no_typed_text(monkeypatch):
+    import openadapt_capture.shadow.symbols as symbols
+
+    def boom(text):
+        raise ValueError(f"bad value {text!r}")
+
+    monkeypatch.setattr(symbols, "value_shape", boom)
+    tok = Tokenizer(ShadowConfig(), digest_key=b"k" * 32)
+    tok.feed(ShadowEvent(1, "type", app="A", role="textfield", label="F", text="hunter2"))
+    with pytest.raises(ShadowTokenizeError) as info:
+        tok.flush()
+    err = info.value
+    assert "hunter2" not in str(err)
+    assert err.__cause__ is None and err.__context__ is None
+    assert tok.flush() == []  # the pending text is gone
 
 
 class _StubbornStore(MemoryKeyStore):
@@ -675,3 +762,38 @@ def test_purge_and_disable_reports_a_key_it_could_not_delete():
     assert obs.purge_and_disable() is False and not obs.enabled
     store.refuse = False
     assert destroy_keys(store) and store._values == {}
+
+
+def test_the_disk_buffer_holds_only_ciphertext(tmp_path):
+    clock = Clock(5_000.0)
+    obs = _observer(clock, key_store=MemoryKeyStore(), cfg={"store_path": tmp_path / "ring.db"})
+    events, end = repeated_task_stream(random.Random(7), 4, start=clock.now)
+    clock.now = end
+    obs.observe_all(events)
+    plain = json.dumps([s.to_dict() for s in obs.symbols()])
+    obs.close()
+    raw = (tmp_path / "ring.db").read_bytes().decode("latin-1")
+    assert '"token": "focus|' in plain and '"app": ' in plain
+    # Markers that can't occur in base64 ciphertext by chance.
+    for marker in ('"token"', '"app"', "focus|", "click|", "type|", '"value_shape"'):
+        assert marker not in raw, marker
+
+
+def test_switching_apps_forgets_that_the_browser_was_on_a_work_site():
+    obs = _observer(Clock(100.0), key_store=MemoryKeyStore())
+    obs.observe_all(
+        [
+            ShadowEvent(1, "navigate", app="Google Chrome", url="https://erp.example.com/invoices"),
+            ShadowEvent(2, "focus", app="Mail"),
+            ShadowEvent(3, "focus", app="Google Chrome"),
+            ShadowEvent(4, "click", app="Google Chrome", role="link", label="Jane Doe"),
+        ]
+    )
+    tokens = [s.token for s in obs.symbols()]
+    assert tokens[-1] == "focus|non-work-browser"
+
+
+def test_a_damaged_ignore_list_does_not_stop_shadow_mode(tmp_path):
+    path = tmp_path / "ignored.json"
+    path.write_text("{not json")
+    assert not SuppressionList(path).is_suppressed("0" * 16, ("a", "b"))

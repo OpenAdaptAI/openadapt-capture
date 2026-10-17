@@ -206,6 +206,10 @@ class ShadowObserver:
 
         cfg = self.config
         in_browser = (event.app or "").strip().casefold() in cfg.browser_apps
+        if event.kind == "focus" and not event.url:
+            # After a switch, the browser may show any page: wait for a browser
+            # event to say it's a work site again.
+            self._browser_on_work_site = False
         if event.url:
             on_work = allowlisted_domain(url_host(event.url), cfg.work_domains) is not None
             if in_browser or event.kind in ("navigate", "submit"):

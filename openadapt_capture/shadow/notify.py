@@ -154,9 +154,14 @@ class SuppressionList:
         self._ids: set[str] = set()
         self._marks: list[frozenset[str]] = []
         if self._path is not None and self._path.exists():
-            data = json.loads(self._path.read_text())
-            self._ids = set(data.get("ids", []))
-            self._marks = [frozenset(m) for m in data.get("marks", [])]
+            try:
+                data = json.loads(self._path.read_text())
+                self._ids = {str(i) for i in data.get("ids", [])}
+                self._marks = [frozenset(map(str, m)) for m in data.get("marks", [])]
+            except (OSError, ValueError, TypeError, AttributeError):
+                # A damaged list must not stop shadow mode from starting; the
+                # person can ignore the task again.
+                self._ids, self._marks = set(), []
 
     def add(self, motif_id: str, tokens: tuple[str, ...]) -> None:
         self._ids.add(motif_id)

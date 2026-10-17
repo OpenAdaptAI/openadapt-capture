@@ -304,14 +304,19 @@ def test_typed_values_never_reach_symbols_store_or_export(tmp_path):
         repr(obs.symbols()),
     ]
     obs.close()
-    blobs.append(store.read_bytes().decode("latin-1"))
+    # The store file is ciphertext; searching its bytes for short strings tests
+    # nothing (and random base64 can contain "ssn"). What was sealed into it is
+    # the symbol list above; test_the_disk_buffer_holds_only_ciphertext covers
+    # the file itself.
+    assert store.exists()
     for blob in blobs:
         for value in SECRET_VALUES:
             assert value not in blob, value
             assert value.lower() not in blob.lower(), value
         assert "invoices/INV" not in blob
         assert "ssn" not in blob and "#Jane" not in blob
-    secure = [s for s in Tokenizer(digest_key=KEY).feed(events[-3])]
+    tok = Tokenizer(digest_key=KEY)
+    secure = tok.feed(events[-3]) + tok.flush()
     assert secure[0].value_digest is None and secure[0].token.endswith("|secure")
 
 
