@@ -185,7 +185,9 @@ a recording by itself.
 
 Shadow-mode pattern mining, which notices repeated tasks and offers a draft,
 is off by default, needs the person's acknowledgement to turn on, keeps no
-typed values, and keeps its encrypted buffer on the device for 24 hours. See
+typed values, and keeps its encrypted buffer on the device for at most 24
+hours while it runs (an expired buffer left by a closed app is deleted at the
+next start). See
 [docs/SHADOW_MINING.md](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/SHADOW_MINING.md).
 
 How Capture handles sensitive data, its licensing boundaries, and how releases

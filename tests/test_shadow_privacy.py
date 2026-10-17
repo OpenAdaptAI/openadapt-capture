@@ -797,3 +797,18 @@ def test_a_damaged_ignore_list_does_not_stop_shadow_mode(tmp_path):
     path = tmp_path / "ignored.json"
     path.write_text("{not json")
     assert not SuppressionList(path).is_suppressed("0" * 16, ("a", "b"))
+
+
+def test_notice_discloses_what_outlives_the_24_hour_buffer():
+    text = notice()["text"]
+    for phrase in (
+        "Keyboard shortcuts",
+        "when each step happened",
+        "Review draft, the draft",
+        "not encrypted",
+        "fingerprint of the task",
+        "next time OpenAdapt starts",
+        "only in memory",
+    ):
+        assert phrase in text, phrase
+    assert NOTICE_VERSION == "2026-10-17.3"

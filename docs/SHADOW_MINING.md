@@ -47,20 +47,25 @@ file or key is created, and `decide()` raises `ShadowModeDisabled`.
 `notice()` returns the text a person must acknowledge, with a version and a
 SHA-256 of the text. It says:
 
-- what is recorded: apps, control kinds, short common-word labels, the shape
-  and a keyed fingerprint of typed values, and for allowlisted work sites the
-  site and one scrubbed path word;
+- what is recorded: apps, control kinds, the time of each step, keyboard
+  shortcuts and named keys, short common-word labels, the shape and a keyed
+  fingerprint of typed values, and for allowlisted work sites the site and one
+  scrubbed path word;
 - what is never recorded: screenshots, window titles, clipboard contents, and
   typed text in readable form;
 - that the buffer is an encrypted file on this computer, kept for 24 hours,
-  with the key in the OS keychain and destroyed every 24 hours;
+  with the key in the OS keychain (or only in memory) and destroyed every 24
+  hours, and that when OpenAdapt isn't running at that point, both go the
+  next time it starts;
+- that a draft saved with **Review draft** is kept, unencrypted, until shadow
+  mode is turned off, and that **Ignore** keeps a fingerprint of the task;
 - that nothing leaves the computer;
 - that OpenAdapt, the person's employer, and other apps can't turn it on or
   read the buffer through OpenAdapt;
 - that someone with administrator access to the computer, or software running
   under the person's account, could still inspect it while it's on;
-- that **Delete everything and turn off** removes the buffer and the key at
-  once.
+- that **Delete everything and turn off** removes the buffer, the key, the
+  drafts, and the ignore list at once.
 
 `ConsentLedger.acknowledge(sha256)` takes the hash of the notice the person
 saw, so an outdated screen can't acknowledge a newer notice. It records the
@@ -73,8 +78,10 @@ no longer counts.
 
 `observer.purge_and_disable()` deletes the buffer file, deletes the key from
 the credential store, clears the ignore list, and leaves the observer off for
-good. Pair it with `ledger.revoke()`. Turning shadow mode on again needs a new
-acknowledgement.
+good. It returns False when the credential store refused to delete the key, so
+the caller can say so; the key id is then kept in a `shadow-key|retired` entry
+and every later destroy retries it. Pair it with `ledger.revoke()`. Turning
+shadow mode on again needs a new acknowledgement.
 
 ## Feed it events
 
@@ -99,10 +106,14 @@ Events reach the observer in one of three ways:
   audio. `publish` never blocks and never raises: a full queue drops and
   counts the event, and a failing subscriber is logged and counted.
   `RecorderShadowBridge` turns mouse presses into clicks, printable key
-  presses into typed characters, chords with Ctrl, Cmd, or Alt into shortcuts
-  (or copy and paste), and window events into focus changes. Typing with no
-  accessibility evidence for the target is treated as typing into a secret
-  field, so its value is dropped.
+  presses into typed characters, chords with Ctrl, Cmd, or Meta into
+  shortcuts (or copy and paste), and window events into focus changes. Option
+  and AltGr alone type characters, so those presses count as typing. A
+  modifier counts as held for at most five seconds after its press, and every
+  window change clears it, so a missed release can't turn typing into
+  shortcuts. Typing with no accessibility evidence for the target (no
+  observation, or one with no element role) is treated as typing into a
+  secret field, so its value is dropped.
 - **From saved events.** `from_capture_event`, `from_browser_event`, and
   `from_window_event` in `events.py` map Capture's event models.
 - **Directly.** Build `ShadowEvent` objects.
@@ -116,7 +127,7 @@ shows what happens to each piece of an event.
 | Input | What is kept |
 |---|---|
 | Typed text | A keyed digest (HMAC-SHA256, 64 bits) and a coarse shape such as `digits` or `email`. Never the text or its length. |
-| Text in a password or other secret field | Nothing. No digest. See [Secret fields](#secret-fields). |
+| Text in a password or other secret field | Nothing: no digest, no shape, and consecutive key presses merge into one symbol, so not even the length. See [Secret fields](#secret-fields). |
 | Label of a button, menu item, tab, check box, or radio button | A keyed digest. The plain text is kept only when it's at most four words and 32 characters, and every word is a common UI word (Save, Send, New Message). Any other label, such as `Doe, John (12345)`, is kept as `<dynamic_label>`. Turn plain text off with `keep_chrome_labels=False`. |
 | Label of a text field or combo box | A keyed digest only. |
 | Label of anything else (a table cell, a list row, a link) | Treated as data: a keyed digest of the value, and no label. |
@@ -126,6 +137,8 @@ shows what happens to each piece of an event.
 | URL anywhere else, or a native event in a browser while it's on such a site | One `non-work-browser` marker. No host, path, label, or value. |
 | Clipboard | Never read. Copy and paste are recognized from the key chord. |
 | Named keys | Enter, Tab, Escape, arrows, function keys. Any other key becomes `other`. |
+| Shortcuts | The modifiers, and the key when it's a named key or one ASCII letter or digit pressed with Ctrl, Cmd, or Meta (`cmd+s`). Any other character, and any key in a secret field, becomes `other`. |
+| Time | The time of each step, to the fraction of a second. |
 | Screenshots, video, audio, mouse coordinates | Not used. |
 
 ### URL and label scrubbing
@@ -215,6 +228,16 @@ file:
 - the file is owner-only (`0600`, in a `0700` directory), with
   `secure_delete` on and a rollback journal instead of a write-ahead log;
 - a buffer without a cipher is refused.
+
+Expiry and rotation run inside the process that holds the observer, on every
+write and read (Desktop scans once a minute). While no such process runs, the
+file and the key stay where they are; starting an observer again deletes
+expired rows and replaces an expired key, which discards the buffer sealed
+with it.
+
+A tokenizer failure raises `ShadowTokenizeError`, which names only the event
+kind and the original exception type, chains nothing, and drops the pending
+typed text, so a log or crash report of it can't show a typed value.
 
 Because each epoch ends with the key destroyed and the buffer purged, mining
 starts over each day. A task you repeat across the epoch boundary is counted
@@ -332,6 +355,10 @@ uses, when, and how often. Treat it as activity monitoring.
   synthetic streams only.
 - Testing the live bridge and the keychain on real hardware for each
   platform. The tests use fakes.
+- Deleting an expired buffer and key while no OpenAdapt process runs. That
+  needs an OS scheduler entry (launchd, Task Scheduler, systemd); today it
+  happens at the next start.
+- Zeroing key bytes in memory. Python can't guarantee it.
 
 ## Tests
 

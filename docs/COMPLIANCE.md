@@ -51,7 +51,10 @@ in code, for the person being observed, after that person acknowledges a
 notice; the acknowledgement time is recorded locally. It keeps value-free
 symbols in an encrypted, 24-hour buffer on the device. The key lives in the
 OS credential store and is destroyed with the buffer every 24 hours, so a
-digest of a short identifier can't be tested later. URL segments and labels
+digest of a short identifier can't be tested later. Expiry runs in the process
+that holds the buffer; a buffer and key left by a closed app are deleted at
+the next start. A saved review draft and the ignore list outlive the 24 hours
+until the person turns shadow mode off, and the notice says so. URL segments and labels
 that could carry identifiers are scrubbed before storage, and only allowlisted
 work domains are recorded. It never reads window titles, the clipboard, or
 the screen, opens no network connection, and has no remote or admin switch.

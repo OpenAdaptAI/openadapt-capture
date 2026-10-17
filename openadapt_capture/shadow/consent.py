@@ -30,7 +30,9 @@ from typing import Any
 # Bump whenever the notice text changes, so a standing acknowledgement of the
 # old text stops counting. 2026-10-17.2 dropped the claim that no
 # administrator can see the buffer, which isn't true of an OS administrator.
-NOTICE_VERSION = "2026-10-17.2"
+# 2026-10-17.3 added shortcuts and timing to what it records, the drafts and
+# ignore list it keeps past 24 hours, and deletion when OpenAdapt was closed.
+NOTICE_VERSION = "2026-10-17.3"
 NOTICE_TITLE = "Turn on shadow mode?"
 NOTICE_INTRO = (
     "Shadow mode watches for tasks you repeat across apps and offers to turn one "
@@ -41,8 +43,9 @@ NOTICE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "What it records",
         (
-            "Which app you switch to, and the kind of control you use (a button, a text "
-            "field, a list row).",
+            "Which app you switch to, the kind of control you use (a button, a text "
+            "field, a list row), and when each step happened.",
+            "Keyboard shortcuts such as Ctrl+S, and keys such as Enter or Tab.",
             "Short button and menu labels made of common words, such as Save or Send. "
             "Any other label is replaced with a placeholder.",
             "The shape of what you type (digits, a date, an email address) and a keyed "
@@ -60,9 +63,16 @@ NOTICE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "Where it is kept",
         (
-            "In an encrypted file on this computer. Each entry is deleted after 24 hours.",
-            "The encryption key is in this computer's keychain. The key, and every "
-            "fingerprint made with it, is destroyed every 24 hours.",
+            "In an encrypted file on this computer. Each entry is deleted after 24 hours. "
+            "If OpenAdapt isn't running at that point, it is deleted the next time "
+            "OpenAdapt starts.",
+            "The encryption key is in this computer's keychain, or only in memory if "
+            "the keychain can't be used. The key, and every fingerprint made with it, "
+            "is destroyed every 24 hours, on the same terms.",
+            "If you choose Review draft, the draft (the steps, with no typed text) is "
+            "saved on this computer, not encrypted, until you turn shadow mode off. "
+            "If you choose Ignore, a fingerprint of the task's steps is kept, so it "
+            "isn't offered again.",
             "Nothing leaves this computer. Shadow mode makes no network connections.",
             "OpenAdapt, your employer, and other apps can't turn shadow mode on or "
             "read the buffer through OpenAdapt. There is no remote or admin setting "
@@ -81,7 +91,10 @@ NOTICE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "Turning it off",
-        ("Delete everything and turn off removes the buffer and the key at once.",),
+        (
+            "Delete everything and turn off removes the buffer, the key, the drafts, "
+            "and the ignore list at once.",
+        ),
     ),
 )
 ACKNOWLEDGE_LABEL = "Turn on shadow mode"
