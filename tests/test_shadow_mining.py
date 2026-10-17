@@ -25,8 +25,10 @@ from openadapt_capture.shadow import (
     Tokenizer,
     from_capture_event,
 )
+from openadapt_capture.shadow.consent import NOTICE_VERSION, Acknowledgement, notice_sha256
 from openadapt_capture.shadow.motifs import lcp_array, poisson_tail, suffix_array
 from openadapt_capture.shadow.notify import PromptLeak, assert_generic_prompt
+from openadapt_capture.shadow.ring import RowCipher
 from openadapt_capture.shadow.symbols import normalize_role, url_pattern
 from tests.shadow_support.streams import (
     SECRET_VALUES,
@@ -37,6 +39,14 @@ from tests.shadow_support.streams import (
 )
 
 KEY = b"k" * 32
+ACK = Acknowledgement(NOTICE_VERSION, notice_sha256(), 0.0)
+WORK = frozenset({"erp.example.com"})
+
+
+def _cipher() -> RowCipher:
+    return RowCipher(b"s" * 32, key_id="test", check="check")
+
+
 SHADOW_DIR = Path(__file__).resolve().parents[1] / "openadapt_capture" / "shadow"
 
 
@@ -51,8 +61,11 @@ class FakeClock:
 def _observer(events, end_t, **cfg):
     clock = FakeClock(end_t)
     notifier = CollectingNotifier()
+    cfg.setdefault("work_domains", WORK)
     config = ShadowConfig(enabled=True, **cfg)
-    obs = ShadowObserver(config, notifier=notifier, digest_key=KEY, clock=clock)
+    obs = ShadowObserver(
+        config, notifier=notifier, acknowledgement=ACK, digest_key=KEY, clock=clock
+    )
     obs.observe_all(events)
     return obs, notifier, clock
 
@@ -158,7 +171,7 @@ def test_single_app_repeat_is_not_offered_by_default():
 def test_window_limits_old_occurrences():
     events, end = repeated_task_stream(random.Random(9), 4, noise_between=5)
     # Push "now" so that only the last episode is inside a short window.
-    obs, _, _ = _observer(events, end, window_s=120.0, max_age_s=10**7)
+    obs, _, _ = _observer(events, end, window_s=120.0, max_age_s=86400)
     assert obs.scan() == []
 
 
@@ -168,7 +181,7 @@ def test_no_false_positives_on_random_streams(seed, alphabet):
     rng = random.Random(seed * 1000 + alphabet)
     events, end = random_events(rng, 3_000_000.0, 4000, alphabet=alphabet)
     obs, _, _ = _observer(
-        events, end, min_apps=1, idle_gap_s=10**6, max_age_s=10**8, window_s=10**8
+        events, end, min_apps=1, idle_gap_s=10**6, max_age_s=86400, window_s=86400
     )
     assert obs.scan() == []
 
@@ -177,13 +190,14 @@ def test_no_false_positives_on_random_streams(seed, alphabet):
 def test_no_false_positives_on_a_full_buffer_of_cross_app_noise(seed):
     rng = random.Random(seed)
     events, end = random_events(rng, 4_000_000.0, 20_000, alphabet=40)
-    obs, _, _ = _observer(events, end, idle_gap_s=10**6, max_age_s=10**8, window_s=10**8)
+    obs, _, _ = _observer(events, end, idle_gap_s=10**6, max_age_s=86400, window_s=86400)
     assert obs.scan() == []
 
 
 def test_detects_task_inside_a_full_buffer_of_noise():
-    events, end = repeated_task_stream(random.Random(2), 4, noise_between=3900)
-    obs, _, _ = _observer(events, end, idle_gap_s=10**6, max_age_s=10**8, window_s=10**8)
+    # About 22 hours of noise: the most a 24-hour buffer can hold around it.
+    events, end = repeated_task_stream(random.Random(2), 4, noise_between=1900)
+    obs, _, _ = _observer(events, end, idle_gap_s=10**6, max_age_s=86400, window_s=86400)
     prompts = obs.scan()
     assert [p.count for p in prompts] == [4]
 
@@ -227,8 +241,9 @@ def test_ignore_suppresses_motif_and_close_variants(tmp_path):
     suppress_file = tmp_path / "ignored.json"
     clock = FakeClock(end)
     obs = ShadowObserver(
-        ShadowConfig(enabled=True),
+        ShadowConfig(enabled=True, work_domains=WORK),
         suppression=SuppressionList(suppress_file),
+        acknowledgement=ACK,
         digest_key=KEY,
         clock=clock,
     )
@@ -241,8 +256,9 @@ def test_ignore_suppresses_motif_and_close_variants(tmp_path):
     assert obs.scan() == []
     # Persisted: a fresh observer with the same key and list stays quiet too.
     again = ShadowObserver(
-        ShadowConfig(enabled=True),
+        ShadowConfig(enabled=True, work_domains=WORK),
         suppression=SuppressionList(suppress_file),
+        acknowledgement=ACK,
         digest_key=KEY,
         clock=clock,
     )
@@ -307,7 +323,7 @@ def test_short_chrome_labels_are_the_only_plain_text():
     assert save.display_label == "Save"
     assert row.display_label is None and row.value_digest is not None
     assert "Jane" not in row.token
-    assert btn.display_label is None  # digits could be data
+    assert btn.display_label == "<dynamic_label>"  # digits could be data
     off = Tokenizer(ShadowConfig(enabled=True, keep_chrome_labels=False), digest_key=KEY)
     (save2,) = off.feed(ShadowEvent(1, "click", app="X", role="button", label="Save"))
     assert save2.display_label is None
@@ -340,14 +356,16 @@ def test_digest_depends_on_key():
     ("url", "expected"),
     [
         ("https://erp.example.com/invoices/INV-1?x=1#y", "https://erp.example.com/invoices/*"),
-        ("https://u:p@host.example:8443/Patients/123", "https://host.example/*/*"),
+        ("https://u:p@host.example.com:8443/Patients/123", "https://<id>.example.com/<id>/*"),
         ("https://mail.example.com/", "https://mail.example.com"),
+        ("https://other.org/invoices", "non-work-browser"),
         ("file:///Users/jane/notes.txt", "file:*"),
         (None, None),
     ],
 )
 def test_url_pattern(url, expected):
-    assert url_pattern(url) == expected
+    work = frozenset({"erp.example.com", "mail.example.com", "example.com"})
+    assert url_pattern(url, work) == expected
 
 
 @pytest.mark.parametrize(
@@ -378,7 +396,11 @@ def _sym(tok: Tokenizer, t: float, i: int):
 def test_ring_buffer_expires_by_age(tmp_path, on_disk):
     clock = FakeClock(100.0)
     ring = SymbolRing(
-        max_symbols=100, max_age_s=10.0, clock=clock, path=tmp_path / "r.db" if on_disk else None
+        max_symbols=100,
+        max_age_s=10.0,
+        clock=clock,
+        path=tmp_path / "r.db" if on_disk else None,
+        cipher=_cipher() if on_disk else None,
     )
     tok = Tokenizer(digest_key=KEY)
     for i in range(5):
@@ -395,7 +417,11 @@ def test_ring_buffer_expires_by_age(tmp_path, on_disk):
 def test_ring_buffer_overwrites_oldest_at_size_cap(tmp_path, on_disk):
     clock = FakeClock(0.0)
     ring = SymbolRing(
-        max_symbols=3, max_age_s=1e9, clock=clock, path=tmp_path / "r.db" if on_disk else None
+        max_symbols=3,
+        max_age_s=1e9,
+        clock=clock,
+        path=tmp_path / "r.db" if on_disk else None,
+        cipher=_cipher() if on_disk else None,
     )
     tok = Tokenizer(digest_key=KEY)
     for i in range(7):
@@ -407,7 +433,7 @@ def test_ring_buffer_overwrites_oldest_at_size_cap(tmp_path, on_disk):
 def test_ring_file_is_private_and_expired_rows_are_gone(tmp_path):
     path = tmp_path / "sub" / "r.db"
     clock = FakeClock(0.0)
-    ring = SymbolRing(max_symbols=1000, max_age_s=5.0, clock=clock, path=path)
+    ring = SymbolRing(max_symbols=1000, max_age_s=5.0, clock=clock, path=path, cipher=_cipher())
     tok = Tokenizer(digest_key=KEY)
     old = _sym(tok, 0.0, 0)
     ring.append(old)

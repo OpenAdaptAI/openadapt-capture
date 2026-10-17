@@ -8,8 +8,59 @@ process can turn it on.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+#: The longest anything in the shadow buffer may live, and the longest a
+#: shadow key may live before it's destroyed.
+MAX_RETENTION_S = 24 * 3600.0
+
+#: Applications treated as web browsers. A native event in one of them (an
+#: accessibility click with no URL) is kept only while the browser's current
+#: page is on an allowlisted work domain.
+DEFAULT_BROWSER_APPS: frozenset[str] = frozenset(
+    {
+        "google chrome",
+        "chrome",
+        "chrome.exe",
+        "chromium",
+        "safari",
+        "firefox",
+        "firefox.exe",
+        "microsoft edge",
+        "msedge",
+        "msedge.exe",
+        "arc",
+        "brave browser",
+        "brave.exe",
+        "opera",
+        "opera.exe",
+        "vivaldi",
+        "vivaldi.exe",
+        "browser",
+    }
+)
+
+_DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9-]{1,63}$")
+
+
+def normalize_domain(domain: str) -> str:
+    """Return the canonical form of one allowlist entry, or raise ValueError.
+
+    Accepts ``example.com``, ``.example.com``, and ``*.example.com``; all mean
+    the domain and its subdomains. A scheme, path, port, or wildcard in the
+    middle is refused, so an entry can't be broader than it looks.
+    """
+
+    text = str(domain).strip().casefold().rstrip(".")
+    if text.startswith("*."):
+        text = text[2:]
+    text = text.lstrip(".")
+    if not _DOMAIN.match(text) or "." not in text:
+        raise ValueError(f"not a domain name: {domain!r}")
+    return text
+
 
 #: Roles whose label names a piece of UI chrome rather than a piece of data.
 #: Only these labels may be kept in plain text for the review draft, and only
@@ -59,6 +110,19 @@ class ShadowConfig:
             (for example "Save") so a person can read the review draft.
         chrome_roles: Roles eligible for a plain-text label.
         structural_label_roles: Roles whose label digest is part of a symbol.
+        work_domains: The local allowlist of work domains (each entry also
+            covers its subdomains). Browser activity on an allowlisted domain
+            is recorded with its host and one scrubbed path word. Activity on
+            any other site is reduced to a single "non-work browser" marker
+            with no host, path, label, or value. Empty by default, so no site
+            is recorded until the person adds one.
+        browser_apps: Application names treated as web browsers.
+        extra_path_words: Extra lowercase words a URL's first path segment may
+            keep (on top of the built-in vocabulary).
+        extra_label_words: Extra words a short chrome label may keep in plain
+            text (on top of the built-in vocabulary).
+        key_lifetime_s: How long one key epoch lasts. At the end the key is
+            destroyed and the buffer purged. At most 24 hours.
     """
 
     enabled: bool = False
@@ -76,14 +140,37 @@ class ShadowConfig:
     keep_chrome_labels: bool = True
     chrome_roles: frozenset[str] = field(default=DEFAULT_CHROME_ROLES)
     structural_label_roles: frozenset[str] = field(default=DEFAULT_STRUCTURAL_LABEL_ROLES)
+    work_domains: frozenset[str] = field(default_factory=frozenset)
+    browser_apps: frozenset[str] = field(default=DEFAULT_BROWSER_APPS)
+    extra_path_words: frozenset[str] = field(default_factory=frozenset)
+    extra_label_words: frozenset[str] = field(default_factory=frozenset)
+    key_lifetime_s: float = MAX_RETENTION_S
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise TypeError("enabled must be a bool; shadow mining needs an explicit opt-in")
         if self.max_symbols < 1:
             raise ValueError("max_symbols must be at least 1")
-        if self.max_age_s <= 0:
-            raise ValueError("max_age_s must be positive")
+        if not 0 < self.max_age_s <= MAX_RETENTION_S:
+            raise ValueError("max_age_s must be positive and at most 24 hours")
+        if not 0 < self.key_lifetime_s <= MAX_RETENTION_S:
+            raise ValueError("key_lifetime_s must be positive and at most 24 hours")
+        if isinstance(self.work_domains, str):
+            raise TypeError("work_domains must be a collection of domain names")
+        object.__setattr__(
+            self, "work_domains", frozenset(normalize_domain(d) for d in self.work_domains)
+        )
+        object.__setattr__(
+            self, "browser_apps", frozenset(a.strip().casefold() for a in self.browser_apps)
+        )
+        object.__setattr__(
+            self, "extra_path_words", frozenset(w.strip().casefold() for w in self.extra_path_words)
+        )
+        object.__setattr__(
+            self,
+            "extra_label_words",
+            frozenset(w.strip().casefold() for w in self.extra_label_words),
+        )
         if self.min_occurrences < 2:
             raise ValueError("min_occurrences must be at least 2")
         if not 2 <= self.min_length <= self.max_length:

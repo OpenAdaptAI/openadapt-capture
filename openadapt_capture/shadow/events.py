@@ -83,22 +83,96 @@ def _attr(obj: Any, *names: str) -> Any:
     for name in names:
         if obj is None:
             return None
-        obj = getattr(obj, name, None)
+        obj = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
     return obj
 
 
-def _structural_context(event: Any) -> dict[str, Any]:
+def _enum_value(value: Any) -> Any:
+    return getattr(value, "value", value)
+
+
+def native_field_is_secure(
+    role: Any = None,
+    control_type: Any = None,
+    *,
+    subrole: Any = None,
+    automation_id: Any = None,
+    class_name: Any = None,
+    is_password: Any = None,
+) -> bool:
+    """True when a native control is a password or other secret field.
+
+    Checks the platform's own signals first (a secure-text role or subrole,
+    UIA's ``IsPassword``), then names: an automation id or class that says
+    password, PIN, passcode, one-time code, SSN, or security code.
+    """
+
+    from openadapt_capture.shadow.scrub import looks_secret
     from openadapt_capture.structural import omit_tree_value
 
-    obs = getattr(event, "structural_observation", None)
-    role = _attr(obs, "element", "role") or _attr(obs, "element", "control_type")
-    control_type = _attr(obs, "element", "control_type")
+    roles = [r for r in (role, control_type, subrole) if isinstance(r, str)]
+    if omit_tree_value(*roles, is_password=bool(is_password)):
+        return True
+    if any("secure" in r.casefold() or "password" in r.casefold() for r in roles):
+        return True
+    return looks_secret(
+        automation_id if isinstance(automation_id, str) else None,
+        class_name if isinstance(class_name, str) else None,
+    )
+
+
+#: ``autocomplete`` tokens that mark a secret or a payment field.
+_SECRET_AUTOCOMPLETE = frozenset(
+    {"current-password", "new-password", "one-time-code", "cc-number", "cc-csc", "cc-exp"}
+)
+_PASSWORD_TYPE = ("[type=password]", "[type='password']", '[type="password"]')
+
+
+def browser_field_is_secure(element: Any) -> bool:
+    """True when a DOM element is a password or other secret field.
+
+    Looks at the input type, ``autocomplete``, and the id, classes, selector,
+    and accessible name for password, PIN, passcode, one-time code, card
+    number, CVV, or SSN.
+    """
+
+    from openadapt_capture.shadow.scrub import looks_secret
+
+    if element is None:
+        return False
+    input_type = str(_attr(element, "type") or _attr(element, "input_type") or "").casefold()
+    if input_type == "password":
+        return True
+    autocomplete = str(_attr(element, "autocomplete") or "").casefold().split()
+    if _SECRET_AUTOCOMPLETE & set(autocomplete):
+        return True
+    css = str(_attr(element, "css_selector") or "")
+    if any(marker in css.casefold().replace(" ", "") for marker in _PASSWORD_TYPE):
+        return True
+    classes = _attr(element, "class_list") or []
+    texts = [css, _attr(element, "id"), _attr(element, "name"), _attr(element, "xpath")]
+    texts += [c for c in classes if isinstance(c, str)]
+    return looks_secret(*[t for t in texts if isinstance(t, str)])
+
+
+def _structural_context(event: Any) -> dict[str, Any]:
+    obs = _attr(event, "structural_observation")
+    element = _attr(obs, "element")
+    role = _attr(element, "role") or _attr(element, "control_type")
+    control_type = _attr(element, "control_type")
     return {
         "app": _attr(obs, "process", "process_name"),
         "window_class": _attr(obs, "window", "class_name"),
         "role": role,
-        "label": _attr(obs, "element", "name"),
-        "secure": omit_tree_value(role, control_type),
+        "label": _attr(element, "name"),
+        "secure": native_field_is_secure(
+            role,
+            control_type,
+            subrole=_attr(element, "subrole"),
+            automation_id=_attr(element, "automation_id"),
+            class_name=_attr(element, "class_name"),
+            is_password=_attr(element, "is_password"),
+        ),
     }
 
 
@@ -155,22 +229,22 @@ def from_capture_event(event: Any) -> ShadowEvent | None:
 
 
 def from_browser_event(event: Any, *, app: str | None = "browser") -> ShadowEvent | None:
-    """Map one Capture browser event onto a :class:`ShadowEvent`."""
+    """Map one Capture browser event (a model or its dict form) onto a
+    :class:`ShadowEvent`."""
 
-    etype = getattr(getattr(event, "type", None), "value", getattr(event, "type", None))
-    ts = float(getattr(event, "timestamp", 0.0))
-    url = getattr(event, "url", None)
-    element = getattr(event, "element", None)
-    role = getattr(element, "role", None)
-    label = getattr(element, "name", None)
-    tag = (getattr(element, "tag_name", "") or "").casefold()
-    secure = tag == "input" and "password" in (getattr(element, "css_selector", "") or "")
+    etype = _enum_value(_attr(event, "type"))
+    ts = float(_attr(event, "timestamp") or 0.0)
+    url = _attr(event, "url")
+    element = _attr(event, "element")
+    role = _attr(element, "role")
+    label = _attr(element, "name")
+    secure = browser_field_is_secure(element)
     if etype == "navigate":
-        nav = getattr(getattr(event, "navigation_type", None), "value", None)
+        nav = _enum_value(_attr(event, "navigation_type"))
         kind: ShadowKind = "submit" if nav == "form_submit" else "navigate"
         return ShadowEvent(timestamp=ts, kind=kind, app=app, url=url)
     if etype == "click":
-        kind = "double_click" if getattr(event, "click_count", 1) == 2 else "click"
+        kind = "double_click" if _attr(event, "click_count") == 2 else "click"
         return ShadowEvent(
             timestamp=ts, kind=kind, app=app, role=role, label=label, url=url, secure=secure
         )
@@ -181,7 +255,7 @@ def from_browser_event(event: Any, *, app: str | None = "browser") -> ShadowEven
             app=app,
             role=role or "textfield",
             label=label,
-            text=getattr(event, "data", None),
+            text=_attr(event, "data"),
             url=url,
             secure=secure,
         )
@@ -195,12 +269,14 @@ def from_window_event(event: Any) -> ShadowEvent | None:
     titles routinely carry document names, record names, and email subjects.
     """
 
-    state = getattr(event, "state", None) or {}
+    state = _attr(event, "state") or {}
+    if not isinstance(state, dict):
+        return None
     app = state.get("owner") or state.get("app") or state.get("process_name")
     if not app:
         return None
     return ShadowEvent(
-        timestamp=float(getattr(event, "timestamp", 0.0)),
+        timestamp=float(_attr(event, "timestamp") or 0.0),
         kind="focus",
         app=str(app),
         window_class=state.get("class_name"),

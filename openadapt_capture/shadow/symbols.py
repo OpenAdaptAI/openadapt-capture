@@ -5,10 +5,13 @@ kind of control. It never says what was typed. Typed text becomes a keyed
 digest (or nothing, for a secure field), labels on data controls become keyed
 digests, URLs become a coarse pattern, and window titles are never read.
 
-The digest key lives in memory for the lifetime of the tokenizer unless the
-integrator supplies one (for example from the OS keychain). Without the key, a
-stored digest can't be checked against a guessed value, which matters for short
-values such as a member ID or a date of birth.
+The digest key comes from :mod:`openadapt_capture.shadow.keys` and lives for
+one 24-hour epoch at most; then it is destroyed with the buffer. Without the
+key, a stored digest can't be checked against a guessed value, which matters
+for short values such as a member ID, a record number, or an SSN.
+
+URLs and short chrome labels are scrubbed here, before a symbol exists: see
+:mod:`openadapt_capture.shadow.scrub`.
 """
 
 from __future__ import annotations
@@ -23,6 +26,14 @@ from urllib.parse import urlsplit
 
 from openadapt_capture.shadow.config import ShadowConfig
 from openadapt_capture.shadow.events import ShadowEvent
+from openadapt_capture.shadow.scrub import (
+    NON_WORK_BROWSER,
+    allowlisted_domain,
+    looks_secret,
+    scrub_host,
+    scrub_label,
+    scrub_path_segment,
+)
 
 SYMBOL_SCHEMA = "openadapt.shadow.symbol/v1"
 _DIGEST_HEX = 16
@@ -62,7 +73,10 @@ _ROLE_ALIASES = {
     "hyperlink": "link",
 }
 
-_SEGMENT_KEEP = re.compile(r"^[a-z][a-z_-]{0,23}$")
+#: Roles that take typed text. A field among them whose label names a
+#: password, PIN, or similar is treated as secure even when the platform
+#: didn't say so.
+_TEXT_ENTRY_ROLES = frozenset({"textfield", "textarea", "combobox", "searchfield", "unknown"})
 _DATE = re.compile(r"^\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}$")
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _DECIMAL = re.compile(r"^[-+]?\d+[.,]\d+$")
@@ -105,34 +119,43 @@ def normalize_role(role: str | None) -> str:
     return _ROLE_ALIASES.get(text.replace(" ", ""), text.replace(" ", ""))
 
 
-def url_pattern(url: str | None) -> str | None:
-    """Reduce a URL to ``scheme://host/first-segment/*``.
+def url_pattern(
+    url: str | None,
+    work_domains: frozenset[str] = frozenset(),
+    extra_words: frozenset[str] = frozenset(),
+) -> str | None:
+    """Reduce a URL to ``scheme://host/first-segment/*``, or a non-work marker.
 
-    The query string, fragment, credentials, and port are dropped. The first
-    path segment is kept only when it is a short lowercase word, and every
-    later segment becomes ``*``, so record IDs, names, and tokens in the path
-    never reach the symbol stream.
+    Only a host covered by ``work_domains`` is kept; any other URL becomes
+    ``non-work-browser``, with no host or path. For a work host, the query
+    string, fragment, credentials, and port are dropped, subdomain labels and
+    the first path segment are scrubbed (see
+    :func:`~openadapt_capture.shadow.scrub.scrub_path_segment`), and every
+    later segment becomes ``*``. So ``/patient-987654`` becomes ``/<id>``.
     """
 
     if not url:
         return None
     try:
         parts = urlsplit(url)
+        host = (parts.hostname or "").casefold()
     except ValueError:
-        return "invalid-url"
+        return NON_WORK_BROWSER
     scheme = (parts.scheme or "").casefold()
     if scheme == "file":
         return "file:*"
-    host = (parts.hostname or "").casefold()
+    domain = allowlisted_domain(host, work_domains)
+    if domain is None or scheme not in ("http", "https"):
+        return NON_WORK_BROWSER
     segments = [s for s in parts.path.split("/") if s]
     shape = []
     for index, segment in enumerate(segments):
-        if index == 0 and _SEGMENT_KEEP.match(segment):
-            shape.append(segment)
+        if index == 0:
+            shape.append(scrub_path_segment(segment, extra_words))
         else:
             shape.append("*")
     path = "/" + "/".join(shape) if shape else ""
-    return f"{scheme}://{host}{path}"
+    return f"{scheme}://{scrub_host(host, domain, extra_words)}{path}"
 
 
 def value_shape(text: str) -> str:
@@ -230,7 +253,7 @@ class Tokenizer:
         """Tokenize one event. Returns zero, one, or two symbols."""
 
         out: list[ShadowSymbol] = []
-        if event.kind == "type" and not event.secure:
+        if event.kind == "type" and not self._is_secure(event):
             if self._pending is not None and self._same_field(self._pending, event):
                 self._pending[1].append(event.text or "")
                 self._pending[2][0] = event.timestamp
@@ -257,6 +280,12 @@ class Tokenizer:
         return [symbol] if symbol is not None else []
 
     @staticmethod
+    def _is_secure(event: ShadowEvent) -> bool:
+        return bool(event.secure) or (
+            normalize_role(event.role) in _TEXT_ENTRY_ROLES and looks_secret(event.label)
+        )
+
+    @staticmethod
     def _same_field(
         pending: tuple[ShadowEvent, list[str], list[float]], second: ShadowEvent
     ) -> bool:
@@ -277,14 +306,7 @@ class Tokenizer:
         digest = self.digest("label", label)
         display = None
         if cfg.keep_chrome_labels and role in cfg.chrome_roles:
-            cleaned = " ".join(label.split())
-            if (
-                len(cleaned) <= 32
-                and len(cleaned.split()) <= 4
-                and not any(ch.isdigit() for ch in cleaned)
-                and "@" not in cleaned
-            ):
-                display = cleaned
+            display = scrub_label(label, cfg.extra_label_words)
         if role in cfg.structural_label_roles:
             return digest, display, digest[:8]
         return digest, display, "-"
@@ -293,14 +315,15 @@ class Tokenizer:
         app = (event.app or "unknown").strip() or "unknown"
         role = normalize_role(event.role)
         label_digest, display, label_part = self._label_parts(role, event.label)
-        pattern = url_pattern(event.url)
+        pattern = url_pattern(event.url, self._config.work_domains, self._config.extra_path_words)
+        secure = bool(event.secure) or (role in _TEXT_ENTRY_ROLES and looks_secret(event.label))
         common: dict[str, Any] = {
             "t": float(event.timestamp),
             "kind": event.kind,
             "app": app,
             "window_class": event.window_class,
             "url_pattern": pattern,
-            "secure": bool(event.secure),
+            "secure": secure,
         }
         kind = event.kind
         if kind == "focus":
@@ -321,7 +344,7 @@ class Tokenizer:
                 **common,
             )
         if kind == "type":
-            if event.secure:
+            if secure:
                 return ShadowSymbol(
                     token=f"type|{app}|{role}|{label_part}|secure",
                     role=role,

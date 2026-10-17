@@ -1,8 +1,8 @@
 """The prompt a person sees when a motif fires, and what they can answer.
 
-This module is the hook a tray or notification surface implements. It is a
-stub: Capture has no UI, and wiring it into OpenAdapt Desktop's Tauri tray is
-a separate change (see ``docs/SHADOW_MINING.md``).
+This module is the hook a tray or notification surface implements. Capture
+has no UI; OpenAdapt Desktop implements it in its tray and window (see
+``docs/SHADOW_MINING.md``).
 
 The prompt text is fixed. It carries a count and nothing else: no application
 name, no control label, no value. A notification can show on a lock screen or
@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -114,9 +115,24 @@ class CollectingNotifier:
         self.prompts.append(prompt)
 
 
+_HEX8 = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _coarse(token: str) -> str:
+    """A token without its keyed label part.
+
+    Keys are destroyed every 24 hours, so a keyed part would stop matching the
+    next day and an ignored task would come back. The coarse form keeps the
+    kind, app, and role, which is enough to recognize the task again.
+    """
+
+    return "|".join("#" if _HEX8.match(part) else part for part in token.split("|"))
+
+
 def _bigram_marks(tokens: tuple[str, ...]) -> frozenset[str]:
+    coarse = [_coarse(t) for t in tokens]
     return frozenset(
-        hashlib.sha256(f"{a}\x1f{b}".encode()).hexdigest()[:12] for a, b in zip(tokens, tokens[1:])
+        hashlib.sha256(f"{a}\x1f{b}".encode()).hexdigest()[:12] for a, b in zip(coarse, coarse[1:])
     )
 
 
@@ -127,7 +143,9 @@ class SuppressionList:
     motif whose symbol pairs mostly match an ignored one (Jaccard similarity of
     hashed bigrams at or above ``resemblance``) stays quiet too, so ignoring a
     task isn't undone by one extra click. Only ids and hashed bigrams are kept,
-    never symbols. Pass ``path`` to remember ignores across restarts.
+    never symbols. Bigrams are taken over coarse tokens (no keyed part), so an
+    ignore still holds after the daily key rotation. Pass ``path`` to remember
+    ignores across restarts.
     """
 
     def __init__(self, path: Path | None = None, *, resemblance: float = 0.6) -> None:

@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from openadapt_capture.shadow import ShadowConfig, ShadowObserver
+from openadapt_capture.shadow.consent import NOTICE_VERSION, Acknowledgement, notice_sha256
 from tests.shadow_support.streams import repeated_task_stream, report_task_stream
 
 FIXTURE_KEY = b"fixture-key-0123456789abcdef0123"
@@ -31,7 +32,10 @@ def main(out_dir: str) -> None:
     for name, make in CASES:
         events, end = make()
         observer = ShadowObserver(
-            ShadowConfig(enabled=True), digest_key=FIXTURE_KEY, clock=lambda end=end: end
+            ShadowConfig(enabled=True, work_domains={"erp.example.com"}),
+            acknowledgement=Acknowledgement(NOTICE_VERSION, notice_sha256(), end),
+            digest_key=FIXTURE_KEY,
+            clock=lambda end=end: end,
         )
         observer.observe_all(events)
         (prompt,) = observer.scan()
