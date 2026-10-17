@@ -29,8 +29,8 @@ dependencies = [
     # Note: openai-whisper moved to optional [transcribe] extra due to Python version conflicts
     "pydantic-settings>=2.12.0",
     # Recording-pipeline dependencies (carried forward from OpenAdapt record.py)
-    "sqlalchemy>=2.0.0",
-    "alembic>=1.0.0",
+    "sqlalchemy>=2.0.54",
+    "alembic>=1.20.0",
     "loguru>=0.7.0",
     "psutil>=5.0.0",
     "pympler>=1.0.0",
@@ -38,7 +38,7 @@ dependencies = [
     "numpy>=1.26.0",
     # Recorder generates a performance plot by default, and the package-level
     # API imports the plotting module while exposing Recorder.
-    "matplotlib>=3.10.8",
+    "matplotlib>=3.10.9",
     # Native macOS window/accessibility observation via permissive PyObjC.
     "pyobjc-framework-ApplicationServices>=12.2.1; sys_platform == 'darwin'",
     # Desktop-independent, exact-window pixels on macOS 14 and later.
