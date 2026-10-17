@@ -11,8 +11,8 @@ sends the data off the computer, no one can turn it on or read it through
 OpenAdapt, and an administrator, IT, or endpoint security or backup software
 could still inspect or copy it.
 
-The acknowledgement is recorded on this computer only, in an owner-only JSON
-file: the notice version, a SHA-256 of the notice text, and the time. Turning
+The acknowledgement is recorded on this computer only, in a JSON file that is
+owner-only on macOS and Linux (``0600``): the notice version, a SHA-256 of the notice text, and the time. Turning
 shadow mode off with **Delete everything and turn off** records the time it
 was revoked; the next opt-in needs a fresh acknowledgement.
 

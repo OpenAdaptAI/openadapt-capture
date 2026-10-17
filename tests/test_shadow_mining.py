@@ -7,6 +7,7 @@ import json
 import os
 import random
 import socket
+import sys
 from pathlib import Path
 
 import pytest
@@ -267,7 +268,8 @@ def test_ignore_suppresses_motif_and_close_variants(tmp_path):
     stored = suppress_file.read_text()
     for value in SECRET_VALUES + ("Excel", "Chrome", "Submit"):
         assert value not in stored
-    assert oct(suppress_file.stat().st_mode & 0o777) == "0o600"
+    if sys.platform != "win32":  # POSIX mode bits; Windows uses ACLs
+        assert oct(suppress_file.stat().st_mode & 0o777) == "0o600"
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +447,8 @@ def test_ring_file_is_private_and_expired_rows_are_gone(tmp_path):
     clock.now = 100.0
     ring.append(_sym(tok, 100.0, 1))
     ring.close()
-    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    if sys.platform != "win32":  # POSIX mode bits; Windows uses ACLs
+        assert oct(path.stat().st_mode & 0o777) == "0o600"
     assert old.label_digest not in path.read_bytes().decode("latin-1")
     assert not Path(str(path) + "-wal").exists()
 

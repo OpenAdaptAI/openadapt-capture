@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -490,7 +491,8 @@ def test_ledger_records_acknowledgement_time_locally_and_revocation(tmp_path):
         ledger.acknowledge("not-the-hash", now=1.0)
     ack = ledger.acknowledge(notice_sha256(), now=1234.5)
     assert ledger.current() == ack and ack.acknowledged_at == 1234.5
-    assert oct((tmp_path / "consent.json").stat().st_mode & 0o777) == "0o600"
+    if sys.platform != "win32":  # POSIX mode bits; Windows uses ACLs
+        assert oct((tmp_path / "consent.json").stat().st_mode & 0o777) == "0o600"
     ledger.revoke(now=2000.0)
     assert ledger.current() is None
     assert [e["event"] for e in ledger.history()] == ["acknowledged", "revoked"]

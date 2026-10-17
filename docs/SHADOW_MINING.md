@@ -81,8 +81,9 @@ claim returns to the notice, this page, the README, or the shadow source.
 
 `ConsentLedger.acknowledge(sha256)` takes the hash of the notice the person
 saw, so an outdated screen can't acknowledge a newer notice. It records the
-notice version, the hash, and the time, in an owner-only JSON file on this
-computer. `ConsentLedger.revoke()` records when the person turned it off.
+notice version, the hash, and the time, in a JSON file on this computer. On
+macOS and Linux the file is owner-only (`0600`). On Windows it takes the
+permissions of the user's local app data folder. `ConsentLedger.revoke()` records when the person turned it off.
 Changing the notice text changes the hash, and an older acknowledgement then
 no longer counts.
 
@@ -264,8 +265,9 @@ The file itself:
   timestamp as associated data, so a row can't be moved or re-dated
   unnoticed;
 - the file stores the key id and a check value, never the key;
-- the file is owner-only (`0600`, in a `0700` directory), with
-  `secure_delete` on and a rollback journal instead of a write-ahead log;
+- on macOS and Linux the file is owner-only (`0600`, in a `0700` directory);
+  on Windows it takes the permissions of the user's local app data folder;
+- `secure_delete` is on, with a rollback journal instead of a write-ahead log;
 - a buffer without a cipher is refused.
 
 Expiry and rotation run inside the process that holds the observer, on every
