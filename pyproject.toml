@@ -63,7 +63,7 @@ transcribe = [
 
 # Privacy scrubbing support
 privacy = [
-    "openadapt-privacy>=0.1.0",
+    "openadapt-privacy>=1.1.2",
 ]
 
 # Shadow-mode pattern mining: AES-GCM for the on-disk buffer and the OS
