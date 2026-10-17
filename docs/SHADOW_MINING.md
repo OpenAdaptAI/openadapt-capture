@@ -55,7 +55,10 @@ SHA-256 of the text. It says:
 - that the buffer is an encrypted file on this computer, kept for 24 hours,
   with the key in the OS keychain and destroyed every 24 hours;
 - that nothing leaves the computer;
-- that no administrator or OpenAdapt service can see it or turn it on;
+- that OpenAdapt, the person's employer, and other apps can't turn it on or
+  read the buffer through OpenAdapt;
+- that someone with administrator access to the computer, or software running
+  under the person's account, could still inspect it while it's on;
 - that **Delete everything and turn off** removes the buffer and the key at
   once.
 

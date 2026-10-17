@@ -417,11 +417,16 @@ def test_notice_says_what_the_counsel_review_requires():
         "encrypted file on this computer",
         "24 hours",
         "Nothing leaves this computer",
-        "No administrator",
+        "can't turn shadow mode on or read the buffer through OpenAdapt",
+        "administrator access to this computer",
         "Delete everything and turn off",
         "never",
     ):
         assert phrase in text
+    # An OS administrator with access to the device can inspect the buffer
+    # while it's on, so the notice must never claim otherwise.
+    assert "No administrator" not in text
+    assert "can see it" not in text
     assert notice()["sha256"] == notice_sha256()
 
 
@@ -602,3 +607,27 @@ def test_secret_values_never_reach_a_live_fed_buffer(tmp_path):
     obs.close()
     raw = (tmp_path / "r.db").read_bytes().decode("latin-1")
     assert SECRET_VALUES[4] not in raw and "SSN" not in raw
+
+
+def test_acknowledgement_of_the_old_notice_no_longer_counts(tmp_path):
+    # The 2026-10-17 notice claimed no administrator could see the buffer.
+    old = Acknowledgement("2026-10-17", notice_sha256(), 1.0)
+    assert not old.current
+    with pytest.raises(ShadowConsentRequired):
+        ShadowObserver(ShadowConfig(enabled=True), acknowledgement=old)
+    path = tmp_path / "consent.json"
+    path.write_text(
+        json.dumps(
+            {
+                "events": [
+                    {
+                        "event": "acknowledged",
+                        "notice_version": "2026-10-17",
+                        "notice_sha256": notice_sha256(),
+                        "at": 1.0,
+                    }
+                ]
+            }
+        )
+    )
+    assert ConsentLedger(path).current() is None

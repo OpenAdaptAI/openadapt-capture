@@ -3,8 +3,10 @@
 :class:`~openadapt_capture.shadow.observer.ShadowObserver` refuses to start
 enabled without an :class:`Acknowledgement` of the current notice. The notice
 says what is captured, that the buffer is encrypted, local, and kept for 24
-hours, that nothing leaves the computer, that no administrator can see it or
-turn it on, and that one action deletes everything and turns it off.
+hours, that nothing leaves the computer, that no one can turn it on or read it
+through OpenAdapt, that an administrator of the computer or software running
+as the person could still inspect it, and that one action deletes everything
+and turns it off.
 
 The acknowledgement is recorded on this computer only, in an owner-only JSON
 file: the notice version, a SHA-256 of the notice text, and the time. Turning
@@ -25,7 +27,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-NOTICE_VERSION = "2026-10-17"
+# Bump whenever the notice text changes, so a standing acknowledgement of the
+# old text stops counting. 2026-10-17.2 dropped the claim that no
+# administrator can see the buffer, which isn't true of an OS administrator.
+NOTICE_VERSION = "2026-10-17.2"
 NOTICE_TITLE = "Turn on shadow mode?"
 NOTICE_INTRO = (
     "Shadow mode watches for tasks you repeat across apps and offers to turn one "
@@ -59,8 +64,11 @@ NOTICE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "The encryption key is in this computer's keychain. The key, and every "
             "fingerprint made with it, is destroyed every 24 hours.",
             "Nothing leaves this computer. Shadow mode makes no network connections.",
-            "No administrator or OpenAdapt service can see it or turn it on. There is "
-            "no remote or admin setting for it.",
+            "OpenAdapt, your employer, and other apps can't turn shadow mode on or "
+            "read the buffer through OpenAdapt. There is no remote or admin setting "
+            "for it.",
+            "Someone with administrator access to this computer, or software running "
+            "under your account, could still inspect it while it's on.",
         ),
     ),
     (
