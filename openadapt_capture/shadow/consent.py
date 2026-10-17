@@ -2,11 +2,14 @@
 
 :class:`~openadapt_capture.shadow.observer.ShadowObserver` refuses to start
 enabled without an :class:`Acknowledgement` of the current notice. The notice
-says what is captured, that the buffer is encrypted, local, and kept for 24
-hours, that nothing leaves the computer, that no one can turn it on or read it
-through OpenAdapt, that an administrator of the computer or software running
-as the person could still inspect it, and that one action deletes everything
-and turns it off.
+says what is captured and that it may include personal, confidential, or
+health information; why (to suggest draft automations); how long it is kept
+(an encrypted local buffer, cleared with its key at least every 24 hours and
+when shadow mode stops); how to erase it (turn it off, or delete everything
+and turn off) and when to pause it; and who can access it: OpenAdapt never
+sends the data off the computer, no one can turn it on or read it through
+OpenAdapt, and an administrator, IT, or endpoint security or backup software
+could still inspect or copy it.
 
 The acknowledgement is recorded on this computer only, in an owner-only JSON
 file: the notice version, a SHA-256 of the notice text, and the time. Turning
@@ -32,68 +35,88 @@ from typing import Any
 # administrator can see the buffer, which isn't true of an OS administrator.
 # 2026-10-17.3 added shortcuts and timing to what it records, the drafts and
 # ignore list it keeps past 24 hours, and deletion when OpenAdapt was closed.
-NOTICE_VERSION = "2026-10-17.3"
+# 2026-10-17.4 follows counsel's review: it is organized as what, why, how
+# long, and how to erase; it says the record may include personal,
+# confidential, or health information; it no longer says "nothing leaves
+# this computer", since backup, sync, and security tools can copy local
+# files; it names IT administrators and endpoint tools on a managed computer;
+# and it advises pausing before viewing sensitive material.
+NOTICE_VERSION = "2026-10-17.4"
 NOTICE_TITLE = "Turn on shadow mode?"
 NOTICE_INTRO = (
-    "Shadow mode watches for tasks you repeat across apps and offers to turn one "
-    "into a draft automation. It is off until you turn it on, and only you can "
-    "turn it on."
+    "Shadow mode watches how you work across apps to find tasks you repeat. It is "
+    "off until you turn it on, and only you can turn it on."
 )
 NOTICE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
-        "What it records",
+        "What it captures",
         (
-            "Which app you switch to, the kind of control you use (a button, a text "
-            "field, a list row), and when each step happened.",
-            "Keyboard shortcuts such as Ctrl+S, and keys such as Enter or Tab.",
-            "Short button and menu labels made of common words, such as Save or Send. "
-            "Any other label is replaced with a placeholder.",
-            "The shape of what you type (digits, a date, an email address) and a keyed "
-            "fingerprint of it, never the text itself. Password and PIN fields are "
-            "skipped.",
-            "On the work sites you list: the site name and the first word of the page "
-            "address, with record numbers and names replaced. On any other site: only "
-            "that you were in a browser.",
+            "A list of the steps you take: which app you switch to, the kind of "
+            "control you use (a button, a text field, a list row), keyboard "
+            "shortcuts such as Ctrl+S, keys such as Enter or Tab, and when each "
+            "step happened.",
+            "What you type is never kept as text. It is reduced to its shape (digits, "
+            "a date, an email address) and a keyed fingerprint. Password and PIN "
+            "fields are skipped.",
+            "Button and menu labels are kept only when they are common words, such as "
+            "Save or Send. Any other label, such as a name or a record number, is "
+            "replaced with a placeholder.",
+            "Web pages count only on the work sites you list: the site name and the "
+            "first word of the page address, with record numbers and names "
+            "replaced. On any other site, it notes only that you were in a browser.",
+            "It never takes screenshots, and never reads window titles or clipboard contents.",
+            "Even so, this record may include personal, confidential, or health "
+            "information that appears on your screen, such as which apps and work "
+            "sites you used, when, and how often.",
         ),
     ),
     (
-        "What it never records",
-        ("Screenshots, window titles, clipboard contents, or what you type in readable form.",),
-    ),
-    (
-        "Where it is kept",
+        "Why",
         (
-            "In an encrypted file on this computer. Each entry is deleted after 24 hours. "
-            "If OpenAdapt isn't running at that point, it is deleted the next time "
-            "OpenAdapt starts.",
-            "The encryption key is in this computer's keychain, or only in memory if "
-            "the keychain can't be used. The key, and every fingerprint made with it, "
-            "is destroyed every 24 hours, on the same terms.",
-            "If you choose Review draft, the draft (the steps, with no typed text) is "
-            "saved on this computer, not encrypted, until you turn shadow mode off. "
-            "If you choose Ignore, a fingerprint of the task's steps is kept, so it "
-            "isn't offered again.",
-            "Nothing leaves this computer. Shadow mode makes no network connections.",
-            "OpenAdapt, your employer, and other apps can't turn shadow mode on or "
-            "read the buffer through OpenAdapt. There is no remote or admin setting "
-            "for it.",
-            "Someone with administrator access to this computer, or software running "
-            "under your account, could still inspect it while it's on.",
-        ),
-    ),
-    (
-        "What it does with it",
-        (
-            "It may show: You did this N times today. You choose Review draft or Ignore.",
+            "To find tasks you repeat and suggest them as draft automations. It may "
+            "show: You did this N times today. You choose Review draft or Ignore.",
             "A draft never runs. To automate the task, you record it and a person "
             "reviews and admits the automation.",
         ),
     ),
     (
-        "Turning it off",
+        "How long it is kept",
         (
-            "Delete everything and turn off removes the buffer, the key, the drafts, "
-            "and the ignore list at once.",
+            "In an encrypted buffer in this computer's app-data folder, which isn't "
+            "synced. Shadow mode won't start if that folder is inside iCloud, "
+            "OneDrive, Dropbox, or a similar synced folder.",
+            "The buffer is cleared, and its key destroyed, at least every 24 hours, "
+            "and whenever you turn shadow mode off or quit OpenAdapt. If OpenAdapt "
+            "stops unexpectedly, the buffer is cleared the next time it starts.",
+            "The key is in this computer's keychain, or only in memory if the "
+            "keychain can't be used.",
+            "If you choose Review draft, the draft (the steps, with no typed text) is "
+            "saved on this computer, not encrypted, until you turn shadow mode off. "
+            "If you choose Ignore, a fingerprint of the task's steps is kept, so it "
+            "isn't offered again.",
+        ),
+    ),
+    (
+        "How to erase it",
+        (
+            "Turning shadow mode off erases the buffer, its key, and any drafts at "
+            "once. Delete everything and turn off also erases the ignore list.",
+            "Pause stops it recording until you resume. Pause before you view sensitive material.",
+        ),
+    ),
+    (
+        "Who can access it",
+        (
+            "OpenAdapt never sends shadow mode data off this computer. Shadow mode "
+            "makes no network connections.",
+            "OpenAdapt, your employer, and other apps can't turn shadow mode on or "
+            "read the buffer through OpenAdapt. There is no remote or admin setting "
+            "for it.",
+            "Someone with administrator access to this computer, or software running "
+            "under your account, could still inspect it while it's on. On a "
+            "work-managed computer, that includes IT administrators, and endpoint "
+            "security or backup tools, which could inspect or copy local files or "
+            "memory.",
         ),
     ),
 )

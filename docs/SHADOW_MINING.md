@@ -45,27 +45,39 @@ file or key is created, and `decide()` raises `ShadowModeDisabled`.
 ### The notice
 
 `notice()` returns the text a person must acknowledge, with a version and a
-SHA-256 of the text. It says:
+SHA-256 of the text. It has five sections:
 
-- what is recorded: apps, control kinds, the time of each step, keyboard
-  shortcuts and named keys, short common-word labels, the shape and a keyed
-  fingerprint of typed values, and for allowlisted work sites the site and one
-  scrubbed path word;
-- what is never recorded: screenshots, window titles, clipboard contents, and
-  typed text in readable form;
-- that the buffer is an encrypted file on this computer, kept for 24 hours,
-  with the key in the OS keychain (or only in memory) and destroyed every 24
-  hours, and that when OpenAdapt isn't running at that point, both go the
-  next time it starts;
-- that a draft saved with **Review draft** is kept, unencrypted, until shadow
-  mode is turned off, and that **Ignore** keeps a fingerprint of the task;
-- that nothing leaves the computer;
-- that OpenAdapt, the person's employer, and other apps can't turn it on or
-  read the buffer through OpenAdapt;
-- that someone with administrator access to the computer, or software running
-  under the person's account, could still inspect it while it's on;
-- that **Delete everything and turn off** removes the buffer, the key, the
-  drafts, and the ignore list at once.
+- **What it captures:** apps, control kinds, keyboard shortcuts and named
+  keys, and the time of each step; the shape and a keyed fingerprint of typed
+  values, never the text, with password and PIN fields skipped; common-word
+  labels, with any other label replaced; and, on allowlisted work sites only,
+  the site and one scrubbed path word. It never takes screenshots or reads
+  window titles or the clipboard. It says the record may still include
+  personal, confidential, or health information that appears on screen.
+- **Why:** to find repeated tasks and suggest them as draft automations. A
+  draft never runs.
+- **How long it is kept:** an encrypted buffer in the unsynced app-data
+  folder, cleared with its key destroyed at least every 24 hours, when shadow
+  mode is turned off, and when OpenAdapt quits; after a crash, at the next
+  start. The key is in the OS keychain, or only in memory. A draft saved with
+  **Review draft** is kept, unencrypted, until shadow mode is turned off, and
+  **Ignore** keeps a fingerprint of the task.
+- **How to erase it:** turning shadow mode off erases the buffer, its key,
+  and any drafts at once; **Delete everything and turn off** also erases the
+  ignore list. **Pause** stops recording; the notice advises pausing before
+  viewing sensitive material.
+- **Who can access it:** OpenAdapt never sends shadow mode data off this
+  computer. OpenAdapt, the person's employer, and other apps can't turn it on
+  or read the buffer through OpenAdapt. Someone with administrator access to
+  the computer, or software running under the person's account, could still
+  inspect it while it's on; on a work-managed computer that includes IT
+  administrators and endpoint security or backup tools, which could inspect or
+  copy local files or memory.
+
+The notice no longer claims that no data leaves the computer. OS backup,
+sync, and endpoint security tools can copy local files, so it promises only
+what OpenAdapt itself does. `tests/test_shadow_privacy.py` fails if the old
+claim returns to the notice, this page, the README, or the shadow source.
 
 `ConsentLedger.acknowledge(sha256)` takes the hash of the notice the person
 saw, so an outdated screen can't acknowledge a newer notice. It records the
@@ -82,6 +94,19 @@ good. It returns False when the credential store refused to delete the key, so
 the caller can say so; the key id is then kept in a `shadow-key|retired` entry
 and every later destroy retries it. Pair it with `ledger.revoke()`. Turning
 shadow mode on again needs a new acknowledgement.
+
+`observer.shutdown()` is for a clean exit or a plain turn-off: it clears the
+buffer, deletes the buffer file and the key, and stops, but keeps the ignore
+list. Desktop calls it when shadow mode is turned off and when the engine
+exits.
+
+### Pause
+
+`observer.pause()` stops recording until `observer.unpause()`. Events that
+arrive while paused are dropped untouched, and typing in progress at the
+moment of the pause is dropped too. The buffer keeps what it already had,
+which expires as usual. The notice tells the person to pause before viewing
+sensitive material.
 
 ## Feed it events
 
@@ -219,7 +244,21 @@ Symbols go into a ring buffer with two limits that both apply:
   symbols are deleted on every write and every read.
 
 By default the buffer lives in memory only. With `store_path`, it's a SQLite
-file:
+file. The file belongs in the platform's local app-data folder, which
+`app_data_dir(app_id)` returns: `~/Library/Application Support` on macOS,
+`%LOCALAPPDATA%` on Windows, and `$XDG_DATA_HOME` or `~/.local/share` on
+Linux. `ShadowObserver` refuses to start, before it makes a key or a file,
+when `store_path` resolves (following symlinks) inside a folder that may be
+synced: Documents, Desktop, iCloud Drive (`~/Library/Mobile Documents`),
+`~/Library/CloudStorage` (OneDrive, Dropbox, Google Drive, and Box on macOS),
+the folders named by the Windows `OneDrive*` variables and by Dropbox's
+`info.json`, and any folder named Dropbox, OneDrive, Google Drive, iCloud
+Drive, Box Sync, Nextcloud, or ownCloud. It raises `ShadowStorageRefused`.
+The check can't see every sync or backup tool; a Time Machine backup or a
+sync client pointed at an unusual folder can still copy the file, which is
+why the notice names backup tools.
+
+The file itself:
 
 - every row is sealed with AES-256-GCM, with a random nonce and the key id and
   timestamp as associated data, so a row can't be moved or re-dated
@@ -230,10 +269,9 @@ file:
 - a buffer without a cipher is refused.
 
 Expiry and rotation run inside the process that holds the observer, on every
-write and read (Desktop scans once a minute). While no such process runs, the
-file and the key stay where they are; starting an observer again deletes
-expired rows and replaces an expired key, which discards the buffer sealed
-with it.
+write and read (Desktop scans once a minute). On a clean exit, `shutdown()`
+deletes the file and the key. After a crash they stay where they are until
+the next start; Desktop then deletes them before it starts a new observer.
 
 A tokenizer failure raises `ShadowTokenizeError`, which names only the event
 kind and the original exception type, chains nothing, and drops the pending
@@ -355,9 +393,10 @@ uses, when, and how often. Treat it as activity monitoring.
   synthetic streams only.
 - Testing the live bridge and the keychain on real hardware for each
   platform. The tests use fakes.
-- Deleting an expired buffer and key while no OpenAdapt process runs. That
-  needs an OS scheduler entry (launchd, Task Scheduler, systemd); today it
-  happens at the next start.
+- Deleting the buffer and key left by a crash before the next start. That
+  needs an OS scheduler entry (launchd, Task Scheduler, systemd).
+- Detecting every sync and backup tool. The sync-root check knows the common
+  folders only.
 - Zeroing key bytes in memory. Python can't guarantee it.
 
 ## Tests
@@ -371,6 +410,9 @@ uses, when, and how often. Treat it as activity monitoring.
   the key kept out of the buffer file, rotation purging the buffer, no
   digest in the export, ignores surviving rotation, URL and label scrubbing,
   the allowlist, secret-field detection, the notice and the consent ledger,
-  purge and disable, and the live bridge.
+  purge and disable, the live bridge, and that the struck "nothing leaves"
+  claim appears nowhere.
+- `tests/test_shadow_storage.py`: app-data paths, refusing synced folders
+  and symlinks into them, pause, and clearing on shutdown.
 - `tests/test_live_tap.py`: the recorder publishing retained events, and
   never frames, to a tap.

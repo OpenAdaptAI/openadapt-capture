@@ -7,6 +7,7 @@ import random
 import re
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -413,24 +414,73 @@ def test_enabling_requires_an_acknowledgement_of_the_current_notice():
     assert not ShadowObserver(ShadowConfig()).enabled
 
 
-def test_notice_says_what_the_counsel_review_requires():
-    text = notice()["text"]
+def test_notice_covers_what_why_how_long_and_how_to_erase():
+    data = notice()
+    headings = [section["heading"] for section in data["sections"]]
+    assert headings == [
+        "What it captures",
+        "Why",
+        "How long it is kept",
+        "How to erase it",
+        "Who can access it",
+    ]
+    text = data["text"]
     for phrase in (
-        "What it records",
-        "encrypted file on this computer",
-        "24 hours",
-        "Nothing leaves this computer",
+        # What: the real facts from the tokenizer and scrubber.
+        "kind of control you use",
+        "keyed fingerprint",
+        "Password and PIN fields are skipped",
+        "replaced with a placeholder",
+        "Web pages count only on the work sites you list",
+        "personal, confidential, or health information",
+        # Why.
+        "find tasks you repeat and suggest them as draft automations",
+        # How long.
+        "encrypted buffer",
+        "isn't synced",
+        "at least every 24 hours",
+        "its key destroyed",
+        "quit OpenAdapt",
+        "next time it starts",
+        # How to erase.
+        "Turning shadow mode off erases the buffer, its key",
+        "Delete everything and turn off",
+        "Pause before you view sensitive material",
+        # Who.
+        "OpenAdapt never sends shadow mode data off this computer.",
         "can't turn shadow mode on or read the buffer through OpenAdapt",
         "administrator access to this computer",
-        "Delete everything and turn off",
-        "never",
+        "IT administrators",
+        "endpoint security or backup tools",
+        "local files or memory",
     ):
-        assert phrase in text
+        assert phrase in text, phrase
     # An OS administrator with access to the device can inspect the buffer
     # while it's on, so the notice must never claim otherwise.
     assert "No administrator" not in text
     assert "can see it" not in text
     assert notice()["sha256"] == notice_sha256()
+    assert NOTICE_VERSION == "2026-10-17.4"
+
+
+#: Claims counsel struck. Backup, sync, and endpoint security tools can copy
+#: local files, so "nothing leaves" isn't true; say what OpenAdapt does instead.
+STRUCK_CLAIMS = re.compile(r"nothing\s+(?:it\s+records\s+)?leaves\s+th(?:is|e)\s+computer", re.I)
+
+
+def test_the_struck_claim_appears_nowhere_in_the_notice_or_the_docs():
+    assert not STRUCK_CLAIMS.search(notice()["text"])
+    root = Path(__file__).resolve().parents[1]
+    files = [root / "README.md", *sorted((root / "docs").rglob("*.md"))]
+    files += sorted((root / "openadapt_capture" / "shadow").rglob("*.py"))
+    hits = [
+        str(path.relative_to(root))
+        for path in files
+        if STRUCK_CLAIMS.search(path.read_text(encoding="utf-8"))
+    ]
+    assert hits == []
+    # The guard itself works.
+    assert STRUCK_CLAIMS.search("Nothing leaves this computer.")
 
 
 def test_ledger_records_acknowledgement_time_locally_and_revocation(tmp_path):
@@ -802,13 +852,11 @@ def test_a_damaged_ignore_list_does_not_stop_shadow_mode(tmp_path):
 def test_notice_discloses_what_outlives_the_24_hour_buffer():
     text = notice()["text"]
     for phrase in (
-        "Keyboard shortcuts",
+        "keyboard shortcuts",
         "when each step happened",
         "Review draft, the draft",
         "not encrypted",
         "fingerprint of the task",
-        "next time OpenAdapt starts",
         "only in memory",
     ):
         assert phrase in text, phrase
-    assert NOTICE_VERSION == "2026-10-17.3"
