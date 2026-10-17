@@ -53,6 +53,7 @@ from openadapt_capture.shadow.notify import (
 )
 from openadapt_capture.shadow.ring import Clock, RowCipher, SymbolRing
 from openadapt_capture.shadow.scrub import NON_WORK_BROWSER, allowlisted_domain, url_host
+from openadapt_capture.shadow.storage import require_unsynced
 from openadapt_capture.shadow.symbols import ShadowSymbol, Tokenizer
 
 EPISODES_SCHEMA = "openadapt.shadow.episodes/v2"
@@ -128,12 +129,15 @@ class ShadowObserver:
         self._keys: ShadowKeys | None = None
         self._store: KeyStore | None = None
         self._shut = False
+        self._paused = False
         self._browser_on_work_site = False
         self._last_was_marker = False
         self.acknowledgement: Acknowledgement | None = None
         if not self.config.enabled:
             return
         self.acknowledgement = require_current(acknowledgement)
+        if self.config.store_path is not None:
+            require_unsynced(self.config.store_path)
         now = clock()
         if digest_key is not None:
             if len(digest_key) < 16:
@@ -227,13 +231,36 @@ class ShadowObserver:
         self._last_was_marker = True
         return ShadowEvent(event.timestamp, "focus", app=NON_WORK_BROWSER)
 
-    def observe(self, event: ShadowEvent | None) -> None:
-        """Record one event. A disabled observer drops it untouched."""
+    @property
+    def paused(self) -> bool:
+        return self._paused
 
-        if not self.enabled or event is None:
+    def pause(self) -> None:
+        """Stop recording until :meth:`unpause`. Typing in progress is dropped.
+
+        What's already in the buffer stays, and expires as usual. Events that
+        arrive while paused are dropped untouched, so nothing about what the
+        person views during the pause reaches the buffer.
+        """
+
+        with self._lock:
+            self._paused = True
+            if self._tokenizer is not None:
+                self._tokenizer.flush()
+            self._browser_on_work_site = False
+            self._last_was_marker = False
+
+    def unpause(self) -> None:
+        with self._lock:
+            self._paused = False
+
+    def observe(self, event: ShadowEvent | None) -> None:
+        """Record one event. A disabled or paused observer drops it untouched."""
+
+        if not self.enabled or self._paused or event is None:
             return
         with self._lock:
-            if not self.enabled:
+            if not self.enabled or self._paused:
                 return
             self._rotate_if_due()
             assert self._tokenizer is not None and self._ring is not None
@@ -353,7 +380,29 @@ class ShadowObserver:
             self._tokenizer = None
             return key_deleted
 
+    def shutdown(self) -> bool:
+        """Clear the buffer and destroy its key, then stop. For a clean exit.
+
+        Unlike :meth:`purge_and_disable`, the ignore list stays, so a task
+        the person ignored isn't offered again after a restart. Returns False
+        when the credential store refused to delete the key.
+        """
+
+        with self._lock:
+            self._shut = True
+            self.purge()
+            if self._ring is not None:
+                self._ring.destroy()
+            key_deleted = True
+            if self._keys is not None:
+                key_deleted = destroy_keys(self._store, also=(self._keys.key_id,))
+            self._keys = None
+            self._tokenizer = None
+            return key_deleted
+
     def close(self) -> None:
+        """Close the buffer file without clearing it. Prefer :meth:`shutdown`."""
+
         with self._lock:
             if self._ring is not None:
                 self._ring.close()

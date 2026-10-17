@@ -36,6 +36,11 @@ from openadapt_capture.shadow.observer import (
     export_episodes,
 )
 from openadapt_capture.shadow.ring import SymbolRing
+from openadapt_capture.shadow.storage import (
+    ShadowStorageRefused,
+    app_data_dir,
+    require_unsynced,
+)
 from openadapt_capture.shadow.symbols import ShadowSymbol, Tokenizer
 
 __all__ = [
@@ -53,15 +58,18 @@ __all__ = [
     "ShadowConsentRequired",
     "ShadowEvent",
     "ShadowModeDisabled",
+    "ShadowStorageRefused",
     "ShadowObserver",
     "ShadowSymbol",
     "SuppressionList",
     "SymbolRing",
     "Tokenizer",
+    "app_data_dir",
     "export_episodes",
     "from_browser_event",
     "from_capture_event",
     "from_window_event",
     "mine_motifs",
     "notice",
+    "require_unsynced",
 ]
