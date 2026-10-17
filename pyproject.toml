@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "pydantic>=2.0.0",
+    "pydantic>=2.14.1",
     "Pillow>=10.1.0",
     "fire>=0.7.1",
     "mss>=6.0.0",
