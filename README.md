@@ -184,7 +184,8 @@ nothing unless you run `capture share` or set `send_profile=True`. The
 a recording by itself.
 
 Shadow-mode pattern mining, which notices repeated tasks and offers a draft,
-is off by default and keeps no typed values. See
+is off by default, needs the person's acknowledgement to turn on, keeps no
+typed values, and keeps its encrypted buffer on the device for 24 hours. See
 [docs/SHADOW_MINING.md](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/docs/SHADOW_MINING.md).
 
 How Capture handles sensitive data, its licensing boundaries, and how releases

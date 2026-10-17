@@ -46,11 +46,17 @@ field-redaction contract can prove the sensitive value was never retained.
 
 ## Shadow-mode pattern mining
 
-Shadow mining (`openadapt_capture.shadow`) is off by default and turns on only
-in code, with `ShadowConfig(enabled=True)`. It keeps value-free symbols in a
-ring buffer capped by size and age, never reads window titles, the clipboard,
-or the screen, and opens no network connection. Because it observes activity
-across applications over time, an employer deployment can count as workplace
+Shadow mining (`openadapt_capture.shadow`) is off by default. It turns on only
+in code, for the person being observed, after that person acknowledges a
+notice; the acknowledgement time is recorded locally. It keeps value-free
+symbols in an encrypted, 24-hour buffer on the device. The key lives in the
+OS credential store and is destroyed with the buffer every 24 hours, so a
+digest of a short identifier can't be tested later. URL segments and labels
+that could carry identifiers are scrubbed before storage, and only allowlisted
+work domains are recorded. It never reads window titles, the clipboard, or
+the screen, opens no network connection, and has no remote or admin switch.
+Its export carries no keyed digest. Because it observes activity across
+applications over time, an employer deployment can count as workplace
 monitoring and may need employee notice, a data protection impact assessment,
 or works-council agreement. See [SHADOW_MINING.md](SHADOW_MINING.md).
 
