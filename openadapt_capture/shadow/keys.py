@@ -43,6 +43,9 @@ from loguru import logger
 SERVICE = "openadapt-capture-shadow"
 ACCOUNT_PREFIX = "shadow-key|"
 ACTIVE_ACCOUNT = f"{ACCOUNT_PREFIX}active"
+#: Ids of keys whose deletion failed. Every later destroy retries them, so a
+#: key that couldn't be deleted once isn't orphaned when a new key replaces it.
+RETIRED_ACCOUNT = f"{ACCOUNT_PREFIX}retired"
 #: The longest a key may live. The buffer's time cap is the same 24 hours.
 MAX_KEY_LIFETIME_S = 24 * 3600.0
 #: How far ahead of the clock a creation time may be before it's distrusted.
@@ -206,18 +209,33 @@ def _encode(key: bytes, created: float) -> str:
     )
 
 
-def destroy_keys(store: KeyStore | None = None) -> bool:
-    """Delete the active key and its pointer. True when both are gone."""
+def _retired(store: KeyStore) -> list[str]:
+    try:
+        ids = json.loads(store.get(RETIRED_ACCOUNT) or "[]")
+    except ValueError:
+        return []
+    return [i for i in ids if isinstance(i, str)] if isinstance(ids, list) else []
+
+
+def destroy_keys(store: KeyStore | None = None, *, also: tuple[str, ...] = ()) -> bool:
+    """Delete the active key, its pointer, and any key a past destroy missed.
+
+    ``also`` names key ids to delete as well (the key an observer holds, in
+    case the pointer no longer names it). A key that can't be deleted is
+    remembered and retried by every later call. True when every key is gone.
+    """
 
     store = store if store is not None else KeyringStore()
     key_id = store.get(ACTIVE_ACCOUNT)
-    ok = True
-    if key_id:
-        ok = store.delete(f"{ACCOUNT_PREFIX}{key_id}") and ok
-    ok = store.delete(ACTIVE_ACCOUNT) and ok
-    if not ok:
-        logger.warning("the shadow key could not be deleted from the credential store")
-    return ok
+    wanted = list(dict.fromkeys([*_retired(store), *([key_id] if key_id else []), *also]))
+    left = [k for k in wanted if not store.delete(f"{ACCOUNT_PREFIX}{k}")]
+    pointer_gone = store.delete(ACTIVE_ACCOUNT)
+    if left:
+        store.set(RETIRED_ACCOUNT, json.dumps(left))
+        logger.warning("{} shadow key(s) could not be deleted; will retry", len(left))
+    else:
+        store.delete(RETIRED_ACCOUNT)
+    return not left and pointer_gone
 
 
 def load_or_create_keys(

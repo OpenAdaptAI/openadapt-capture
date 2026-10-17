@@ -181,7 +181,7 @@ class ShadowObserver:
         if not self._keys.expired(now):
             return
         store = self._store if self._store is not None else None
-        destroy_keys(store)
+        destroy_keys(store, also=(self._keys.key_id,))
         self._keys = create_keys(store, lifetime_s=self.config.key_lifetime_s, now=now)
         self._tokenizer = Tokenizer(self.config, digest_key=self._keys.digest_key)
         if self.config.store_path is not None:
@@ -324,23 +324,30 @@ class ShadowObserver:
             if self._ring is not None:
                 self._ring.purge()
 
-    def purge_and_disable(self) -> None:
+    def purge_and_disable(self) -> bool:
         """Delete the buffer file, the key, and the ignore list; then stay off.
 
         This is the one-click "Delete everything and turn off". The observer
-        can't be turned back on; a new opt-in builds a new one.
+        can't be turned back on; a new opt-in builds a new one. Returns False
+        when the credential store refused to delete the key (it is retried by
+        the next destroy), so a caller can say so instead of claiming success.
         """
 
         with self._lock:
+            self._shut = True
             self.purge()
             self._suppression.clear()
             if self._ring is not None:
                 self._ring.destroy()
+            key_deleted = True
             if self._keys is not None:
-                destroy_keys(self._store if self._store is not None else None)
+                key_deleted = destroy_keys(
+                    self._store if self._store is not None else None,
+                    also=(self._keys.key_id,),
+                )
             self._keys = None
             self._tokenizer = None
-            self._shut = True
+            return key_deleted
 
     def close(self) -> None:
         with self._lock:

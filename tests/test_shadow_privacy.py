@@ -28,8 +28,10 @@ from openadapt_capture.shadow.consent import NOTICE_VERSION, Acknowledgement, no
 from openadapt_capture.shadow.events import browser_field_is_secure, native_field_is_secure
 from openadapt_capture.shadow.keys import (
     ACTIVE_ACCOUNT,
+    RETIRED_ACCOUNT,
     KeyringStore,
     MemoryKeyStore,
+    destroy_keys,
     load_or_create_keys,
 )
 from openadapt_capture.shadow.scrub import (
@@ -631,3 +633,45 @@ def test_acknowledgement_of_the_old_notice_no_longer_counts(tmp_path):
         )
     )
     assert ConsentLedger(path).current() is None
+
+
+# ---------------------------------------------------------------------------
+# Review fixes
+# ---------------------------------------------------------------------------
+
+
+class _StubbornStore(MemoryKeyStore):
+    """A credential store that refuses deletes until told otherwise."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refuse = False
+
+    def delete(self, account: str) -> bool:
+        if self.refuse and account.startswith("shadow-key|") and account != RETIRED_ACCOUNT:
+            return False
+        return super().delete(account)
+
+
+def test_a_key_that_could_not_be_deleted_is_retried_not_orphaned():
+    store = _StubbornStore()
+    clock = Clock(1000.0)
+    obs = _observer(clock, key_store=store)
+    first = store.get(ACTIVE_ACCOUNT)
+    store.refuse = True
+    clock.now = 1000.0 + DAY
+    obs.symbols()  # the epoch ends; the old key can't be deleted yet
+    assert store.get(f"shadow-key|{first}") is not None
+    assert first in json.loads(store.get(RETIRED_ACCOUNT))
+    store.refuse = False
+    assert obs.purge_and_disable() is True
+    assert store._values == {}
+
+
+def test_purge_and_disable_reports_a_key_it_could_not_delete():
+    store = _StubbornStore()
+    obs = _observer(Clock(10.0), key_store=store)
+    store.refuse = True
+    assert obs.purge_and_disable() is False and not obs.enabled
+    store.refuse = False
+    assert destroy_keys(store) and store._values == {}
