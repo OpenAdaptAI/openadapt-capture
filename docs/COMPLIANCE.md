@@ -44,6 +44,16 @@ truncated, so a consumer never treats half a string as exact identity
 evidence. Flow refuses desktop `--secret` authoring until its source-time
 field-redaction contract can prove the sensitive value was never retained.
 
+## Shadow-mode pattern mining
+
+Shadow mining (`openadapt_capture.shadow`) is off by default and turns on only
+in code, with `ShadowConfig(enabled=True)`. It keeps value-free symbols in a
+ring buffer capped by size and age, never reads window titles, the clipboard,
+or the screen, and opens no network connection. Because it observes activity
+across applications over time, an employer deployment can count as workplace
+monitoring and may need employee notice, a data protection impact assessment,
+or works-council agreement. See [SHADOW_MINING.md](SHADOW_MINING.md).
+
 ## Microphone narration
 
 Microphone narration (`capture record --audio`, or `RECORD_AUDIO`) is off by
