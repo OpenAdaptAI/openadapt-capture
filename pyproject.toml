@@ -38,7 +38,7 @@ dependencies = [
     "numpy>=1.26.0",
     # Recorder generates a performance plot by default, and the package-level
     # API imports the plotting module while exposing Recorder.
-    "matplotlib>=3.10.8",
+    "matplotlib>=3.10.9",
     # Native macOS window/accessibility observation via permissive PyObjC.
     "pyobjc-framework-ApplicationServices>=12.2.1; sys_platform == 'darwin'",
     # Desktop-independent, exact-window pixels on macOS 14 and later.
@@ -85,10 +85,10 @@ all = [
 ]
 
 dev = [
-    "pytest>=7.0.0",
+    "pytest>=9.1.1",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.0.0",
-    "pytest-timeout>=2.0.0",
+    "pytest-timeout>=2.4.0",
     "ruff>=0.1.0",
     "numpy>=1.21.0",
 ]
