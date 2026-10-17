@@ -9,8 +9,11 @@ import time
 
 import pytest
 
+from openadapt_capture import recorder as recorder_module
+from openadapt_capture.authentication import AuthenticationHandoffController
 from openadapt_capture.input_observer import (
     InputObserverError,
+    InputObserverUnavailableError,
     ObservedKey,
     ObservedMouseButton,
     ObservedMouseMove,
@@ -172,12 +175,77 @@ def test_direct_setup_initializes_xlib_threads_before_loading_x11(
         "find_library",
         lambda _name: pytest.fail("loaded Xlib before XInitThreads succeeded"),
     )
+    monkeypatch.setattr(
+        linux_module.ctypes,
+        "CDLL",
+        lambda _name: pytest.fail("loaded Xlib before XInitThreads succeeded"),
+    )
 
     with pytest.raises(RuntimeError, match="XInitThreads refused"):
         observer._setup()
 
     assert observer._x11 is None
     assert observer._control_display is None
+
+
+def test_x_libraries_load_by_soname_without_a_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """find_library runs ldconfig in a subprocess, which a concurrent fork can hang."""
+    loaded: list[str] = []
+
+    def fake_cdll(name: str) -> str:
+        loaded.append(name)
+        return f"handle:{name}"
+
+    monkeypatch.setattr(linux_module.ctypes, "CDLL", fake_cdll)
+    monkeypatch.setattr(
+        linux_module.ctypes.util,
+        "find_library",
+        lambda _name: pytest.fail("searched for a library that loads by soname"),
+    )
+
+    assert linux_module._load_x_libraries() == (
+        "handle:libX11.so.6",
+        "handle:libXtst.so.6",
+        "handle:libxkbcommon.so.0",
+    )
+    assert loaded == ["libX11.so.6", "libXtst.so.6", "libxkbcommon.so.0"]
+
+
+def test_x_libraries_fall_back_to_a_search_for_an_unusual_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_cdll(name: str) -> str:
+        if name == "libXtst.so.6":
+            raise OSError("no such file")
+        return f"handle:{name}"
+
+    monkeypatch.setattr(linux_module.ctypes, "CDLL", fake_cdll)
+    monkeypatch.setattr(
+        linux_module.ctypes.util,
+        "find_library",
+        lambda name: "libXtst.so.99" if name == "Xtst" else None,
+    )
+
+    assert linux_module._load_x_libraries() == (
+        "handle:libX11.so.6",
+        "handle:libXtst.so.99",
+        "handle:libxkbcommon.so.0",
+    )
+
+
+def test_missing_x_library_is_reported_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(_name: str) -> str:
+        raise OSError("no such file")
+
+    monkeypatch.setattr(linux_module.ctypes, "CDLL", missing)
+    monkeypatch.setattr(linux_module.ctypes.util, "find_library", lambda _name: None)
+
+    with pytest.raises(InputObserverUnavailableError, match="libXtst"):
+        linux_module._load_x_libraries()
 
 
 @pytest.mark.skipif(
@@ -1095,6 +1163,44 @@ def test_shutdown_drain_times_out_without_end_of_data(
     assert process_count == 1
 
 
+def test_enable_flushes_the_new_context_before_the_data_connection_names_it() -> None:
+    """CreateContext is buffered on the control connection until a round trip.
+
+    Enabling the context on the data connection first makes the server answer
+    XRecordBadContext, which Xlib's default error handler turns into an exit.
+    """
+    observer = make_observer()
+    control_display = object()
+    data_display = object()
+    callback = object()
+    observer._control_display = control_display
+    observer._data_display = data_display
+    observer._record_context = 7
+    observer._record_callback = callback
+    calls: list[str] = []
+
+    class EnableX11:
+        def XSync(self, display, discard) -> int:
+            assert display is control_display
+            assert discard == 0
+            calls.append("sync")
+            return 1
+
+    class EnableXtst:
+        def XRecordEnableContextAsync(self, display, context, proc, closure) -> int:
+            assert display is data_display
+            assert (context, proc, closure) == (7, callback, None)
+            calls.append("enable")
+            # A server that never received CreateContext rejects the context.
+            return 1 if calls == ["sync", "enable"] else 0
+
+    observer._x11 = EnableX11()
+    observer._xtst = EnableXtst()
+
+    assert observer._enable_record_context() == 1
+    assert calls == ["sync", "enable"]
+
+
 def test_teardown_drains_then_releases_every_native_resource() -> None:
     observer = make_observer()
     observer.shutdown_timeout = 0.1
@@ -1127,10 +1233,13 @@ def test_teardown_drains_then_releases_every_native_resource() -> None:
         def XRecordProcessReplies(self, display) -> None:
             assert display is data_display
             self.calls.append("process")
-            intercept_record(
-                observer,
-                category=linux_module._XRECORD_END_OF_DATA,
-            )
+            # The server sends EndOfData only after DisableContext leaves
+            # Xlib's buffer on the control connection.
+            if self.calls[:2] == ["disable", "sync"]:
+                intercept_record(
+                    observer,
+                    category=linux_module._XRECORD_END_OF_DATA,
+                )
 
         def XRecordFreeData(self, _pointer) -> None:
             self.free_data_count += 1
@@ -1145,6 +1254,12 @@ def test_teardown_drains_then_releases_every_native_resource() -> None:
         def __init__(self) -> None:
             self.freed = []
             self.closed = []
+
+        def XSync(self, display, discard) -> int:
+            assert display is control_display
+            assert discard == 0
+            xtst.calls.append("sync")
+            return 1
 
         def XFree(self, value) -> int:
             self.freed.append(value)
@@ -1176,7 +1291,7 @@ def test_teardown_drains_then_releases_every_native_resource() -> None:
 
     observer._teardown()
 
-    assert xtst.calls == ["disable", "process", "free_context"]
+    assert xtst.calls == ["disable", "sync", "process", "free_context"]
     assert xtst.free_data_count == 1
     assert x11.freed == [record_range]
     assert x11.closed == [data_display, control_display]
@@ -1287,6 +1402,9 @@ def test_failed_start_drain_never_arms_or_emits_buffered_input() -> None:
             return 1
 
     class FailedStartX11:
+        def XSync(self, _display, _discard) -> int:
+            return 1
+
         def XCloseDisplay(self, _display) -> int:
             return 0
 
@@ -1316,6 +1434,9 @@ def exercise_cancelled_start_lifecycle(
     class LifecycleX11:
         def __init__(self) -> None:
             self.close_count = 0
+
+        def XSync(self, _display, _discard) -> int:
+            return 1
 
         def XCloseDisplay(self, _display) -> int:
             self.close_count += 1
@@ -1484,6 +1605,9 @@ def test_outer_timeout_cancels_already_armed_record_batch_transactionally() -> N
         def __init__(self) -> None:
             self.close_count = 0
 
+        def XSync(self, _display, _discard) -> int:
+            return 1
+
         def XCloseDisplay(self, _display) -> int:
             self.close_count += 1
             return 0
@@ -1626,3 +1750,154 @@ def test_outer_timeout_cancels_already_armed_record_batch_transactionally() -> N
     assert x11.close_count == 2
     assert observer._thread is None
     assert observer._delivery_thread is None
+
+
+def test_recorder_journals_x_record_click_and_text_through_the_privacy_gate(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every receipt X RECORD reserves reaches the journal during a recording.
+
+    ``capture record`` always binds an authentication controller, so the
+    recorder wraps each receipt in its privacy gate. The observer must see that
+    wrapper finish after delivery, or the first click stops the recording.
+    """
+    journal = recorder_module.OrderedEventJournal()
+    controller = AuthenticationHandoffController()
+    controller.bind(tmp_path, time.time)
+    terminate = threading.Event()
+    started = threading.Event()
+    failures = []
+    delivered_client = 0x800000
+    script = [
+        # Device event first, then the copy delivered to the focused client.
+        (wire_event(event_type=linux_module._MOTION_NOTIFY, detail=0,
+                    event_time=10, root_x=200, root_y=200), 0),
+        (wire_event(event_type=linux_module._BUTTON_PRESS, detail=1,
+                    event_time=11), 0),
+        (wire_event(event_type=linux_module._BUTTON_PRESS, detail=1,
+                    event_time=11, root_x=200, root_y=200), delivered_client),
+        (wire_event(event_type=linux_module._BUTTON_RELEASE, detail=1,
+                    event_time=12), 0),
+        (wire_event(event_type=linux_module._BUTTON_RELEASE, detail=1,
+                    event_time=12, root_x=200, root_y=200, state=0x100),
+         delivered_client),
+        (wire_event(event_type=linux_module._KEY_PRESS, detail=43,
+                    event_time=13), 0),
+        (wire_event(event_type=linux_module._KEY_PRESS, detail=43,
+                    event_time=13), delivered_client),
+        (wire_event(event_type=linux_module._KEY_RELEASE, detail=43,
+                    event_time=14), 0),
+        (wire_event(event_type=linux_module._KEY_RELEASE, detail=43,
+                    event_time=14), delivered_client),
+    ]
+
+    class ScriptedX11(FakeX11):
+        def XSync(self, _display, _discard) -> int:
+            return 1
+
+        def XCloseDisplay(self, _display) -> int:
+            return 0
+
+    class ScriptedXtst:
+        def __init__(self) -> None:
+            self.observer: LinuxXInputObserver | None = None
+            self.sent = False
+            self.disabled = False
+
+        def XRecordProcessReplies(self, _display) -> None:
+            assert self.observer is not None
+            if self.disabled:
+                intercept_record(
+                    self.observer,
+                    category=linux_module._XRECORD_END_OF_DATA,
+                )
+                return
+            if self.sent or not started.is_set():
+                return
+            self.sent = True
+            for payload, id_base in script:
+                intercept_record(
+                    self.observer,
+                    category=linux_module._XRECORD_FROM_SERVER,
+                    payload=payload,
+                    id_base=id_base,
+                )
+
+        def XRecordDisableContext(self, _display, _context) -> int:
+            self.disabled = True
+            return 1
+
+        def XRecordFreeData(self, _pointer) -> None:
+            return
+
+        def XRecordFreeContext(self, _display, _context) -> int:
+            return 1
+
+    xtst = ScriptedXtst()
+
+    class ScriptedObserver(LinuxXInputObserver):
+        def _setup(self) -> None:
+            self._x11 = ScriptedX11(keysym=0x68, keysym_name="h")
+            self._xtst = xtst
+            self._xkbcommon = FakeXkbCommon({0x68: "h"})
+            self._control_display = object()
+            self._data_display = object()
+            self._record_context = 11
+            self._record_enabled = True
+            self._record_started = True
+            self._control_id_base = 0x400000
+            self._last_pointer = (0.0, 0.0)
+            self._accepting_events = True
+            self._setup_complete = True
+
+    def create(callback, **kwargs):
+        observer = ScriptedObserver(
+            callback,
+            shutdown_timeout=1.0,
+            environ={"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11"},
+            **kwargs,
+        )
+        xtst.observer = observer
+        return observer
+
+    def read() -> None:
+        try:
+            recorder_module.read_input_events(
+                journal,
+                terminate,
+                object(),
+                started,
+                authentication=controller,
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(recorder_module, "create_input_observer", create)
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    assert started.wait(timeout=2)
+    actions = [journal.get(timeout=2).data for _ in range(5)]
+    terminate.set()
+    reader.join(timeout=5)
+
+    assert not reader.is_alive()
+    assert failures == []
+    assert [
+        (
+            action["name"],
+            action.get("mouse_x"),
+            action.get("mouse_y"),
+            action.get("mouse_pressed"),
+            action.get("key_char"),
+        )
+        for action in actions
+    ] == [
+        ("move", 200.0, 200.0, None, None),
+        ("click", 200.0, 200.0, True, None),
+        ("click", 200.0, 200.0, False, None),
+        ("press", None, None, None, "h"),
+        ("release", None, None, None, "h"),
+    ]
+    assert journal.empty()
+    assert controller._active_retentions == 0

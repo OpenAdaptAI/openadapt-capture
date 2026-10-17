@@ -1,7 +1,7 @@
 [project]
 name = "openadapt-capture"
 version = "1.3.0"
-description = "GUI interaction capture - platform-agnostic event streams with time-aligned media"
+description = "Record desktop mouse, keyboard, and screen activity, then load it from Python"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -108,9 +108,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["openadapt_capture"]
-exclude = [
-    "openadapt_capture/browser_bridge.py",
-]
 
 [tool.hatch.build.targets.sdist]
 ignore-vcs = true
@@ -121,7 +118,6 @@ only-include = [
     "docs",
 ]
 exclude = [
-    "/openadapt_capture/browser_bridge.py",
     "/docs/images/demo.gif",
     "/docs/whisper-integration-plan.md",
 ]
@@ -174,4 +170,12 @@ dev = [
     # Repository-only Chrome-extension prototype tests. The bridge and this
     # dependency are not part of wheel or source-distribution runtime.
     "websockets>=12.0",
+]
+
+[tool.uv]
+# Lockfile-only floor for a transitive dependency of the `share` extra
+# (magic-wormhole -> autobahn). autobahn 26.7.1 fixes GHSA-hxp9-w8x3-p566 but
+# requires Python 3.11+, so Python 3.10 keeps the last compatible release.
+constraint-dependencies = [
+    "autobahn>=26.7.1; python_full_version >= '3.11'",
 ]
