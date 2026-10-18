@@ -514,8 +514,11 @@ jobs:
             --allow-missing \
             --github-output "${GITHUB_OUTPUT}"
 
+      # fetch-pypi already failed if PyPI lacks the version. The verifier writes
+      # no outputs when both surfaces already match, so a rerun after success
+      # skips both this guard and the creation step.
       - name: Refuse a version that is not on PyPI
-        if: ${{ steps.publication.outputs.publish_pypi != 'false' }}
+        if: ${{ steps.publication.outputs.publish_pypi == 'true' }}
         run: |
           echo "This path never publishes to PyPI, and the version is not there."
           exit 1

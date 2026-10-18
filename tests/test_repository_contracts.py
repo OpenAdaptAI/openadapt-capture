@@ -176,7 +176,9 @@ def test_existing_tag_release_path_reuses_every_check_and_never_publishes_pypi()
     assert "python scripts/verify_distribution.py dist/*" in job
     assert "python scripts/check_source_boundary.py --require-dist" in job
     assert '--rebuilt "${SOURCE_DIR}/dist"' in job
-    assert "publish_pypi != 'false'" in job
+    assert "publish_pypi == 'true'" in job
+    # A rerun after success: the verifier writes no outputs, so nothing runs.
+    assert "create_github_release == 'true'" in job
     _assert_release_app_publishes_exact_pypi_assets(job)
 
 
