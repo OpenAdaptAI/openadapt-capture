@@ -5,6 +5,11 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/OpenAdaptAI/openadapt-capture/blob/main/LICENSE)
 
+> **openadapt-capture has moved into the [OpenAdapt monorepo](https://github.com/OpenAdaptAI/OpenAdapt)**,
+> in [`packages/capture`](https://github.com/OpenAdaptAI/OpenAdapt/tree/main/packages/capture).
+> Open new issues and pull requests there. Releases still publish from this repository
+> until its release workflow moves to the monorepo.
+
 Record what a person does on a Windows or macOS desktop, then read it back in
 Python. Capture saves mouse clicks, drags, scrolls, keystrokes, and screen
 video to one local folder, and pairs every action with the screen frame from
