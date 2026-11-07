@@ -1,5 +1,7 @@
 # openadapt-capture
 
+> **Now part of OpenAdapt.** This code lives in [`packages/capture`](https://github.com/OpenAdaptAI/OpenAdapt/tree/main/packages/capture) in the [OpenAdapt repository](https://github.com/OpenAdaptAI/OpenAdapt). This repository is archived; open issues and pull requests there.
+
 [![Build Status](https://github.com/OpenAdaptAI/openadapt-capture/actions/workflows/test.yml/badge.svg)](https://github.com/OpenAdaptAI/openadapt-capture/actions/workflows/test.yml)
 [![PyPI version](https://img.shields.io/pypi/v/openadapt-capture.svg)](https://pypi.org/project/openadapt-capture/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
